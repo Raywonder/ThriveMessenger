@@ -270,6 +270,8 @@ def load_user_config():
         'message_undo_window_seconds': 15,
         'allow_cross_server_directory_message': True,
         'directory_dm_defaults': {},
+        'incoming_popup_on_message': False,
+        'incoming_alert_on_message': False,
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -307,6 +309,8 @@ def load_user_config():
     settings['allow_cross_server_directory_message'] = bool(settings.get('allow_cross_server_directory_message', True))
     if not isinstance(settings.get('directory_dm_defaults', {}), dict):
         settings['directory_dm_defaults'] = {}
+    settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
+    settings['incoming_alert_on_message'] = bool(settings.get('incoming_alert_on_message', False))
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -1122,6 +1126,10 @@ class SettingsDialog(wx.Dialog):
         self.typing_indicator_cb.SetValue(bool(self.config.get('typing_indicators', True)))
         self.announce_typing_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Announce typing start/stop")
         self.announce_typing_cb.SetValue(bool(self.config.get('announce_typing', True)))
+        self.incoming_popup_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Open chat windows automatically on incoming messages (legacy behavior)")
+        self.incoming_popup_cb.SetValue(bool(self.config.get('incoming_popup_on_message', False)))
+        self.incoming_alert_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Play sound/notification on incoming messages")
+        self.incoming_alert_cb.SetValue(bool(self.config.get('incoming_alert_on_message', False)))
         enter_row = wx.BoxSizer(wx.HORIZONTAL)
         enter_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Enter key action:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.enter_action_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
@@ -1209,6 +1217,8 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.show_main_actions_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.incoming_popup_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.incoming_alert_cb, 0, wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -1254,7 +1264,7 @@ class SettingsDialog(wx.Dialog):
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.incoming_popup_cb, self.incoming_alert_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -3070,6 +3080,7 @@ class MainFrame(wx.Frame):
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
         self._sort_mode = "name_asc"
+        self._unread_counts = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
         dark_mode_on = is_windows_dark_mode()
@@ -3270,6 +3281,13 @@ class MainFrame(wx.Frame):
         if sel == wx.NOT_FOUND or sel >= len(self._contact_display_map):
             return None
         return self._contact_display_map[sel]
+    def _clear_unread(self, contact):
+        if contact in self._unread_counts:
+            self._unread_counts.pop(contact, None)
+            self._apply_search_filter()
+    def _mark_unread(self, contact):
+        self._unread_counts[contact] = int(self._unread_counts.get(contact, 0) or 0) + 1
+        self._apply_search_filter()
     def on_submit_logs(self, _):
         app = wx.GetApp()
         ok, err = submit_logs_payload(app.user_config, reason="manual_submit")
@@ -3326,6 +3344,8 @@ class MainFrame(wx.Frame):
                 app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
+                app.user_config['incoming_popup_on_message'] = dlg.incoming_popup_cb.IsChecked()
+                app.user_config['incoming_alert_on_message'] = dlg.incoming_alert_cb.IsChecked()
                 enter_map = {0: 'send', 1: 'place_call', 2: 'none'}
                 app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'send')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
@@ -3805,7 +3825,9 @@ class MainFrame(wx.Frame):
             contacts = sorted(contacts, key=lambda c: c["user"].lower())
         for c in contacts:
             if query and query not in c["user"].lower(): continue
-            display = f"{c['user']}  |  {c['status']}"
+            unread = int(self._unread_counts.get(c["user"], 0) or 0)
+            unread_text = f"  |  {c['user']} has {unread} new message{'s' if unread != 1 else ''}" if unread > 0 else ""
+            display = f"{c['user']}  |  {c['status']}{unread_text}"
             self.lv.Append(display)
             idx = self.lv.GetCount() - 1
             self._contact_display_map.append(c["user"])
@@ -3986,6 +4008,7 @@ class MainFrame(wx.Frame):
         app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, c)
         dlg = self.get_chat(c) or ChatDialog(self, c, self.sock, self.user, is_logging_enabled)
         dlg.Show(); wx.CallAfter(dlg.input_ctrl.SetFocus)
+        self._clear_unread(c)
     def on_send_file(self, _):
         c = self._selected_contact_name()
         if not c: return
@@ -4005,47 +4028,28 @@ class MainFrame(wx.Frame):
             return
         self.on_send(None)
     def receive_message(self, msg):
-        wx.GetApp().play_sound("receive.wav");
-        app = wx.GetApp(); is_logging_enabled = is_chat_logging_enabled(app.user_config, msg["from"])
-        dlg = self.get_chat(msg["from"])
+        app = wx.GetApp()
+        sender = msg["from"]
+        is_logging_enabled = is_chat_logging_enabled(app.user_config, sender)
+        is_contact = sender in self.contact_states
+        dlg = self.get_chat(sender)
         if not dlg:
-            is_contact = msg["from"] in self.contact_states
-            dlg = ChatDialog(self, msg["from"], self.sock, self.user, is_logging_enabled, is_contact=is_contact)
-        if not is_contact and msg["from"] not in self._noncontact_senders:
-            self._noncontact_senders.add(msg["from"]); self._apply_search_filter()
-            save_noncontact_senders(self.user, self._noncontact_senders)
-        if wx.GetActiveWindow() is not None:
-            dlg.Show()
-        elif sys.platform == 'win32':
-            _shown = False
-            try:
-                hwnd = dlg.GetHandle()
-                # CBT hook blocks HCBT_ACTIVATE for this window during Show() so wx
-                # fully initialises it but WM_ACTIVATE is never sent — no focus change,
-                # no screen reader announcement.  No WS_EX_APPWINDOW: keeping the dialog
-                # as a plain owned window means Windows auto-hides it with the owner and
-                # won't promote it to foreground when the owner is hidden to tray.
-                _CBTProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, ctypes.WPARAM, ctypes.LPARAM)
-                def _no_activate(nCode, wParam, lParam):
-                    if nCode == 5 and wParam == hwnd:  # HCBT_ACTIVATE for our window
-                        return 1
-                    return ctypes.windll.user32.CallNextHookEx(None, nCode, wParam, lParam)
-                _cb = _CBTProc(_no_activate)
-                tid = ctypes.windll.kernel32.GetCurrentThreadId()
-                hook = ctypes.windll.user32.SetWindowsHookExW(5, _cb, None, tid)  # WH_CBT
-                try:
-                    dlg.Show(); _shown = True
-                finally:
-                    if hook: ctypes.windll.user32.UnhookWindowsHookEx(hook)
-            except Exception:
-                pass
-            if not _shown:
-                dlg.Show()
-        else:
+            dlg = ChatDialog(self, sender, self.sock, self.user, is_logging_enabled, is_contact=is_contact)
+        popup_on_message = bool(app.user_config.get('incoming_popup_on_message', False))
+        alert_on_message = bool(app.user_config.get('incoming_alert_on_message', False))
+        if popup_on_message:
             dlg.Show()
         dlg.append(msg["msg"], msg["from"], msg["time"])
+        is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
+        if not is_focused_chat:
+            self._mark_unread(sender)
+            if alert_on_message:
+                app.play_sound("receive.wav")
+                show_notification("New message", f"{sender} has a new message.", timeout=5)
+        else:
+            self._clear_unread(sender)
         played_bot_tts = play_tts_audio_from_message(msg)
-        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
+        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and is_focused_chat:
             speak_text(f"{msg['from']}: {msg['msg']}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
@@ -4507,10 +4511,16 @@ class ChatDialog(wx.Dialog):
     def on_show_dialog(self, event):
         if event.IsShown():
             self._focus_input()
+            parent = self.GetParent()
+            if parent and hasattr(parent, "_clear_unread"):
+                parent._clear_unread(self.contact)
         event.Skip()
     def on_activate_dialog(self, event):
         if event.GetActive():
             self._focus_input()
+            parent = self.GetParent()
+            if parent and hasattr(parent, "_clear_unread"):
+                parent._clear_unread(self.contact)
         event.Skip()
     def _save_message_to_log(self, formatted_log_line):
         try:
