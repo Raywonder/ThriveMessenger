@@ -608,6 +608,152 @@ def _remove_user_from_all_direct_calls(username):
             if target != username:
                 _send_to_user(target, payload)
 
+def _group_name_valid(name):
+    n = str(name or "").strip()
+    if not n or len(n) > 80:
+        return False
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ .")
+    return all(ch in allowed for ch in n)
+
+def _group_policy_effective(group_name):
+    # Start with global policy and apply group-level override.
+    base = _fetch_group_policy(scope="global", group_name="__global__")
+    group_name = _normalize_group_name(group_name)
+    try:
+        con = sqlite3.connect(DB)
+        row = con.execute(
+            "SELECT policy_json FROM group_policies WHERE scope='group' AND group_name=?",
+            (group_name,),
+        ).fetchone()
+        con.close()
+        if row and row[0]:
+            raw = json.loads(str(row[0]))
+            if isinstance(raw, dict):
+                for key, val in raw.items():
+                    if key in GROUP_POLICY_SCHEMA:
+                        try:
+                            base[key] = _coerce_group_policy_value(key, val)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return base
+
+def _group_exists(group_name):
+    con = sqlite3.connect(DB)
+    row = con.execute("SELECT 1 FROM groups WHERE name=?", (group_name,)).fetchone()
+    con.close()
+    return bool(row)
+
+def _group_member_role(group_name, username):
+    con = sqlite3.connect(DB)
+    row = con.execute(
+        "SELECT role FROM group_members WHERE group_name=? AND username=?",
+        (group_name, username),
+    ).fetchone()
+    con.close()
+    return str(row[0]) if row else ""
+
+def _group_members(group_name):
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT username, role FROM group_members WHERE group_name=? ORDER BY username",
+        (group_name,),
+    ).fetchall()
+    con.close()
+    return [{"user": r[0], "role": r[1]} for r in rows]
+
+def _create_group(owner, group_name, topic=""):
+    if not _group_name_valid(group_name):
+        return False, "Invalid group name."
+    if _group_exists(group_name):
+        return False, "A group with this name already exists."
+    created = datetime.datetime.utcnow().isoformat()
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT INTO groups(name, owner, topic, created_at) VALUES(?,?,?,?)",
+        (group_name, owner, str(topic or "").strip(), created),
+    )
+    con.execute(
+        "INSERT OR REPLACE INTO group_members(group_name, username, role, joined_at) VALUES(?,?,?,?)",
+        (group_name, owner, "owner", created),
+    )
+    con.commit()
+    con.close()
+    return True, None
+
+def _join_group(username, group_name):
+    if not _group_exists(group_name):
+        return False, "Group does not exist."
+    policy = _group_policy_effective(group_name)
+    con = sqlite3.connect(DB)
+    verified_row = con.execute("SELECT is_verified FROM users WHERE username=?", (username,)).fetchone()
+    if policy.get("group_require_verified_users", False) and (not verified_row or int(verified_row[0] or 0) != 1):
+        con.close()
+        return False, "This group requires verified accounts."
+    count_row = con.execute("SELECT COUNT(*) FROM group_members WHERE group_name=?", (group_name,)).fetchone()
+    cur_count = int(count_row[0] or 0)
+    if cur_count >= int(policy.get("max_group_participants", 200) or 200):
+        con.close()
+        return False, "Group participant limit reached."
+    con.execute(
+        "INSERT OR IGNORE INTO group_members(group_name, username, role, joined_at) VALUES(?,?,?,?)",
+        (group_name, username, "member", datetime.datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
+    return True, None
+
+def _leave_group(username, group_name):
+    con = sqlite3.connect(DB)
+    owner_row = con.execute("SELECT owner FROM groups WHERE name=?", (group_name,)).fetchone()
+    if not owner_row:
+        con.close()
+        return False, "Group does not exist."
+    owner = str(owner_row[0] or "")
+    con.execute("DELETE FROM group_members WHERE group_name=? AND username=?", (group_name, username))
+    if username == owner:
+        replacement = con.execute(
+            "SELECT username FROM group_members WHERE group_name=? ORDER BY joined_at LIMIT 1",
+            (group_name,),
+        ).fetchone()
+        if replacement:
+            new_owner = str(replacement[0])
+            con.execute("UPDATE groups SET owner=? WHERE name=?", (new_owner, group_name))
+            con.execute(
+                "UPDATE group_members SET role='owner' WHERE group_name=? AND username=?",
+                (group_name, new_owner),
+            )
+        else:
+            con.execute("DELETE FROM groups WHERE name=?", (group_name,))
+    con.commit()
+    con.close()
+    return True, None
+
+def _list_groups_for_user(username):
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        """
+        SELECT g.name, g.owner, g.topic, g.created_at,
+               (SELECT COUNT(*) FROM group_members gm WHERE gm.group_name=g.name) AS member_count,
+               EXISTS(SELECT 1 FROM group_members gm2 WHERE gm2.group_name=g.name AND gm2.username=?) AS is_member
+        FROM groups g
+        ORDER BY g.name
+        """,
+        (username,),
+    ).fetchall()
+    con.close()
+    return [
+        {
+            "name": r[0],
+            "owner": r[1],
+            "topic": r[2] or "",
+            "created_at": r[3],
+            "member_count": int(r[4] or 0),
+            "is_member": bool(r[5]),
+        }
+        for r in rows
+    ]
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
 
@@ -2160,6 +2306,8 @@ def init_db():
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS groups (name TEXT PRIMARY KEY, owner TEXT, topic TEXT, created_at TEXT, is_private INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS group_members (group_name TEXT, username TEXT, role TEXT, joined_at TEXT, PRIMARY KEY(group_name, username))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
@@ -3658,6 +3806,116 @@ def handle_client(cs, addr):
                             os.remove(path)
                         except Exception:
                             pass
+            elif action == "group_list":
+                groups = _list_groups_for_user(user)
+                try:
+                    sock.sendall((json.dumps({"action": "group_list_response", "groups": groups}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_create":
+                group_name = str(msg.get("group", "")).strip()
+                topic = str(msg.get("topic", "") or "").strip()
+                ok, reason = _create_group(user, group_name, topic=topic)
+                payload = {"action": "group_create_result", "ok": bool(ok), "group": group_name}
+                if not ok:
+                    payload["reason"] = reason or "Could not create group."
+                try:
+                    sock.sendall((json.dumps(payload) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_join":
+                group_name = str(msg.get("group", "")).strip()
+                ok, reason = _join_group(user, group_name)
+                payload = {"action": "group_join_result", "ok": bool(ok), "group": group_name}
+                if not ok:
+                    payload["reason"] = reason or "Could not join group."
+                try:
+                    sock.sendall((json.dumps(payload) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_leave":
+                group_name = str(msg.get("group", "")).strip()
+                ok, reason = _leave_group(user, group_name)
+                payload = {"action": "group_leave_result", "ok": bool(ok), "group": group_name}
+                if not ok:
+                    payload["reason"] = reason or "Could not leave group."
+                try:
+                    sock.sendall((json.dumps(payload) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_members":
+                group_name = str(msg.get("group", "")).strip()
+                members = _group_members(group_name) if _group_exists(group_name) else []
+                try:
+                    sock.sendall((json.dumps({"action": "group_members_response", "group": group_name, "members": members}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_msg":
+                group_name = str(msg.get("group", "")).strip()
+                text = str(msg.get("msg", "") or "").strip()
+                if not group_name or not _group_exists(group_name):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_msg_failed", "group": group_name, "reason": "Unknown group."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                role = _group_member_role(group_name, user)
+                if not role:
+                    try:
+                        sock.sendall((json.dumps({"action": "group_msg_failed", "group": group_name, "reason": "You are not a member of this group."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                policy = _group_policy_effective(group_name)
+                if not policy.get("allow_group_text", True):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_msg_failed", "group": group_name, "reason": "Group text messaging is disabled."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if len(text) > int(policy.get("max_group_message_length", 4000) or 4000):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_msg_failed", "group": group_name, "reason": "Message exceeds group length policy."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if (("http://" in text) or ("https://" in text)) and not policy.get("allow_group_links", True):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_msg_failed", "group": group_name, "reason": "Links are disabled for this group."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                payload = {
+                    "action": "group_msg",
+                    "group": group_name,
+                    "from": user,
+                    "msg": text,
+                    "time": datetime.datetime.now().isoformat(),
+                }
+                members = _group_members(group_name)
+                delivered = 0
+                with lock:
+                    for m in members:
+                        target = m.get("user")
+                        if not target or target == user:
+                            continue
+                        s_to = clients.get(target)
+                        if not s_to:
+                            continue
+                        try:
+                            s_to.sendall((json.dumps(payload) + "\n").encode())
+                            delivered += 1
+                        except Exception:
+                            pass
+                try:
+                    sock.sendall((json.dumps({"action": "group_msg_sent", "group": group_name, "delivered": delivered}) + "\n").encode())
+                except Exception:
+                    pass
 
             elif action == "get_bot_rules":
                 if not _can_user_use_feature(user, "bot_rules"):
