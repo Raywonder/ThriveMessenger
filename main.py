@@ -1911,6 +1911,13 @@ class ClientApp(wx.App):
                 elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
                 elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
                 elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
+                elif act == "group_list_response": wx.CallAfter(self.frame.on_group_list_response, msg)
+                elif act == "group_create_result": wx.CallAfter(self.frame.on_group_create_result, msg)
+                elif act == "group_join_result": wx.CallAfter(self.frame.on_group_join_result, msg)
+                elif act == "group_leave_result": wx.CallAfter(self.frame.on_group_leave_result, msg)
+                elif act == "group_members_response": wx.CallAfter(self.frame.on_group_members_response, msg)
+                elif act == "group_msg": wx.CallAfter(self.frame.on_group_message, msg)
+                elif act == "group_msg_failed": wx.CallAfter(self.frame.on_group_message_failed, msg)
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -3024,6 +3031,191 @@ class InviteUserDialog(wx.Dialog):
     def should_include_link(self):
         return self.include_link.IsChecked()
 
+class GroupListDialog(wx.Dialog):
+    def __init__(self, parent_frame, sock):
+        super().__init__(parent_frame, title="Group Chats", size=(640, 460))
+        self.parent_frame = parent_frame
+        self.sock = sock
+        self.groups = []
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        self.list_box = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.list_box.Bind(wx.EVT_LISTBOX_DCLICK, self.on_open)
+        self.info = wx.StaticText(panel, label="Use Create, Join, Leave, or Open to manage group chats.")
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_create = wx.Button(panel, label="Create")
+        self.btn_join = wx.Button(panel, label="Join")
+        self.btn_leave = wx.Button(panel, label="Leave")
+        self.btn_open = wx.Button(panel, label="Open")
+        self.btn_refresh = wx.Button(panel, label="Refresh")
+        for b in [self.btn_create, self.btn_join, self.btn_leave, self.btn_open, self.btn_refresh]:
+            btn_row.Add(b, 1, wx.EXPAND | wx.ALL, 3)
+        self.btn_create.Bind(wx.EVT_BUTTON, self.on_create)
+        self.btn_join.Bind(wx.EVT_BUTTON, self.on_join)
+        self.btn_leave.Bind(wx.EVT_BUTTON, self.on_leave)
+        self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
+        self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
+        s.Add(self.info, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(self.list_box, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+    def on_close(self, event):
+        if self.parent_frame:
+            self.parent_frame._group_list_dlg = None
+        event.Skip()
+
+    def set_groups(self, groups):
+        self.groups = list(groups or [])
+        self.list_box.Clear()
+        for g in self.groups:
+            mark = "joined" if g.get("is_member") else "not joined"
+            topic = str(g.get("topic", "") or "").strip()
+            topic_text = f" | {topic}" if topic else ""
+            self.list_box.Append(f"{g.get('name')} | {mark} | members: {g.get('member_count', 0)}{topic_text}")
+        if self.list_box.GetCount() == 0:
+            self.list_box.Append("(No groups yet)")
+
+    def _selected_group(self):
+        idx = self.list_box.GetSelection()
+        if idx == wx.NOT_FOUND or idx < 0 or idx >= len(self.groups):
+            return None
+        return self.groups[idx]
+
+    def on_refresh(self, _):
+        try:
+            self.sock.sendall((json.dumps({"action": "group_list"}) + "\n").encode())
+        except Exception as e:
+            wx.MessageBox(f"Could not refresh groups: {e}", "Groups", wx.OK | wx.ICON_ERROR)
+
+    def on_create(self, _):
+        with wx.TextEntryDialog(self, "Group name:", "Create Group") as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            group_name = dlg.GetValue().strip()
+        if not group_name:
+            return
+        topic = ""
+        with wx.TextEntryDialog(self, "Optional topic:", "Create Group") as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                topic = dlg.GetValue().strip()
+        try:
+            self.sock.sendall((json.dumps({"action": "group_create", "group": group_name, "topic": topic}) + "\n").encode())
+        except Exception as e:
+            wx.MessageBox(f"Could not create group: {e}", "Groups", wx.OK | wx.ICON_ERROR)
+
+    def on_join(self, _):
+        g = self._selected_group()
+        if not g:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "group_join", "group": g.get("name")}) + "\n").encode())
+        except Exception as e:
+            wx.MessageBox(f"Could not join group: {e}", "Groups", wx.OK | wx.ICON_ERROR)
+
+    def on_leave(self, _):
+        g = self._selected_group()
+        if not g:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "group_leave", "group": g.get("name")}) + "\n").encode())
+        except Exception as e:
+            wx.MessageBox(f"Could not leave group: {e}", "Groups", wx.OK | wx.ICON_ERROR)
+
+    def on_open(self, _):
+        g = self._selected_group()
+        if not g:
+            return
+        if not g.get("is_member"):
+            wx.MessageBox("Join this group first.", "Groups", wx.OK | wx.ICON_INFORMATION)
+            return
+        self.parent_frame.open_group_chat(g.get("name"))
+
+    def on_create_result(self, msg):
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not create group."), "Groups", wx.OK | wx.ICON_WARNING)
+        self.on_refresh(None)
+
+    def on_join_result(self, msg):
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not join group."), "Groups", wx.OK | wx.ICON_WARNING)
+            return
+        self.on_refresh(None)
+        self.parent_frame.open_group_chat(msg.get("group"))
+
+    def on_leave_result(self, msg):
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not leave group."), "Groups", wx.OK | wx.ICON_WARNING)
+        self.on_refresh(None)
+
+class GroupChatDialog(wx.Dialog):
+    def __init__(self, parent, group_name, sock, user):
+        super().__init__(parent, title=f"Group Chat: {group_name}", size=(620, 500))
+        self.parent_frame = parent
+        self.group = group_name
+        self.sock = sock
+        self.user = user
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        self.members_lbl = wx.StaticText(panel, label="Members: loading...")
+        self.hist = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.input = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER)
+        self.btn_send = wx.Button(panel, label="Send")
+        self.btn_members = wx.Button(panel, label="Refresh Members")
+        self.input.Bind(wx.EVT_TEXT_ENTER, self.on_send)
+        self.btn_send.Bind(wx.EVT_BUTTON, self.on_send)
+        self.btn_members.Bind(wx.EVT_BUTTON, self.on_refresh_members)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        row.Add(self.btn_members, 0, wx.RIGHT, 6)
+        row.Add(self.btn_send, 0)
+        s.Add(self.members_lbl, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(self.hist, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(self.input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(row, 0, wx.ALIGN_RIGHT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+        wx.CallAfter(self.input.SetFocus)
+
+    def on_close(self, event):
+        if self.parent_frame and hasattr(self.parent_frame, "close_group_chat"):
+            self.parent_frame.close_group_chat(self.group)
+        event.Skip()
+
+    def set_members(self, members):
+        names = [f"{m.get('user')} ({m.get('role')})" for m in members or []]
+        self.members_lbl.SetLabel("Members: " + (", ".join(names) if names else "none"))
+
+    def on_refresh_members(self, _):
+        try:
+            self.sock.sendall((json.dumps({"action": "group_members", "group": self.group}) + "\n").encode())
+        except Exception:
+            pass
+
+    def append(self, text, sender, ts):
+        self.hist.Append(f"[{format_timestamp(ts)}] {sender}: {text}")
+        self.hist.SetSelection(self.hist.GetCount() - 1)
+
+    def append_error(self, reason):
+        self.hist.Append(f"[{format_timestamp(time.time())}] Error: {reason}")
+        self.hist.SetSelection(self.hist.GetCount() - 1)
+
+    def on_send(self, _):
+        txt = self.input.GetValue().strip()
+        if not txt:
+            return
+        payload = {
+            "action": "group_msg",
+            "group": self.group,
+            "msg": txt,
+        }
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.append(txt, self.user, datetime.datetime.now().isoformat())
+            self.input.Clear()
+        except Exception as e:
+            self.append_error(str(e))
+
 class MainFrame(wx.Frame):
     def _build_connection_title(self):
         app = wx.GetApp()
@@ -3075,7 +3267,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None
+        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_list_dlg = None; self._group_chats = {}
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
@@ -3164,6 +3356,7 @@ class MainFrame(wx.Frame):
         self.mi_delete_contact = file_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
         self.mi_send_file = file_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
         self.mi_file_transfers = file_menu.Append(wx.ID_ANY, "File Transfers")
+        self.mi_group_chats = file_menu.Append(wx.ID_ANY, "Group Chats")
         file_menu.AppendSeparator()
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
@@ -3217,6 +3410,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_delete, self.mi_delete_contact)
         self.Bind(wx.EVT_MENU, self.on_send_file, self.mi_send_file)
         self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_file_transfers)
+        self.Bind(wx.EVT_MENU, self.on_group_chats, self.mi_group_chats)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
@@ -3792,6 +3986,81 @@ class MainFrame(wx.Frame):
     def on_file_transfers(self, _):
         with FileTransfersDialog(self, wx.GetApp().transfer_history) as dlg:
             dlg.ShowModal()
+    def on_group_chats(self, _):
+        if self._group_list_dlg and self._group_list_dlg.IsShown():
+            self._group_list_dlg.Raise()
+            self._group_list_dlg.SetFocus()
+            try:
+                self.sock.sendall((json.dumps({"action": "group_list"}) + "\n").encode())
+            except Exception:
+                pass
+            return
+        self._group_list_dlg = GroupListDialog(self, self.sock)
+        self._group_list_dlg.Show()
+        try:
+            self.sock.sendall((json.dumps({"action": "group_list"}) + "\n").encode())
+        except Exception:
+            pass
+    def on_group_list_response(self, msg):
+        if self._group_list_dlg and self._group_list_dlg.IsShown():
+            self._group_list_dlg.set_groups(msg.get("groups", []))
+    def on_group_create_result(self, msg):
+        if self._group_list_dlg and self._group_list_dlg.IsShown():
+            self._group_list_dlg.on_create_result(msg)
+    def on_group_join_result(self, msg):
+        if self._group_list_dlg and self._group_list_dlg.IsShown():
+            self._group_list_dlg.on_join_result(msg)
+    def on_group_leave_result(self, msg):
+        if self._group_list_dlg and self._group_list_dlg.IsShown():
+            self._group_list_dlg.on_leave_result(msg)
+    def on_group_members_response(self, msg):
+        group = str(msg.get("group", "")).strip()
+        dlg = self._group_chats.get(group)
+        if dlg and dlg.IsShown():
+            dlg.set_members(msg.get("members", []))
+    def open_group_chat(self, group_name):
+        g = str(group_name or "").strip()
+        if not g:
+            return
+        dlg = self._group_chats.get(g)
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            return
+        dlg = GroupChatDialog(self, g, self.sock, self.user)
+        self._group_chats[g] = dlg
+        dlg.Show()
+        try:
+            self.sock.sendall((json.dumps({"action": "group_members", "group": g}) + "\n").encode())
+        except Exception:
+            pass
+    def close_group_chat(self, group_name):
+        g = str(group_name or "").strip()
+        if g in self._group_chats:
+            self._group_chats.pop(g, None)
+    def on_group_message(self, msg):
+        group = str(msg.get("group", "")).strip()
+        if not group:
+            return
+        dlg = self._group_chats.get(group)
+        if not dlg:
+            dlg = GroupChatDialog(self, group, self.sock, self.user)
+            self._group_chats[group] = dlg
+            # Keep non-intrusive behavior by default.
+            if bool(wx.GetApp().user_config.get("incoming_popup_on_message", False)):
+                dlg.Show()
+        sender = str(msg.get("from", ""))
+        text = str(msg.get("msg", ""))
+        ts = msg.get("time", datetime.datetime.now().isoformat())
+        dlg.append(text, sender, ts)
+    def on_group_message_failed(self, msg):
+        group = str(msg.get("group", "")).strip()
+        reason = str(msg.get("reason", "Group message failed."))
+        dlg = self._group_chats.get(group)
+        if dlg:
+            dlg.append_error(reason)
+        else:
+            wx.MessageBox(reason, "Group Message Failed", wx.OK | wx.ICON_WARNING)
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
