@@ -1182,6 +1182,8 @@ class SettingsDialog(wx.Dialog):
         self.btn_open_admin_console.Bind(wx.EVT_BUTTON, self.on_open_admin_console)
         self.btn_open_bot_rules = wx.Button(admin_box.GetStaticBox(), label="Open Bot Rules Manager")
         self.btn_open_bot_rules.Bind(wx.EVT_BUTTON, self.on_open_bot_rules)
+        self.btn_open_group_policy = wx.Button(admin_box.GetStaticBox(), label="Open Group Policy Manager")
+        self.btn_open_group_policy.Bind(wx.EVT_BUTTON, self.on_open_group_policy)
         self.allow_cross_server_dm_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Allow direct messaging from Directory to users on other configured servers")
         self.allow_cross_server_dm_cb.SetValue(bool(self.config.get('allow_cross_server_directory_message', True)))
         edit_window_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -1235,6 +1237,7 @@ class SettingsDialog(wx.Dialog):
         admin_box.Add(self.allow_cross_server_dm_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
         admin_box.Add(self.btn_open_bot_rules, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.btn_open_group_policy, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_sizer = wx.BoxSizer(wx.VERTICAL)
         admin_sizer.Add(admin_box, 1, wx.EXPAND | wx.ALL, 8)
         tab_admin.SetSizer(admin_sizer)
@@ -1263,6 +1266,7 @@ class SettingsDialog(wx.Dialog):
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
             self.btn_open_bot_rules.SetBackgroundColour(dark_color); self.btn_open_bot_rules.SetForegroundColour(light_text_color)
+            self.btn_open_group_policy.SetBackgroundColour(dark_color); self.btn_open_group_policy.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -1291,6 +1295,10 @@ class SettingsDialog(wx.Dialog):
         frame = self.GetParent()
         if frame and hasattr(frame, "on_manage_bot_rules"):
             frame.on_manage_bot_rules(None)
+    def on_open_group_policy(self, _):
+        frame = self.GetParent()
+        if frame and hasattr(frame, "on_manage_group_policy"):
+            frame.on_manage_group_policy(None)
     def apply_admin_config(self):
         cfg = configparser.ConfigParser(interpolation=None)
         cfg.read(self.client_conf_path)
@@ -1891,6 +1899,8 @@ class ClientApp(wx.App):
                 elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
                 elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
                 elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
+                elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
+                elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -3055,7 +3065,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None
+        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
@@ -3148,6 +3158,7 @@ class MainFrame(wx.Frame):
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
         self.mi_server_manager = file_menu.Append(wx.ID_ANY, "Server Manager")
         self.mi_bot_rules = file_menu.Append(wx.ID_ANY, "Manage Bot Rules")
+        self.mi_group_policy = file_menu.Append(wx.ID_ANY, "Manage Group Policy")
         self.mi_settings = file_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
         file_menu.AppendSeparator()
         self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
@@ -3199,6 +3210,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
         self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
+        self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
@@ -3407,6 +3419,14 @@ class MainFrame(wx.Frame):
             return
         self._bot_rules_dlg = BotRulesDialog(self, self.sock, self._known_bot_names())
         self._bot_rules_dlg.Show()
+    def on_manage_group_policy(self, _):
+        dlg = self._group_policy_dlg
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            return
+        self._group_policy_dlg = GroupPolicyDialog(self, self.sock)
+        self._group_policy_dlg.Show()
     def on_bot_rules(self, msg):
         dlg = self._bot_rules_dlg
         if dlg and dlg.IsShown():
@@ -3421,6 +3441,20 @@ class MainFrame(wx.Frame):
             return
         if not msg.get("ok"):
             wx.MessageBox(msg.get("reason", "Bot rules update failed."), "Bot Rules", wx.OK | wx.ICON_WARNING)
+    def on_group_policy(self, msg):
+        dlg = self._group_policy_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_policy_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not fetch group policy."), "Group Policy", wx.OK | wx.ICON_WARNING)
+    def on_group_policy_update(self, msg):
+        dlg = self._group_policy_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_update_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Group policy update failed."), "Group Policy", wx.OK | wx.ICON_WARNING)
     def on_server_info_response(self, msg):
         encrypted = isinstance(self.sock, ssl.SSLSocket)
         app = wx.GetApp()
@@ -4055,6 +4089,7 @@ class AdminDialog(wx.Dialog):
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         btn = wx.Button(self, label="&Send Command")
         btn_rules = wx.Button(self, label="Manage Bot Rules")
+        btn_group_policy = wx.Button(self, label="Manage Group Policy")
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
@@ -4063,12 +4098,14 @@ class AdminDialog(wx.Dialog):
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             btn_rules.SetBackgroundColour(dark_color); btn_rules.SetForegroundColour(light_text_color)
+            btn_group_policy.SetBackgroundColour(dark_color); btn_group_policy.SetForegroundColour(light_text_color)
             
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
-        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); btn_rules.Bind(wx.EVT_BUTTON, self.on_bot_rules)
+        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); btn_rules.Bind(wx.EVT_BUTTON, self.on_bot_rules); btn_group_policy.Bind(wx.EVT_BUTTON, self.on_group_policy)
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         btn_row.Add(btn, 1, wx.RIGHT, 5)
-        btn_row.Add(btn_rules, 1, wx.LEFT, 5)
+        btn_row.Add(btn_rules, 1, wx.LEFT | wx.RIGHT, 5)
+        btn_row.Add(btn_group_policy, 1, wx.LEFT, 5)
         s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5); self.SetSizer(s)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
@@ -4086,6 +4123,10 @@ class AdminDialog(wx.Dialog):
         parent = self.GetParent()
         if parent and hasattr(parent, "on_manage_bot_rules"):
             parent.on_manage_bot_rules(None)
+    def on_group_policy(self, _):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "on_manage_group_policy"):
+            parent.on_manage_group_policy(None)
     def append_response(self, text):
         ts = format_timestamp(time.time())
         line = f"{ts} | {text}"
@@ -4233,6 +4274,153 @@ class BotRulesDialog(wx.Dialog):
             wx.MessageBox(reason, "Bot Rules", wx.OK | wx.ICON_WARNING, self)
             return
         self.info.SetLabel(f"Rules updated for {bot}. Reloading...")
+        self.on_load(None)
+
+class GroupPolicyDialog(wx.Dialog):
+    def __init__(self, parent, sock):
+        super().__init__(parent, title="Group Policy Manager", size=(780, 560))
+        self.sock = sock
+        self.current_group = "__global__"
+        self.schema = {}
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        top.Add(wx.StaticText(panel, label="Group name (blank = global):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.group_txt = wx.TextCtrl(panel, value="")
+        top.Add(self.group_txt, 1, wx.EXPAND | wx.RIGHT, 8)
+        self.btn_load = wx.Button(panel, label="Load")
+        self.btn_save = wx.Button(panel, label="Save")
+        self.btn_reset = wx.Button(panel, label="Reset")
+        top.Add(self.btn_load, 0, wx.RIGHT, 4)
+        top.Add(self.btn_save, 0, wx.RIGHT, 4)
+        top.Add(self.btn_reset, 0)
+
+        self.info = wx.StaticText(panel, label="Edit advanced group chat/call controls as JSON policy.")
+        self.info.Wrap(740)
+        splitter = wx.SplitterWindow(panel, style=wx.SP_LIVE_UPDATE)
+        self.schema_list = wx.ListBox(splitter, style=wx.LB_SINGLE)
+        self.policy_txt = wx.TextCtrl(splitter, style=wx.TE_MULTILINE)
+        splitter.SplitVertically(self.schema_list, self.policy_txt, 320)
+        splitter.SetMinimumPaneSize(220)
+
+        close_row = wx.BoxSizer(wx.HORIZONTAL)
+        close_row.AddStretchSpacer(1)
+        self.btn_close = wx.Button(panel, wx.ID_CLOSE, "Close")
+        close_row.Add(self.btn_close, 0)
+
+        s.Add(top, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(self.info, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(splitter, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(close_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+        self.btn_load.Bind(wx.EVT_BUTTON, self.on_load)
+        self.btn_save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.btn_reset.Bind(wx.EVT_BUTTON, self.on_reset)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda _: self.Close())
+        self.schema_list.SetToolTip("Policy keys and descriptions.")
+        self.policy_txt.SetToolTip("Editable JSON policy payload. Save sends all keys shown.")
+        self.on_load(None)
+
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_F1:
+            open_help_docs_for_context("settings", self)
+            return
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        event.Skip()
+
+    def on_close(self, event):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "_group_policy_dlg"):
+            parent._group_policy_dlg = None
+        event.Skip()
+
+    def _group_value(self):
+        g = self.group_txt.GetValue().strip()
+        return g if g else "__global__"
+
+    def on_load(self, _):
+        group = self._group_value()
+        payload = {"action": "get_group_policy"}
+        if group != "__global__":
+            payload["group"] = group
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.info.SetLabel(f"Loading group policy for {group}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to request group policy: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+
+    def on_save(self, _):
+        group = self._group_value()
+        raw = self.policy_txt.GetValue().strip()
+        try:
+            updates = json.loads(raw) if raw else {}
+            if not isinstance(updates, dict):
+                raise ValueError("Policy JSON must be an object.")
+        except Exception as e:
+            wx.MessageBox(f"Invalid policy JSON: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+            return
+        payload = {"action": "set_group_policy", "updates": updates}
+        if group != "__global__":
+            payload["group"] = group
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.info.SetLabel(f"Saving policy for {group}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to save group policy: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+
+    def on_reset(self, _):
+        group = self._group_value()
+        payload = {"action": "reset_group_policy"}
+        if group != "__global__":
+            payload["group"] = group
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self.info.SetLabel(f"Resetting policy for {group}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to reset group policy: {e}", "Group Policy", wx.OK | wx.ICON_ERROR, self)
+
+    def handle_policy_payload(self, msg):
+        if not msg.get("ok"):
+            reason = msg.get("reason", "Failed to load group policy.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Group Policy", wx.OK | wx.ICON_WARNING, self)
+            return
+        group = str(msg.get("group", "__global__") or "__global__")
+        policy = msg.get("policy", {}) or {}
+        self.schema = msg.get("schema", {}) or {}
+        self.current_group = group
+        self.group_txt.SetValue("" if group == "__global__" else group)
+        try:
+            self.policy_txt.ChangeValue(json.dumps(policy, indent=2, ensure_ascii=False))
+        except Exception:
+            self.policy_txt.ChangeValue(str(policy))
+        self.schema_list.Clear()
+        for key in sorted(self.schema.keys()):
+            meta = self.schema.get(key, {})
+            t = meta.get("type", "any")
+            d = meta.get("default", "")
+            desc = meta.get("description", "")
+            self.schema_list.Append(f"{key} ({t}, default={d}) - {desc}")
+        editable = bool(msg.get("editable", False))
+        self.policy_txt.SetEditable(editable)
+        self.btn_save.Enable(editable)
+        self.btn_reset.Enable(editable)
+        self.info.SetLabel(f"Loaded policy for {group}. {'Editable' if editable else 'Read-only (admin required).'}")
+
+    def handle_update_payload(self, msg):
+        ok = bool(msg.get("ok"))
+        if not ok:
+            reason = msg.get("reason", "Group policy update failed.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Group Policy", wx.OK | wx.ICON_WARNING, self)
+            return
+        self.info.SetLabel("Policy updated. Reloading...")
         self.on_load(None)
 
 class ChatDialog(wx.Dialog):

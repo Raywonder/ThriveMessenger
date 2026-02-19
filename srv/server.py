@@ -32,6 +32,127 @@ bot_rules_text = {}
 restart_lock = threading.Lock()
 restart_scheduled_for = None
 
+GROUP_POLICY_SCHEMA = {
+    "allow_group_text": ("bool", True, "Allow users to send text messages in groups."),
+    "allow_group_links": ("bool", True, "Allow links in group messages."),
+    "allow_group_files": ("bool", True, "Allow file uploads/shares in groups."),
+    "allow_group_voice": ("bool", True, "Allow users to join group voice calls."),
+    "allow_group_video": ("bool", True, "Allow users to join group video calls."),
+    "allow_group_screen_share": ("bool", False, "Allow screen sharing in group calls."),
+    "allow_group_reactions": ("bool", True, "Allow reactions in group chats."),
+    "allow_group_edit": ("bool", True, "Allow users to edit their group messages."),
+    "allow_group_delete_own": ("bool", True, "Allow users to delete their own group messages."),
+    "allow_group_delete_any": ("bool", False, "Allow moderators/admins to delete any group message."),
+    "allow_group_invite_members": ("bool", True, "Allow non-admin members to invite users to groups."),
+    "allow_group_pin_messages": ("bool", False, "Allow non-admin members to pin messages."),
+    "allow_group_create_channels": ("bool", False, "Allow non-admin members to create sub-channels."),
+    "allow_group_mention_everyone": ("bool", False, "Allow @everyone style mentions."),
+    "allow_group_external_bots": ("bool", False, "Allow external bot accounts in groups."),
+    "max_group_message_length": ("int", 4000, "Maximum group message length."),
+    "max_group_attachments_per_message": ("int", 8, "Maximum attachments per group message."),
+    "max_group_file_size_bytes": ("int", 52428800, "Maximum file size for group uploads."),
+    "max_group_participants": ("int", 200, "Maximum number of participants per group."),
+    "max_group_concurrent_voice": ("int", 40, "Maximum concurrent users in group voice calls."),
+    "group_message_edit_window_seconds": ("int", 600, "Time window users can edit group messages."),
+    "group_message_delete_undo_seconds": ("int", 20, "Undo window after deleting group messages."),
+    "group_rate_limit_per_minute": ("int", 120, "Per-user group message rate limit per minute."),
+    "group_slow_mode_seconds": ("int", 0, "Slow mode delay between messages (0 disables)."),
+    "group_retention_days": ("int", 0, "Message retention days (0 keeps indefinitely)."),
+    "group_require_verified_users": ("bool", False, "Require verified accounts for group participation."),
+}
+
+def _group_policy_defaults():
+    return {k: GROUP_POLICY_SCHEMA[k][1] for k in GROUP_POLICY_SCHEMA}
+
+def _coerce_group_policy_value(key, raw):
+    value_type = GROUP_POLICY_SCHEMA[key][0]
+    if value_type == "bool":
+        if isinstance(raw, bool):
+            return raw
+        val = str(raw or "").strip().lower()
+        if val in ("1", "true", "yes", "on", "enabled"):
+            return True
+        if val in ("0", "false", "no", "off", "disabled"):
+            return False
+        raise ValueError(f"{key} expects true/false")
+    if value_type == "int":
+        val = int(raw)
+        if val < 0:
+            raise ValueError(f"{key} must be >= 0")
+        return val
+    raise ValueError(f"Unsupported type for {key}")
+
+def _normalize_group_name(group_name):
+    g = str(group_name or "").strip()
+    return g if g else "__global__"
+
+def _fetch_group_policy(scope="global", group_name=None):
+    scope = "group" if str(scope).lower() == "group" else "global"
+    group_name = _normalize_group_name(group_name)
+    defaults = _group_policy_defaults()
+    try:
+        con = sqlite3.connect(DB)
+        row = con.execute(
+            "SELECT policy_json FROM group_policies WHERE scope=? AND group_name=?",
+            (scope, group_name),
+        ).fetchone()
+        con.close()
+        if not row or not row[0]:
+            return defaults
+        parsed = json.loads(str(row[0]))
+        if not isinstance(parsed, dict):
+            return defaults
+        out = defaults.copy()
+        for key, val in parsed.items():
+            if key in GROUP_POLICY_SCHEMA:
+                try:
+                    out[key] = _coerce_group_policy_value(key, val)
+                except Exception:
+                    pass
+        return out
+    except Exception:
+        return defaults
+
+def _upsert_group_policy(scope="global", group_name=None, updates=None, updated_by="admin"):
+    scope = "group" if str(scope).lower() == "group" else "global"
+    group_name = _normalize_group_name(group_name)
+    updates = updates or {}
+    current = _fetch_group_policy(scope, group_name)
+    merged = current.copy()
+    for key, raw in updates.items():
+        if key not in GROUP_POLICY_SCHEMA:
+            raise ValueError(f"Unknown policy key: {key}")
+        merged[key] = _coerce_group_policy_value(key, raw)
+    payload = json.dumps(merged, ensure_ascii=False)
+    con = sqlite3.connect(DB)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO group_policies(scope, group_name, policy_json, updated_by, updated_at)
+        VALUES(?,?,?,?,?)
+        """,
+        (scope, group_name, payload, str(updated_by or "admin"), datetime.datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
+    return merged
+
+def _reset_group_policy(scope="global", group_name=None):
+    scope = "group" if str(scope).lower() == "group" else "global"
+    group_name = _normalize_group_name(group_name)
+    con = sqlite3.connect(DB)
+    con.execute("DELETE FROM group_policies WHERE scope=? AND group_name=?", (scope, group_name))
+    con.commit()
+    con.close()
+
+def _policy_schema_payload():
+    return {
+        key: {
+            "type": GROUP_POLICY_SCHEMA[key][0],
+            "default": GROUP_POLICY_SCHEMA[key][1],
+            "description": GROUP_POLICY_SCHEMA[key][2],
+        }
+        for key in sorted(GROUP_POLICY_SCHEMA.keys())
+    }
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
 
@@ -689,6 +810,7 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
@@ -1077,6 +1199,36 @@ def handle_client(cs, addr):
                             response = f"User '{cmd_parts[1]}' file ban for '{file_type}' removed."
                         else:
                             response = f"All file bans for user '{cmd_parts[1]}' removed."
+                    elif command == "gpolicy" and len(cmd_parts) >= 2:
+                        sub = cmd_parts[1].lower()
+                        if sub == "show":
+                            # /gpolicy show [group_name]
+                            target_group = cmd_parts[2] if len(cmd_parts) >= 3 else "__global__"
+                            scope = "group" if target_group != "__global__" else "global"
+                            policy = _fetch_group_policy(scope=scope, group_name=target_group)
+                            response = json.dumps({
+                                "scope": scope,
+                                "group": target_group,
+                                "policy": policy
+                            }, ensure_ascii=False)
+                        elif sub == "set" and len(cmd_parts) >= 4:
+                            # /gpolicy set key value [group_name]
+                            key = cmd_parts[2]
+                            value = cmd_parts[3]
+                            target_group = cmd_parts[4] if len(cmd_parts) >= 5 else "__global__"
+                            scope = "group" if target_group != "__global__" else "global"
+                            merged = _upsert_group_policy(scope=scope, group_name=target_group, updates={key: value}, updated_by=user)
+                            response = f"Group policy updated for {scope}:{target_group}. {key}={merged.get(key)}"
+                        elif sub == "reset":
+                            # /gpolicy reset [group_name]
+                            target_group = cmd_parts[2] if len(cmd_parts) >= 3 else "__global__"
+                            scope = "group" if target_group != "__global__" else "global"
+                            _reset_group_policy(scope=scope, group_name=target_group)
+                            response = f"Group policy reset for {scope}:{target_group}."
+                        elif sub == "keys":
+                            response = json.dumps(_policy_schema_payload(), ensure_ascii=False)
+                        else:
+                            response = "Error: gpolicy syntax: /gpolicy show [group], /gpolicy set <key> <value> [group], /gpolicy reset [group], /gpolicy keys"
                     else:
                         response = "Error: Unknown command or incorrect syntax."
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
@@ -1165,6 +1317,77 @@ def handle_client(cs, addr):
                         "rules_available": bool(rules_text),
                         "editable": bool(_is_admin(user)),
                         "scope": "admin_override" if (_is_admin(user) and bool(_get_admin_bot_rules(user, bot_name))) else "global",
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "get_group_policy":
+                group_name = str(msg.get("group", "") or "").strip()
+                scope = "group" if group_name else "global"
+                policy = _fetch_group_policy(scope=scope, group_name=group_name or "__global__")
+                payload = {
+                    "action": "group_policy",
+                    "ok": True,
+                    "scope": scope,
+                    "group": group_name or "__global__",
+                    "policy": policy,
+                    "schema": _policy_schema_payload(),
+                    "editable": bool(user in get_admins()),
+                }
+                try:
+                    sock.sendall((json.dumps(payload) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "set_group_policy":
+                if user not in get_admins():
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                group_name = str(msg.get("group", "") or "").strip()
+                scope = "group" if group_name else "global"
+                updates = msg.get("updates", {})
+                if not isinstance(updates, dict):
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Invalid updates payload."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    merged = _upsert_group_policy(scope=scope, group_name=group_name or "__global__", updates=updates, updated_by=user)
+                    sock.sendall((json.dumps({
+                        "action": "group_policy_update",
+                        "ok": True,
+                        "scope": scope,
+                        "group": group_name or "__global__",
+                        "policy": merged
+                    }) + "\n").encode())
+                except Exception as e:
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": str(e)}) + "\n").encode())
+                    except Exception:
+                        pass
+
+            elif action == "reset_group_policy":
+                if user not in get_admins():
+                    try:
+                        sock.sendall((json.dumps({"action": "group_policy_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                group_name = str(msg.get("group", "") or "").strip()
+                scope = "group" if group_name else "global"
+                _reset_group_policy(scope=scope, group_name=group_name or "__global__")
+                policy = _fetch_group_policy(scope=scope, group_name=group_name or "__global__")
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "group_policy_update",
+                        "ok": True,
+                        "scope": scope,
+                        "group": group_name or "__global__",
+                        "policy": policy
                     }) + "\n").encode())
                 except Exception:
                     pass
