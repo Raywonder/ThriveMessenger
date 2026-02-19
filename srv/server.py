@@ -1,4 +1,4 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
@@ -27,8 +27,13 @@ bot_voice_map = {}
 bot_external_usernames = set()
 allow_external_bot_contacts = True
 docs_cache = {}
+bot_rules_config = {}
+bot_rules_text = {}
 restart_lock = threading.Lock()
 restart_scheduled_for = None
+
+def _is_admin(username):
+    return str(username or "").strip() in get_admins()
 
 def _is_virtual_bot(username):
     uname = str(username or "").strip()
@@ -57,6 +62,144 @@ def _parse_bot_map(raw):
         if name and value:
             out[name] = value
     return out
+
+def _safe_read_text(path, limit=120000):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read(limit)
+    except Exception:
+        return ""
+
+def _select_agent_zip(pattern_or_path):
+    raw = str(pattern_or_path or "").strip()
+    if not raw:
+        return ""
+    if "*" in raw or "?" in raw or "[" in raw:
+        matches = sorted(glob.glob(raw))
+        if not matches:
+            return ""
+        return matches[-1]
+    return raw if os.path.isfile(raw) else ""
+
+def _load_rules_from_zip(zip_path, max_chars=60000):
+    if not zip_path or not os.path.isfile(zip_path):
+        return ""
+    preferred = ("AGENTS.md", "RULES.md", "RULES.txt", "BOT_RULES.md", "BOT_RULES.txt", "README.md")
+    chunks = []
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = zf.namelist()
+            ordered = []
+            for p in preferred:
+                ordered.extend([n for n in names if n.lower().endswith(p.lower())])
+            ordered.extend([
+                n for n in names
+                if n not in ordered and (
+                    "rule" in n.lower() or n.lower().endswith(".md") or n.lower().endswith(".txt")
+                )
+            ])
+            for name in ordered:
+                try:
+                    data = zf.read(name)
+                    text = data.decode("utf-8", errors="ignore").strip()
+                    if text:
+                        chunks.append(f"# Source: {name}\n{text}")
+                    if sum(len(c) for c in chunks) >= max_chars:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        return ""
+    out = "\n\n".join(chunks).strip()
+    return out[:max_chars]
+
+def _refresh_bot_rules():
+    global bot_rules_text
+    bot_rules_text = {}
+    zip_path = _select_agent_zip(bot_rules_config.get("agent_rules_zip_path", ""))
+    local_rules_path = str(bot_rules_config.get("agent_rules_file_path", "") or "").strip()
+    common_rules = ""
+    if zip_path:
+        common_rules = _load_rules_from_zip(zip_path)
+    if not common_rules and local_rules_path:
+        common_rules = _safe_read_text(local_rules_path, limit=60000)
+    if common_rules:
+        for bot in bot_usernames | {"openclaw-bot"} | bot_external_usernames:
+            bot_rules_text[bot] = common_rules
+
+def _rules_for_bot(bot_name):
+    return str(bot_rules_text.get(bot_name, "") or "").strip()
+
+def _get_admin_bot_rules(owner, bot_name):
+    owner = str(owner or "").strip()
+    bot_name = str(bot_name or "").strip()
+    if not owner or not bot_name:
+        return ""
+    try:
+        con = sqlite3.connect(DB)
+        row = con.execute(
+            "SELECT rules FROM bot_rule_overrides WHERE owner=? AND bot=?",
+            (owner, bot_name),
+        ).fetchone()
+        con.close()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+
+def _set_admin_bot_rules(owner, bot_name, rules):
+    owner = str(owner or "").strip()
+    bot_name = str(bot_name or "").strip()
+    rules = str(rules or "").strip()
+    if not owner or not bot_name:
+        return False
+    try:
+        con = sqlite3.connect(DB)
+        con.execute(
+            """
+            INSERT OR REPLACE INTO bot_rule_overrides(owner, bot, rules, updated_at)
+            VALUES(?,?,?,?)
+            """,
+            (owner, bot_name, rules, datetime.datetime.utcnow().isoformat()),
+        )
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+def _clear_admin_bot_rules(owner, bot_name):
+    owner = str(owner or "").strip()
+    bot_name = str(bot_name or "").strip()
+    if not owner or not bot_name:
+        return False
+    try:
+        con = sqlite3.connect(DB)
+        con.execute("DELETE FROM bot_rule_overrides WHERE owner=? AND bot=?", (owner, bot_name))
+        con.commit()
+        con.close()
+        return True
+    except Exception:
+        return False
+
+def _effective_rules_for_bot(bot_name, owner=None):
+    base_rules = _rules_for_bot(bot_name)
+    owner = str(owner or "").strip()
+    if owner and _is_admin(owner):
+        admin_rules = _get_admin_bot_rules(owner, bot_name)
+        if admin_rules:
+            return admin_rules
+    return base_rules
+
+def _ensure_admin_bot_rules_seed(owner, bot_name):
+    owner = str(owner or "").strip()
+    bot_name = str(bot_name or "").strip()
+    if not owner or not bot_name or not _is_admin(owner):
+        return
+    if _get_admin_bot_rules(owner, bot_name):
+        return
+    base_rules = _rules_for_bot(bot_name)
+    if base_rules:
+        _set_admin_bot_rules(owner, bot_name, base_rules)
 
 def _load_docs_text():
     key = "docs_text"
@@ -202,10 +345,15 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     if not user_text:
         user_text = "Introduce yourself and explain how you can help in one short message."
     docs_context = _documentation_context_for_query(user_text)
+    rules_context = _effective_rules_for_bot(bot_name, sender_user)
     if docs_context:
         system_prompt += (
             " Always verify feature and usage answers against the documentation context provided. "
             "If docs do not confirm a detail, say it is not documented/uncertain instead of guessing."
+        )
+    if rules_context:
+        system_prompt += (
+            " Follow the bot ruleset provided below. If a user asks what rules you follow, summarize these rules."
         )
 
     payload = {
@@ -214,6 +362,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
+            {"role": "system", "content": f"Agent rules context:\n{rules_context[:5000]}" if rules_context else "Agent rules context unavailable."},
             {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
         ]
     }
@@ -499,6 +648,12 @@ def load_config():
     allow_external_bot_contacts = config.getboolean('bots', 'allow_external_bot_contacts', fallback=True)
     global bot_voice_map
     bot_voice_map = _parse_bot_map(config.get('bots', 'voice_map', fallback=''))
+    global bot_rules_config
+    bot_rules_config = {
+        'agent_rules_zip_path': config.get('bots', 'agent_rules_zip_path', fallback='/home/devinecr/downloads/*.zip'),
+        'agent_rules_file_path': config.get('bots', 'agent_rules_file_path', fallback=''),
+    }
+    _refresh_bot_rules()
     global bot_runtime_config
     bot_runtime_config = {
         'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=True),
@@ -533,6 +688,7 @@ def init_db():
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
@@ -782,6 +938,9 @@ def handle_client(cs, addr):
                     is_online = _is_online_user(contact_to_add)
                     contact_status_text = _status_for_user(contact_to_add)
                     admins = get_admins()
+                    if is_bot:
+                        _ensure_admin_bot_rules_seed(user, contact_to_add)
+                    rules_text = _effective_rules_for_bot(contact_to_add, user) if is_bot else ""
                     contact_data = {
                         "user": contact_to_add,
                         "blocked": 0,
@@ -789,7 +948,10 @@ def handle_client(cs, addr):
                         "is_admin": contact_to_add in admins,
                         "status_text": contact_status_text,
                         "is_bot": bool(is_bot),
-                        "bot_origin": "local" if _is_virtual_bot(contact_to_add) else ("external" if is_bot else "user")
+                        "bot_origin": "local" if _is_virtual_bot(contact_to_add) else ("external" if is_bot else "user"),
+                        "bot_rules_available": bool(rules_text),
+                        "bot_rules_preview": rules_text[:1000] if rules_text else "",
+                        "bot_rules_editable": bool(is_bot and _is_admin(user)),
                     }
                     if _is_virtual_bot(contact_to_add) and str(contact_to_add).lower() == "openclaw-bot":
                         token = _upsert_bot_token(user, contact_to_add)
@@ -982,6 +1144,86 @@ def handle_client(cs, addr):
                     })
                 try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
                 except: pass
+
+            elif action == "get_bot_rules":
+                bot_name = str(msg.get("bot", "")).strip()
+                if not bot_name or not _is_registered_bot(bot_name):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules", "ok": False, "reason": "Unknown bot."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if _is_admin(user):
+                    _ensure_admin_bot_rules_seed(user, bot_name)
+                rules_text = _effective_rules_for_bot(bot_name, user)
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "bot_rules",
+                        "ok": True,
+                        "bot": bot_name,
+                        "rules": rules_text,
+                        "rules_available": bool(rules_text),
+                        "editable": bool(_is_admin(user)),
+                        "scope": "admin_override" if (_is_admin(user) and bool(_get_admin_bot_rules(user, bot_name))) else "global",
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "set_bot_rules":
+                if not _is_admin(user):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                bot_name = str(msg.get("bot", "")).strip()
+                rules_text = str(msg.get("rules", "") or "").strip()
+                if not bot_name or not _is_registered_bot(bot_name):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Unknown bot."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if len(rules_text) > 60000:
+                    rules_text = rules_text[:60000]
+                ok = _set_admin_bot_rules(user, bot_name, rules_text)
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "bot_rules_update",
+                        "ok": bool(ok),
+                        "bot": bot_name,
+                        "scope": "admin_override",
+                        "rules_available": bool(rules_text),
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "reset_bot_rules":
+                if not _is_admin(user):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Admin only."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                bot_name = str(msg.get("bot", "")).strip()
+                if not bot_name or not _is_registered_bot(bot_name):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_rules_update", "ok": False, "reason": "Unknown bot."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                _clear_admin_bot_rules(user, bot_name)
+                _ensure_admin_bot_rules_seed(user, bot_name)
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "bot_rules_update",
+                        "ok": True,
+                        "bot": bot_name,
+                        "scope": "global_seeded",
+                        "rules_available": bool(_effective_rules_for_bot(bot_name, user)),
+                    }) + "\n").encode())
+                except Exception:
+                    pass
 
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]

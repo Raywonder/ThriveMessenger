@@ -1139,6 +1139,8 @@ class SettingsDialog(wx.Dialog):
         restart_row.Add(self.restart_delay_txt, 1, wx.EXPAND)
         self.btn_open_admin_console = wx.Button(admin_box.GetStaticBox(), label="Open Server Command Console")
         self.btn_open_admin_console.Bind(wx.EVT_BUTTON, self.on_open_admin_console)
+        self.btn_open_bot_rules = wx.Button(admin_box.GetStaticBox(), label="Open Bot Rules Manager")
+        self.btn_open_bot_rules.Bind(wx.EVT_BUTTON, self.on_open_bot_rules)
         edit_window_row = wx.BoxSizer(wx.HORIZONTAL)
         edit_window_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Edit window (seconds):"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.message_edit_window_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('message_edit_window_seconds', 300)))
@@ -1188,6 +1190,7 @@ class SettingsDialog(wx.Dialog):
         admin_box.Add(edit_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(undo_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
+        admin_box.Add(self.btn_open_bot_rules, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_sizer = wx.BoxSizer(wx.VERTICAL)
         admin_sizer.Add(admin_box, 1, wx.EXPAND | wx.ALL, 8)
         tab_admin.SetSizer(admin_sizer)
@@ -1214,6 +1217,7 @@ class SettingsDialog(wx.Dialog):
             self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
+            self.btn_open_bot_rules.SetBackgroundColour(dark_color); self.btn_open_bot_rules.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -1238,6 +1242,10 @@ class SettingsDialog(wx.Dialog):
         frame = self.GetParent()
         if frame and hasattr(frame, "on_admin"):
             frame.on_admin(None)
+    def on_open_bot_rules(self, _):
+        frame = self.GetParent()
+        if frame and hasattr(frame, "on_manage_bot_rules"):
+            frame.on_manage_bot_rules(None)
     def apply_admin_config(self):
         cfg = configparser.ConfigParser(interpolation=None)
         cfg.read(self.client_conf_path)
@@ -1771,6 +1779,8 @@ class ClientApp(wx.App):
                 elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                 elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
                 elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
+                elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
+                elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -2863,7 +2873,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None
+        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
@@ -2955,6 +2965,7 @@ class MainFrame(wx.Frame):
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
         self.mi_server_manager = file_menu.Append(wx.ID_ANY, "Server Manager")
+        self.mi_bot_rules = file_menu.Append(wx.ID_ANY, "Manage Bot Rules")
         self.mi_settings = file_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
         file_menu.AppendSeparator()
         self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
@@ -3005,6 +3016,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
+        self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
@@ -3195,6 +3207,37 @@ class MainFrame(wx.Frame):
                 app.user_config['last_server_name'] = app.user_config.get('primary_server_name') or updated_entries[0].get('name', '')
             save_user_config(app.user_config)
             wx.MessageBox("Server list updated. Changes apply on next login.", "Server Manager", wx.OK | wx.ICON_INFORMATION)
+    def _known_bot_names(self):
+        names = {"openclaw-bot", "assistant-bot", "helper-bot"}
+        for c in self._all_contacts:
+            uname = str(c.get("user", "")).strip()
+            if not uname:
+                continue
+            if uname.lower().endswith("-bot") or uname in names:
+                names.add(uname)
+        return sorted(names, key=lambda x: x.lower())
+    def on_manage_bot_rules(self, _):
+        dlg = self._bot_rules_dlg
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            return
+        self._bot_rules_dlg = BotRulesDialog(self, self.sock, self._known_bot_names())
+        self._bot_rules_dlg.Show()
+    def on_bot_rules(self, msg):
+        dlg = self._bot_rules_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_rules_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not fetch bot rules."), "Bot Rules", wx.OK | wx.ICON_WARNING)
+    def on_bot_rules_update(self, msg):
+        dlg = self._bot_rules_dlg
+        if dlg and dlg.IsShown():
+            dlg.handle_update_payload(msg)
+            return
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Bot rules update failed."), "Bot Rules", wx.OK | wx.ICON_WARNING)
     def on_server_info_response(self, msg):
         encrypted = isinstance(self.sock, ssl.SSLSocket)
         app = wx.GetApp()
@@ -3827,6 +3870,7 @@ class AdminDialog(wx.Dialog):
         self.hist.InsertColumn(0, "Server Response", width=200); self.hist.InsertColumn(1, "Time", width=220)
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         btn = wx.Button(self, label="&Send Command")
+        btn_rules = wx.Button(self, label="Manage Bot Rules")
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
@@ -3834,9 +3878,14 @@ class AdminDialog(wx.Dialog):
             box_msg.GetStaticBox().SetBackgroundColour(dark_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
             btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
+            btn_rules.SetBackgroundColour(dark_color); btn_rules.SetForegroundColour(light_text_color)
             
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
-        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); s.Add(btn, 0, wx.CENTER|wx.ALL, 5); self.SetSizer(s)
+        s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); btn_rules.Bind(wx.EVT_BUTTON, self.on_bot_rules)
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        btn_row.Add(btn, 1, wx.RIGHT, 5)
+        btn_row.Add(btn_rules, 1, wx.LEFT, 5)
+        s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5); self.SetSizer(s)
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("admin", self)
@@ -3847,9 +3896,151 @@ class AdminDialog(wx.Dialog):
         if not cmd: return
         if not cmd.startswith('/'): self.append_response("Error: Commands must start with /"); return
         msg = {"action":"admin_cmd", "cmd": cmd[1:]}; self.sock.sendall(json.dumps(msg).encode()+b"\n"); self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
+    def on_bot_rules(self, _):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "on_manage_bot_rules"):
+            parent.on_manage_bot_rules(None)
     def append_response(self, text):
         ts = time.time(); idx = self.hist.GetItemCount(); self.hist.InsertItem(idx, text); self.hist.SetItem(idx, 1, format_timestamp(ts))
         if text.lower().startswith('error'): self.hist.SetItemTextColour(idx, wx.RED)
+
+class BotRulesDialog(wx.Dialog):
+    def __init__(self, parent, sock, bot_names=None):
+        super().__init__(parent, title="Bot Rules Manager", size=(700, 520))
+        self.sock = sock
+        self.current_bot = ""
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+
+        dark_mode_on = is_windows_dark_mode()
+        if dark_mode_on:
+            dark_color = wx.Colour(40, 40, 40)
+            light_text_color = wx.WHITE
+            WxMswDarkMode().enable(self)
+            self.SetBackgroundColour(dark_color)
+            panel.SetBackgroundColour(dark_color)
+
+        top_row = wx.BoxSizer(wx.HORIZONTAL)
+        top_row.Add(wx.StaticText(panel, label="Bot username:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_choice = wx.ComboBox(panel, style=wx.CB_DROPDOWN)
+        for bot in bot_names or []:
+            self.bot_choice.Append(bot)
+        if self.bot_choice.GetCount() == 0:
+            self.bot_choice.Append("openclaw-bot")
+        self.bot_choice.SetSelection(0)
+        top_row.Add(self.bot_choice, 1, wx.EXPAND | wx.RIGHT, 8)
+        self.btn_load = wx.Button(panel, label="Load Rules")
+        self.btn_save = wx.Button(panel, label="Save Rules")
+        self.btn_reset = wx.Button(panel, label="Reset to Global")
+        top_row.Add(self.btn_load, 0, wx.RIGHT, 4)
+        top_row.Add(self.btn_save, 0, wx.RIGHT, 4)
+        top_row.Add(self.btn_reset, 0)
+
+        self.info = wx.StaticText(panel, label="Load a bot to view active rules. Admins can edit and save overrides.")
+        self.info.Wrap(640)
+        self.rules_txt = wx.TextCtrl(panel, style=wx.TE_MULTILINE)
+
+        close_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_close = wx.Button(panel, wx.ID_CLOSE, "Close")
+        close_row.AddStretchSpacer(1)
+        close_row.Add(self.btn_close, 0)
+
+        s.Add(top_row, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(self.info, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(self.rules_txt, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(close_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+        if dark_mode_on:
+            panel.SetForegroundColour(light_text_color)
+            self.bot_choice.SetBackgroundColour(dark_color); self.bot_choice.SetForegroundColour(light_text_color)
+            self.rules_txt.SetBackgroundColour(dark_color); self.rules_txt.SetForegroundColour(light_text_color)
+            for b in (self.btn_load, self.btn_save, self.btn_reset, self.btn_close):
+                b.SetBackgroundColour(dark_color); b.SetForegroundColour(light_text_color)
+            self.info.SetForegroundColour(light_text_color)
+
+        self.btn_load.Bind(wx.EVT_BUTTON, self.on_load)
+        self.btn_save.Bind(wx.EVT_BUTTON, self.on_save)
+        self.btn_reset.Bind(wx.EVT_BUTTON, self.on_reset)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda _: self.Close())
+        self.on_load(None)
+
+    def on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.Close()
+            return
+        event.Skip()
+
+    def on_close(self, event):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "_bot_rules_dlg"):
+            parent._bot_rules_dlg = None
+        event.Skip()
+
+    def _selected_bot(self):
+        bot = self.bot_choice.GetValue().strip()
+        if not bot:
+            bot = "openclaw-bot"
+            self.bot_choice.SetValue(bot)
+        self.current_bot = bot
+        return bot
+
+    def on_load(self, _):
+        bot = self._selected_bot()
+        try:
+            self.sock.sendall((json.dumps({"action": "get_bot_rules", "bot": bot}) + "\n").encode())
+            self.info.SetLabel(f"Loading rules for {bot}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to request bot rules: {e}", "Bot Rules", wx.OK | wx.ICON_ERROR, self)
+
+    def on_save(self, _):
+        bot = self._selected_bot()
+        rules = self.rules_txt.GetValue()
+        try:
+            self.sock.sendall((json.dumps({"action": "set_bot_rules", "bot": bot, "rules": rules}) + "\n").encode())
+            self.info.SetLabel(f"Saving rules for {bot}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to save bot rules: {e}", "Bot Rules", wx.OK | wx.ICON_ERROR, self)
+
+    def on_reset(self, _):
+        bot = self._selected_bot()
+        try:
+            self.sock.sendall((json.dumps({"action": "reset_bot_rules", "bot": bot}) + "\n").encode())
+            self.info.SetLabel(f"Resetting rules for {bot}...")
+        except Exception as e:
+            wx.MessageBox(f"Failed to reset bot rules: {e}", "Bot Rules", wx.OK | wx.ICON_ERROR, self)
+
+    def handle_rules_payload(self, msg):
+        ok = bool(msg.get("ok"))
+        if not ok:
+            reason = msg.get("reason", "Could not load bot rules.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Bot Rules", wx.OK | wx.ICON_WARNING, self)
+            return
+        bot = str(msg.get("bot", self.current_bot) or self.current_bot)
+        rules = str(msg.get("rules", "") or "")
+        editable = bool(msg.get("editable", False))
+        scope = str(msg.get("scope", "global") or "global")
+        self.current_bot = bot
+        self.bot_choice.SetValue(bot)
+        self.rules_txt.ChangeValue(rules)
+        self.rules_txt.SetEditable(editable)
+        self.btn_save.Enable(editable)
+        self.btn_reset.Enable(editable)
+        self.info.SetLabel(f"Loaded {scope} rules for {bot}. {'Editable' if editable else 'Read-only for non-admins.'}")
+
+    def handle_update_payload(self, msg):
+        ok = bool(msg.get("ok"))
+        bot = str(msg.get("bot", self.current_bot) or self.current_bot)
+        if not ok:
+            reason = msg.get("reason", "Bot rules update failed.")
+            self.info.SetLabel(reason)
+            wx.MessageBox(reason, "Bot Rules", wx.OK | wx.ICON_WARNING, self)
+            return
+        self.info.SetLabel(f"Rules updated for {bot}. Reloading...")
+        self.on_load(None)
 
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True):
