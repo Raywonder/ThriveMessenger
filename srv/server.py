@@ -31,6 +31,8 @@ bot_rules_config = {}
 bot_rules_text = {}
 restart_lock = threading.Lock()
 restart_scheduled_for = None
+group_call_sessions = {}
+group_call_lock = threading.Lock()
 
 GROUP_POLICY_SCHEMA = {
     "allow_group_text": ("bool", True, "Allow users to send text messages in groups."),
@@ -153,6 +155,46 @@ def _policy_schema_payload():
         }
         for key in sorted(GROUP_POLICY_SCHEMA.keys())
     }
+
+def _group_call_snapshot(group_name):
+    with group_call_lock:
+        data = group_call_sessions.get(group_name) or {}
+        participants = sorted(list(data.get("participants", set())))
+        mode = data.get("mode", "voice")
+    return {"group": group_name, "mode": mode, "participants": participants, "count": len(participants)}
+
+def _group_call_broadcast(group_name, payload, exclude=None):
+    targets = []
+    with group_call_lock:
+        members = list((group_call_sessions.get(group_name) or {}).get("participants", set()))
+    with lock:
+        for uname in members:
+            if exclude and uname == exclude:
+                continue
+            s = clients.get(uname)
+            if s:
+                targets.append(s)
+    wire = (json.dumps(payload) + "\n").encode()
+    for s in targets:
+        try:
+            s.sendall(wire)
+        except Exception:
+            pass
+
+def _remove_user_from_all_group_calls(username):
+    events = []
+    with group_call_lock:
+        for g, data in list(group_call_sessions.items()):
+            participants = data.get("participants", set())
+            if username in participants:
+                participants.discard(username)
+                snapshot = {"action": "group_call_event", "event": "leave", "by": username}
+                snapshot.update(_group_call_snapshot(g))
+                events.append((g, snapshot))
+            if not participants:
+                group_call_sessions.pop(g, None)
+    for g, payload in events:
+        _group_call_broadcast(g, payload, exclude=username)
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
 
@@ -1448,6 +1490,107 @@ def handle_client(cs, addr):
                 except Exception:
                     pass
 
+            elif action == "group_call_list":
+                rows = []
+                with group_call_lock:
+                    for g in sorted(group_call_sessions.keys()):
+                        snap = _group_call_snapshot(g)
+                        rows.append(snap)
+                try:
+                    sock.sendall((json.dumps({"action": "group_call_list_response", "calls": rows}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_call_join":
+                group = str(msg.get("group", "")).strip()
+                mode = str(msg.get("mode", "voice") or "voice").strip().lower()
+                if mode not in ("voice", "video"):
+                    mode = "voice"
+                if not group:
+                    try:
+                        sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "reason": "Missing group name."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                # Enforce global/group call policy when configured.
+                policy = _fetch_group_policy(scope="global", group_name="__global__")
+                if mode == "voice" and not policy.get("allow_group_voice", True):
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": "Group voice calls are disabled."}) + "\n").encode())
+                    continue
+                if mode == "video" and not policy.get("allow_group_video", True):
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": "Group video calls are disabled."}) + "\n").encode())
+                    continue
+                with group_call_lock:
+                    data = group_call_sessions.setdefault(group, {"mode": mode, "participants": set()})
+                    if data.get("mode") != mode and data.get("participants"):
+                        mode = data.get("mode", "voice")
+                    data["mode"] = mode
+                    max_voice = int(policy.get("max_group_concurrent_voice", 40) or 40)
+                    if len(data["participants"]) >= max_voice and user not in data["participants"]:
+                        sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": "Group call participant limit reached."}) + "\n").encode())
+                        continue
+                    data["participants"].add(user)
+                payload = {"action": "group_call_event", "event": "join", "by": user}
+                payload.update(_group_call_snapshot(group))
+                _group_call_broadcast(group, payload)
+                try:
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": True, "group": group}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_call_leave":
+                group = str(msg.get("group", "")).strip()
+                if not group:
+                    continue
+                with group_call_lock:
+                    data = group_call_sessions.get(group)
+                    if not data:
+                        pass
+                    else:
+                        data.get("participants", set()).discard(user)
+                        if not data.get("participants"):
+                            group_call_sessions.pop(group, None)
+                payload = {"action": "group_call_event", "event": "leave", "by": user}
+                payload.update(_group_call_snapshot(group))
+                _group_call_broadcast(group, payload, exclude=user)
+                try:
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": True, "group": group}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "group_call_signal":
+                group = str(msg.get("group", "")).strip()
+                target = str(msg.get("to", "")).strip()
+                signal_type = str(msg.get("signal_type", "")).strip()
+                signal_data = msg.get("data", {})
+                if not group or not target:
+                    continue
+                with group_call_lock:
+                    data = group_call_sessions.get(group) or {}
+                    participants = set(data.get("participants", set()))
+                if user not in participants or target not in participants:
+                    try:
+                        sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Call participant not found."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                with lock:
+                    target_sock = clients.get(target)
+                if not target_sock:
+                    sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": f"{target} is offline."}) + "\n").encode())
+                    continue
+                try:
+                    target_sock.sendall((json.dumps({
+                        "action": "group_call_signal",
+                        "group": group,
+                        "from": user,
+                        "signal_type": signal_type,
+                        "data": signal_data
+                    }) + "\n").encode())
+                    sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": True, "group": group, "to": target}) + "\n").encode())
+                except Exception:
+                    sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Signal relay failed."}) + "\n").encode())
+
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
                 con = sqlite3.connect(DB)
@@ -1615,7 +1758,9 @@ def handle_client(cs, addr):
         with lock:
             if user in clients: del clients[user]
             client_statuses.pop(user, None)
-        if user: broadcast_contact_status(user, False)
+        if user:
+            _remove_user_from_all_group_calls(user)
+            broadcast_contact_status(user, False)
 
 def check_file_ban(username, file_ext):
     con = sqlite3.connect(DB)

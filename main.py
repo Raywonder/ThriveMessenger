@@ -1911,6 +1911,11 @@ class ClientApp(wx.App):
                 elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
                 elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
                 elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
+                elif act == "group_call_list_response": wx.CallAfter(self.frame.on_group_call_list_response, msg)
+                elif act == "group_call_event": wx.CallAfter(self.frame.on_group_call_event, msg)
+                elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
+                elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
+                elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
                 elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
         except (IOError, json.JSONDecodeError, ValueError):
             print("Disconnected from server.")
@@ -3075,7 +3080,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{user} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None
+        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self._empty_prompt_shown = False
@@ -3164,6 +3169,7 @@ class MainFrame(wx.Frame):
         self.mi_delete_contact = file_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
         self.mi_send_file = file_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
         self.mi_file_transfers = file_menu.Append(wx.ID_ANY, "File Transfers")
+        self.mi_group_calls = file_menu.Append(wx.ID_ANY, "Group Calls")
         file_menu.AppendSeparator()
         self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
         self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
@@ -3217,6 +3223,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_delete, self.mi_delete_contact)
         self.Bind(wx.EVT_MENU, self.on_send_file, self.mi_send_file)
         self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_file_transfers)
+        self.Bind(wx.EVT_MENU, self.on_group_calls, self.mi_group_calls)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
@@ -3792,6 +3799,37 @@ class MainFrame(wx.Frame):
     def on_file_transfers(self, _):
         with FileTransfersDialog(self, wx.GetApp().transfer_history) as dlg:
             dlg.ShowModal()
+    def on_group_calls(self, _):
+        dlg = self._group_call_dlg
+        if dlg and dlg.IsShown():
+            dlg.Raise()
+            dlg.SetFocus()
+            try:
+                self.sock.sendall((json.dumps({"action": "group_call_list"}) + "\n").encode())
+            except Exception:
+                pass
+            return
+        self._group_call_dlg = GroupCallDialog(self, self.sock, self.user)
+        self._group_call_dlg.Show()
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_list"}) + "\n").encode())
+        except Exception:
+            pass
+    def on_group_call_list_response(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.set_calls(msg.get("calls", []))
+    def on_group_call_event(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_call_event(msg)
+    def on_group_call_result(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_call_result(msg)
+    def on_group_call_signal(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_call_signal(msg)
+    def on_group_call_signal_result(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_signal_result(msg)
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -4426,6 +4464,159 @@ class GroupPolicyDialog(wx.Dialog):
             return
         self.info.SetLabel("Policy updated. Reloading...")
         self.on_load(None)
+
+class GroupCallDialog(wx.Dialog):
+    def __init__(self, parent, sock, username):
+        super().__init__(parent, title="Group Calls", size=(720, 500))
+        self.parent_frame = parent
+        self.sock = sock
+        self.username = username
+        self.calls = []
+        self.current_group = ""
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+
+        top = wx.BoxSizer(wx.HORIZONTAL)
+        top.Add(wx.StaticText(panel, label="Group:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.group_txt = wx.TextCtrl(panel)
+        top.Add(self.group_txt, 1, wx.EXPAND | wx.RIGHT, 8)
+        top.Add(wx.StaticText(panel, label="Mode:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.mode_choice = wx.Choice(panel, choices=["voice", "video"])
+        self.mode_choice.SetSelection(0)
+        top.Add(self.mode_choice, 0)
+
+        btn_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_join = wx.Button(panel, label="Join")
+        self.btn_leave = wx.Button(panel, label="Leave")
+        self.btn_refresh = wx.Button(panel, label="Refresh")
+        self.btn_ping = wx.Button(panel, label="Send Test Signal")
+        for b in [self.btn_join, self.btn_leave, self.btn_refresh, self.btn_ping]:
+            btn_row.Add(b, 1, wx.EXPAND | wx.ALL, 3)
+        self.btn_join.Bind(wx.EVT_BUTTON, self.on_join)
+        self.btn_leave.Bind(wx.EVT_BUTTON, self.on_leave)
+        self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
+        self.btn_ping.Bind(wx.EVT_BUTTON, self.on_ping)
+
+        self.calls_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.calls_list.Bind(wx.EVT_LISTBOX, self.on_select_call)
+        self.log = wx.ListBox(panel, style=wx.LB_SINGLE)
+
+        s.Add(top, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Active Group Calls"), 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        s.Add(self.calls_list, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Call Events"), 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        s.Add(self.log, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        panel.SetSizer(s)
+
+    def on_close(self, event):
+        if self.parent_frame:
+            self.parent_frame._group_call_dlg = None
+        event.Skip()
+
+    def _append_log(self, text):
+        self.log.Append(f"[{format_timestamp(time.time())}] {text}")
+        self.log.SetSelection(self.log.GetCount() - 1)
+
+    def set_calls(self, calls):
+        self.calls = list(calls or [])
+        self.calls_list.Clear()
+        for c in self.calls:
+            group = c.get("group", "")
+            mode = c.get("mode", "voice")
+            count = c.get("count", 0)
+            self.calls_list.Append(f"{group} | {mode} | participants: {count}")
+        if self.calls_list.GetCount() == 0:
+            self.calls_list.Append("(No active group calls)")
+
+    def on_select_call(self, _):
+        idx = self.calls_list.GetSelection()
+        if idx == wx.NOT_FOUND or idx < 0 or idx >= len(self.calls):
+            return
+        call = self.calls[idx]
+        self.current_group = str(call.get("group", "") or "")
+        self.group_txt.SetValue(self.current_group)
+        mode = str(call.get("mode", "voice"))
+        self.mode_choice.SetStringSelection(mode if mode in ("voice", "video") else "voice")
+
+    def on_refresh(self, _):
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_list"}) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Refresh failed: {e}")
+
+    def on_join(self, _):
+        group = self.group_txt.GetValue().strip()
+        if not group:
+            wx.MessageBox("Enter a group name first.", "Group Calls", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        self.current_group = group
+        mode = self.mode_choice.GetStringSelection() or "voice"
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_join", "group": group, "mode": mode}) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Join failed: {e}")
+
+    def on_leave(self, _):
+        group = self.group_txt.GetValue().strip() or self.current_group
+        if not group:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "group_call_leave", "group": group}) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Leave failed: {e}")
+
+    def on_ping(self, _):
+        group = self.group_txt.GetValue().strip() or self.current_group
+        if not group:
+            wx.MessageBox("Join/select a group call first.", "Group Calls", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        target = ""
+        for c in self.calls:
+            if str(c.get("group", "")) == group:
+                participants = [p for p in c.get("participants", []) if p != self.username]
+                if participants:
+                    target = participants[0]
+                break
+        if not target:
+            self._append_log("No other participant available for test signal.")
+            return
+        payload = {
+            "action": "group_call_signal",
+            "group": group,
+            "to": target,
+            "signal_type": "test",
+            "data": {"message": "ping"},
+        }
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+        except Exception as e:
+            self._append_log(f"Signal failed: {e}")
+
+    def handle_call_event(self, msg):
+        group = msg.get("group", "")
+        event = msg.get("event", "")
+        by = msg.get("by", "")
+        participants = msg.get("participants", [])
+        self._append_log(f"{group}: {by} {event} ({len(participants)} participants)")
+        self.on_refresh(None)
+
+    def handle_call_result(self, msg):
+        if msg.get("ok"):
+            self._append_log(f"Call action OK for group {msg.get('group', '')}.")
+            self.on_refresh(None)
+        else:
+            self._append_log(f"Call action failed: {msg.get('reason', 'unknown error')}")
+
+    def handle_call_signal(self, msg):
+        self._append_log(f"Signal from {msg.get('from', '')} in {msg.get('group', '')}: {msg.get('signal_type', '')}")
+
+    def handle_signal_result(self, msg):
+        if msg.get("ok"):
+            self._append_log(f"Signal sent to {msg.get('to', '')}.")
+        else:
+            self._append_log(f"Signal failed: {msg.get('reason', 'unknown error')}")
 
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None):
