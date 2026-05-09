@@ -32,8 +32,8 @@ Adjust names and command path for your system.
 DEPLOY_USER=<deploy-user> \
 REPO_DIR=/home/<deploy-user>/apps/ThriveMessenger \
 PM2_APP_NAME=thrive-server \
-PM2_RUN_USER=thrive \
-PM2_HOME_PATH=/home/thrive/.pm2 \
+PM2_RUN_USER=<pm2-owner> \
+PM2_HOME_PATH=/home/<pm2-owner>/.pm2 \
 bash /home/<deploy-user>/apps/ThriveMessenger/srv/scripts/deploy_and_restart.sh
 ```
 
@@ -62,8 +62,8 @@ export DEPLOY_API_TOKEN='strong-random-token'
 export DEPLOY_USER='<deploy-user>'
 export REPO_DIR='/home/<deploy-user>/apps/ThriveMessenger'
 export PM2_APP_NAME='thrive-server'
-export PM2_RUN_USER='thrive'
-export PM2_HOME_PATH='/home/thrive/.pm2'
+export PM2_RUN_USER='<pm2-owner>'
+export PM2_HOME_PATH='/home/<pm2-owner>/.pm2'
 python3 /home/<deploy-user>/apps/ThriveMessenger/srv/scripts/deploy_hook_api.py
 ```
 

@@ -7,6 +7,7 @@ DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
 clients = {}
 client_statuses = {}
+session_preferences = {}
 lock = threading.Lock()
 smtp_config = {}
 flexpbx_config = {}
@@ -24,17 +25,26 @@ bot_status_map = {}
 bot_purpose_map = {}
 bot_service_map = {}
 bot_voice_map = {}
+bot_auth_map = {}
 bot_external_usernames = set()
 allow_external_bot_contacts = True
 docs_cache = {}
 bot_rules_config = {}
 bot_rules_text = {}
+bot_session_registry = {}
+bot_session_lock = threading.Lock()
+bot_temp_file_registry = {}
+bot_temp_file_lock = threading.Lock()
+bot_moderation_registry = {}
+bot_moderation_lock = threading.Lock()
 restart_lock = threading.Lock()
 restart_scheduled_for = None
 group_call_sessions = {}
 group_call_lock = threading.Lock()
 FEATURE_DEFAULTS = {
     "bots": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot contacts and bot chat features."},
+    "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
+    "bot_moderation": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot-powered moderation watch, spam scoring, and guest activity feeds."},
     "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
     "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group chat create/join/send features."},
     "group_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group call session and signaling features."},
@@ -342,6 +352,196 @@ def _is_registered_bot(username):
     if allow_external_bot_contacts and uname.lower().endswith("-bot"):
         return True
     return False
+
+def _bot_auth_type(bot_name):
+    name = str(bot_name or "").strip()
+    if not name:
+        return "bot"
+    mapped = str(bot_auth_map.get(name, "") or "").strip()
+    if mapped:
+        return mapped
+    lower = name.lower()
+    if "openclaw" in lower:
+        return "openclaw"
+    if "opencode" in lower:
+        return "opencode"
+    if "codex" in lower:
+        return "codex"
+    if "ollama" in lower:
+        return "ollama"
+    if "assistant" in lower:
+        return "assistant"
+    if "claude" in lower:
+        return "claude"
+    return "bot"
+
+def _bot_session_snapshot(username):
+    uname = str(username or "").strip()
+    if not uname:
+        return None
+    with bot_session_lock:
+        data = bot_session_registry.get(uname)
+        if not data:
+            return None
+        return {
+            "user": uname,
+            "auth_type": str(data.get("auth_type", _bot_auth_type(uname))),
+            "runtime": str(data.get("runtime", "cli")),
+            "host_label": str(data.get("host_label", "") or ""),
+            "platform": str(data.get("platform", "") or ""),
+            "capabilities": list(data.get("capabilities", [])),
+            "transports": list(data.get("transports", [])),
+            "temp_dir": str(data.get("temp_dir", "") or ""),
+            "accepts_files": bool(data.get("accepts_files", False)),
+            "supports_delegation": bool(data.get("supports_delegation", True)),
+            "background": bool(data.get("background", False)),
+            "server": str(data.get("server", server_identity)),
+            "connected_at": str(data.get("connected_at", "") or ""),
+            "last_seen": str(data.get("last_seen", "") or ""),
+            "moderation": dict(data.get("moderation", {}) or {}),
+        }
+
+def _active_bot_sessions():
+    sessions = []
+    with bot_session_lock:
+        names = sorted(bot_session_registry.keys(), key=lambda x: x.lower())
+    for name in names:
+        snap = _bot_session_snapshot(name)
+        if snap:
+            sessions.append(snap)
+    return sessions
+
+def _cleanup_bot_session(username):
+    uname = str(username or "").strip()
+    if not uname:
+        return
+    with bot_session_lock:
+        bot_session_registry.pop(uname, None)
+    with bot_moderation_lock:
+        bot_moderation_registry.pop(uname, None)
+    with bot_temp_file_lock:
+        stale_ids = [
+            file_id for file_id, meta in bot_temp_file_registry.items()
+            if meta.get("from") == uname or meta.get("to") == uname
+        ]
+        for file_id in stale_ids:
+            meta = bot_temp_file_registry.pop(file_id, None)
+            path = str((meta or {}).get("path", "") or "")
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+def _store_bot_mesh_temp_file(sender, target, filename, data_b64, mime="", request_id=""):
+    clean_name = os.path.basename(str(filename or "").strip())
+    if not clean_name or clean_name != str(filename or "").strip():
+        raise ValueError("Invalid filename.")
+    raw = base64.b64decode(str(data_b64 or "").encode("ascii"), validate=True)
+    max_size = int(bot_runtime_config.get("bot_mesh_max_file_size", 10485760) or 10485760)
+    if len(raw) > max_size:
+        raise ValueError(f"File exceeds bot mesh size limit of {max_size} bytes.")
+    root = str(bot_runtime_config.get("bot_mesh_temp_root", "") or "").strip() or os.path.join(tempfile.gettempdir(), "thrive_bot_mesh")
+    os.makedirs(root, exist_ok=True)
+    file_id = str(uuid.uuid4())
+    path = os.path.join(root, f"{file_id}_{clean_name}")
+    with open(path, "wb") as f:
+        f.write(raw)
+    meta = {
+        "id": file_id,
+        "from": str(sender or "").strip(),
+        "to": str(target or "").strip(),
+        "filename": clean_name,
+        "mime": str(mime or "").strip(),
+        "request_id": str(request_id or "").strip(),
+        "size": len(raw),
+        "path": path,
+        "created_at": datetime.datetime.utcnow().isoformat(),
+    }
+    with bot_temp_file_lock:
+        bot_temp_file_registry[file_id] = meta
+    return meta
+
+def _is_guest_like_username(username):
+    uname = str(username or "").strip().lower()
+    if not uname:
+        return False
+    return (
+        uname.startswith("guest")
+        or uname.startswith("anon")
+        or uname.startswith("temp")
+        or uname.endswith("-guest")
+    )
+
+def _moderation_excerpt(text, limit=280):
+    cleaned = " ".join(str(text or "").replace("\r", " ").replace("\n", " ").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: max(0, limit - 3)] + "..."
+
+def _spam_signal_summary(text):
+    raw = str(text or "")
+    lower = raw.lower()
+    score = 0
+    reasons = []
+    if len(raw) > 800:
+        score += 1
+        reasons.append("long_message")
+    if lower.count("http://") + lower.count("https://") >= 3:
+        score += 2
+        reasons.append("many_links")
+    if raw.count("\n") >= 8:
+        score += 1
+        reasons.append("multi_line_burst")
+    if len(raw) >= 40 and len(set(raw)) <= max(4, len(raw) // 20):
+        score += 2
+        reasons.append("repetitive_pattern")
+    if sum(1 for ch in raw if ch.isupper()) >= 20 and raw:
+        upper_ratio = sum(1 for ch in raw if ch.isupper()) / max(1, sum(1 for ch in raw if ch.isalpha()))
+        if upper_ratio >= 0.75:
+            score += 1
+            reasons.append("mostly_uppercase")
+    if any(token in lower for token in ("free nitro", "airdrop", "bitcoin", "crypto", "claim now", "dm me", "telegram")):
+        score += 2
+        reasons.append("spam_keywords")
+    return {"score": score, "reasons": reasons, "flagged": score >= 2}
+
+def _emit_bot_moderation_event(event_type, payload):
+    if not _feature_policy_row("bot_moderation") or not _feature_policy_row("bot_moderation").get("enabled", True):
+        return
+    event_kind = str(event_type or "").strip().lower()
+    if not event_kind:
+        return
+    watchers = []
+    with bot_moderation_lock:
+        for uname, cfg in list(bot_moderation_registry.items()):
+            if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+                continue
+            kinds = cfg.get("kinds", [])
+            if kinds and "*" not in kinds and event_kind not in kinds:
+                continue
+            watchers.append(uname)
+    if not watchers:
+        return
+    envelope = {
+        "action": "bot_moderation_event",
+        "event_type": event_kind,
+        "event_id": str(uuid.uuid4()),
+        "payload": payload if isinstance(payload, dict) else {},
+        "relay_server": server_identity,
+        "sent_at": datetime.datetime.utcnow().isoformat(),
+    }
+    wire = (json.dumps(envelope) + "\n").encode()
+    for uname in watchers:
+        with bot_session_lock:
+            data = bot_session_registry.get(uname) or {}
+            target_sock = data.get("sock")
+        if not target_sock:
+            continue
+        try:
+            target_sock.sendall(wire)
+        except Exception:
+            pass
 
 def _parse_bot_map(raw):
     out = {}
@@ -994,6 +1194,8 @@ def load_config():
     bot_purpose_map = _parse_bot_map(config.get('bots', 'purpose_map', fallback=''))
     global bot_service_map
     bot_service_map = _parse_bot_map(config.get('bots', 'service_map', fallback=''))
+    global bot_auth_map
+    bot_auth_map = _parse_bot_map(config.get('bots', 'auth_type_map', fallback='openclaw-bot:openclaw,assistant-bot:ollama,helper-bot:codex'))
     global bot_external_usernames
     raw_external = config.get('bots', 'external_names', fallback='')
     bot_external_usernames = {name.strip() for name in raw_external.split(',') if name.strip()}
@@ -1001,9 +1203,17 @@ def load_config():
     allow_external_bot_contacts = config.getboolean('bots', 'allow_external_bot_contacts', fallback=True)
     global bot_voice_map
     bot_voice_map = _parse_bot_map(config.get('bots', 'voice_map', fallback=''))
+    shared_rules_user = (
+        os.getenv('THRIVE_SHARED_USER')
+        or os.getenv('DEPLOY_USER')
+        or os.getenv('SUDO_USER')
+        or os.getenv('USER')
+        or 'tappedin'
+    )
+    default_agent_rules_zip = f"/home/{shared_rules_user}/shared/agents/*.zip"
     global bot_rules_config
     bot_rules_config = {
-        'agent_rules_zip_path': config.get('bots', 'agent_rules_zip_path', fallback='/home/devinecr/downloads/*.zip'),
+        'agent_rules_zip_path': config.get('bots', 'agent_rules_zip_path', fallback=default_agent_rules_zip),
         'agent_rules_file_path': config.get('bots', 'agent_rules_file_path', fallback=''),
     }
     _refresh_bot_rules()
@@ -1019,6 +1229,12 @@ def load_config():
         'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
         'piper_default_voice': config.get('bots', 'piper_default_voice', fallback='en_US-lessac-medium'),
         'piper_timeout': config.getint('bots', 'piper_timeout', fallback=12),
+        'bot_mesh_temp_root': config.get('bots', 'bot_mesh_temp_root', fallback=os.path.join(tempfile.gettempdir(), 'thrive_bot_mesh')),
+        'bot_mesh_max_file_size': config.getint('bots', 'bot_mesh_max_file_size', fallback=10485760),
+        'moderation_watch_direct_messages': config.getboolean('bots', 'moderation_watch_direct_messages', fallback=True),
+        'moderation_watch_file_offers': config.getboolean('bots', 'moderation_watch_file_offers', fallback=True),
+        'moderation_watch_guest_logins': config.getboolean('bots', 'moderation_watch_guest_logins', fallback=True),
+        'moderation_excerpt_limit': config.getint('bots', 'moderation_excerpt_limit', fallback=280),
     }
     return {
         'port': config.getint('server', 'port', fallback=5005),
@@ -1394,9 +1610,30 @@ def handle_client(cs, addr):
                 return
 
         sock.sendall(b'{"status":"ok"}\n')
+        prior_sock = None
         with lock:
+            prior_sock = clients.get(user)
             clients[user] = sock
             client_statuses[user] = "online"
+            session_preferences[sock] = {}
+
+        # Optional alert to the existing signed-in device when another login happens.
+        if prior_sock and prior_sock is not sock:
+            notify_existing = False
+            with lock:
+                notify_existing = bool(
+                    session_preferences.get(prior_sock, {}).get("notify_on_other_device_login", False)
+                )
+            if notify_existing:
+                try:
+                    prior_sock.sendall((json.dumps({
+                        "action": "other_device_login",
+                        "user": user,
+                        "ip": str(addr[0] if addr else ""),
+                        "at": datetime.datetime.utcnow().isoformat() + "Z",
+                    }) + "\n").encode())
+                except Exception:
+                    pass
 
         admins = get_admins()
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
@@ -1404,6 +1641,15 @@ def handle_client(cs, addr):
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
         _send_feature_caps(sock, user)
         db.close()
+
+        if bot_runtime_config.get("moderation_watch_guest_logins", True) and _is_guest_like_username(user):
+            _emit_bot_moderation_event("guest_login", {
+                "user": user,
+                "ip": str(addr[0] if addr else ""),
+                "logged_in_at": datetime.datetime.utcnow().isoformat(),
+                "is_guest": True,
+                "status_text": _status_for_user(user),
+            })
         
         broadcast_contact_status(user, True)
         
@@ -1423,6 +1669,15 @@ def handle_client(cs, addr):
             
             if action == "get_feature_caps":
                 _send_feature_caps(sock, user)
+
+            elif action == "set_session_pref":
+                with lock:
+                    prefs = session_preferences.get(sock)
+                    if prefs is None:
+                        prefs = {}
+                        session_preferences[sock] = prefs
+                    if "notify_on_other_device_login" in msg:
+                        prefs["notify_on_other_device_login"] = bool(msg.get("notify_on_other_device_login", False))
 
             elif action == "get_feature_policies":
                 if not _is_admin(user):
@@ -1612,6 +1867,7 @@ def handle_client(cs, addr):
                     if is_bot:
                         _ensure_admin_bot_rules_seed(user, contact_to_add)
                     rules_text = _effective_rules_for_bot(contact_to_add, user) if is_bot else ""
+                    bot_session = _bot_session_snapshot(contact_to_add) if is_bot else None
                     contact_data = {
                         "user": contact_to_add,
                         "blocked": 0,
@@ -1620,14 +1876,15 @@ def handle_client(cs, addr):
                         "status_text": contact_status_text,
                         "is_bot": bool(is_bot),
                         "bot_origin": "local" if _is_virtual_bot(contact_to_add) else ("external" if is_bot else "user"),
+                        "bot_auth_type": _bot_auth_type(contact_to_add) if is_bot else "",
+                        "bot_session": bot_session,
                         "bot_rules_available": bool(rules_text),
                         "bot_rules_preview": rules_text[:1000] if rules_text else "",
                         "bot_rules_editable": bool(is_bot and _is_admin(user)),
                     }
-                    if _is_virtual_bot(contact_to_add) and str(contact_to_add).lower() == "openclaw-bot":
+                    if _is_virtual_bot(contact_to_add):
                         token = _upsert_bot_token(user, contact_to_add)
                         contact_data["bot_auth_token"] = token
-                        contact_data["bot_auth_type"] = "openclaw"
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
 
@@ -2009,6 +2266,8 @@ def handle_client(cs, addr):
                 if include_bots:
                     extra = set(bot_usernames) | set(bot_external_usernames)
                 for uname in sorted(known | extra):
+                    is_bot = _is_registered_bot(uname)
+                    bot_session = _bot_session_snapshot(uname) if is_bot else None
                     directory.append({
                         "user": uname,
                         "online": _is_online_user(uname),
@@ -2017,11 +2276,230 @@ def handle_client(cs, addr):
                         "is_contact": uname in user_contacts,
                         "is_blocked": user_contacts.get(uname, 0) == 1,
                         "server": server_identity,
-                        "is_bot": _is_registered_bot(uname),
-                        "bot_origin": "local" if _is_virtual_bot(uname) else ("external" if _is_registered_bot(uname) else "user")
+                        "is_bot": is_bot,
+                        "bot_origin": "local" if _is_virtual_bot(uname) else ("external" if is_bot else "user"),
+                        "bot_auth_type": _bot_auth_type(uname) if is_bot else "",
+                        "bot_session": bot_session,
                     })
                 try: sock.sendall((json.dumps({"action": "user_directory_response", "users": directory}) + "\n").encode())
                 except: pass
+
+            elif action == "register_bot_session":
+                if not _can_user_use_feature(user, "bot_mesh"):
+                    _deny_feature("bot_mesh", "bot_session_registered")
+                    continue
+                if not _is_registered_bot(user):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_session_registered", "ok": False, "reason": "Only bot accounts can register bot sessions."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                capabilities = msg.get("capabilities", [])
+                transports = msg.get("transports", [])
+                moderation = msg.get("moderation", {})
+                if not isinstance(capabilities, list):
+                    capabilities = []
+                if not isinstance(transports, list):
+                    transports = []
+                if not isinstance(moderation, dict):
+                    moderation = {}
+                moderation_kinds = moderation.get("kinds", [])
+                if not isinstance(moderation_kinds, list):
+                    moderation_kinds = []
+                moderation_cfg = {
+                    "enabled": bool(moderation.get("enabled", False)),
+                    "kinds": [str(v).strip().lower() for v in moderation_kinds if str(v).strip()],
+                    "auto_report": bool(moderation.get("auto_report", True)),
+                    "notify_user": str(moderation.get("notify_user", "") or "").strip(),
+                }
+                if moderation_cfg.get("enabled") and not _can_user_use_feature(user, "bot_moderation"):
+                    moderation_cfg["enabled"] = False
+                now = datetime.datetime.utcnow().isoformat()
+                with bot_session_lock:
+                    bot_session_registry[user] = {
+                        "sock": sock,
+                        "auth_type": str(msg.get("auth_type", _bot_auth_type(user)) or _bot_auth_type(user)),
+                        "runtime": str(msg.get("runtime", "cli") or "cli"),
+                        "host_label": str(msg.get("host_label", "") or ""),
+                        "platform": str(msg.get("platform", "") or ""),
+                        "capabilities": [str(v).strip() for v in capabilities if str(v).strip()],
+                        "transports": [str(v).strip() for v in transports if str(v).strip()],
+                        "temp_dir": str(msg.get("temp_dir", "") or ""),
+                        "accepts_files": bool(msg.get("accepts_files", False)),
+                        "supports_delegation": bool(msg.get("supports_delegation", True)),
+                        "background": bool(msg.get("background", False)),
+                        "moderation": moderation_cfg,
+                        "server": server_identity,
+                        "connected_at": now,
+                        "last_seen": now,
+                    }
+                with bot_moderation_lock:
+                    if moderation_cfg.get("enabled"):
+                        bot_moderation_registry[user] = moderation_cfg
+                    else:
+                        bot_moderation_registry.pop(user, None)
+                try:
+                    sock.sendall((json.dumps({"action": "bot_session_registered", "ok": True, "session": _bot_session_snapshot(user)}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "unregister_bot_session":
+                _cleanup_bot_session(user)
+                try:
+                    sock.sendall((json.dumps({"action": "bot_session_registered", "ok": True, "removed": True, "user": user}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "get_bot_mesh_directory":
+                if not _can_user_use_feature(user, "bot_mesh"):
+                    _deny_feature("bot_mesh", "bot_mesh_directory")
+                    continue
+                try:
+                    sock.sendall((json.dumps({"action": "bot_mesh_directory", "ok": True, "sessions": _active_bot_sessions()}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action in ("bot_mesh_request", "bot_mesh_result", "bot_mesh_status"):
+                if not _can_user_use_feature(user, "bot_mesh"):
+                    _deny_feature("bot_mesh", action)
+                    continue
+                target = str(msg.get("to", "") or "").strip()
+                if not target:
+                    try:
+                        sock.sendall((json.dumps({"action": action, "ok": False, "reason": "Target bot is required."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                with bot_session_lock:
+                    target_data = bot_session_registry.get(target)
+                if not target_data or not target_data.get("sock"):
+                    try:
+                        sock.sendall((json.dumps({"action": action, "ok": False, "reason": f"{target} is not connected for bot mesh."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                request_id = str(msg.get("request_id", "") or str(uuid.uuid4()))
+                envelope = {
+                    "action": action,
+                    "from": user,
+                    "to": target,
+                    "request_id": request_id,
+                    "task": str(msg.get("task", "") or ""),
+                    "result": msg.get("result"),
+                    "status": str(msg.get("status", "") or ""),
+                    "metadata": msg.get("metadata", {}) if isinstance(msg.get("metadata"), dict) else {},
+                    "user_context": msg.get("user_context", {}) if isinstance(msg.get("user_context"), dict) else {},
+                    "relay_server": server_identity,
+                    "sent_at": datetime.datetime.utcnow().isoformat(),
+                }
+                try:
+                    target_data["sock"].sendall((json.dumps(envelope) + "\n").encode())
+                    sock.sendall((json.dumps({"action": action, "ok": True, "to": target, "request_id": request_id}) + "\n").encode())
+                except Exception:
+                    try:
+                        sock.sendall((json.dumps({"action": action, "ok": False, "reason": "Bot mesh relay failed."}) + "\n").encode())
+                    except Exception:
+                        pass
+
+            elif action == "bot_mesh_store_file":
+                if not _can_user_use_feature(user, "bot_mesh"):
+                    _deny_feature("bot_mesh", "bot_mesh_file_stored")
+                    continue
+                target = str(msg.get("to", "") or "").strip()
+                if not target:
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_mesh_file_stored", "ok": False, "reason": "Target bot is required."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    meta = _store_bot_mesh_temp_file(
+                        user,
+                        target,
+                        msg.get("filename", ""),
+                        msg.get("data", ""),
+                        mime=msg.get("mime", ""),
+                        request_id=msg.get("request_id", ""),
+                    )
+                except Exception as e:
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_mesh_file_stored", "ok": False, "reason": str(e)}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                with bot_session_lock:
+                    target_data = bot_session_registry.get(target)
+                if target_data and target_data.get("sock"):
+                    try:
+                        target_data["sock"].sendall((json.dumps({
+                            "action": "bot_mesh_file_available",
+                            "from": user,
+                            "to": target,
+                            "file_id": meta["id"],
+                            "filename": meta["filename"],
+                            "mime": meta["mime"],
+                            "size": meta["size"],
+                            "request_id": meta["request_id"],
+                            "relay_server": server_identity,
+                            "created_at": meta["created_at"],
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
+                try:
+                    sock.sendall((json.dumps({"action": "bot_mesh_file_stored", "ok": True, "file_id": meta["id"], "filename": meta["filename"], "size": meta["size"]}) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "bot_mesh_fetch_file":
+                if not _can_user_use_feature(user, "bot_mesh"):
+                    _deny_feature("bot_mesh", "bot_mesh_file_data")
+                    continue
+                file_id = str(msg.get("file_id", "") or "").strip()
+                consume = bool(msg.get("consume", False))
+                with bot_temp_file_lock:
+                    meta = bot_temp_file_registry.get(file_id)
+                if not meta:
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_mesh_file_data", "ok": False, "reason": "File not found."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if user not in (meta.get("from"), meta.get("to")):
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_mesh_file_data", "ok": False, "reason": "Not authorized for this file."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    with open(meta["path"], "rb") as f:
+                        data_b64 = base64.b64encode(f.read()).decode("ascii")
+                    sock.sendall((json.dumps({
+                        "action": "bot_mesh_file_data",
+                        "ok": True,
+                        "file_id": file_id,
+                        "from": meta.get("from"),
+                        "to": meta.get("to"),
+                        "filename": meta.get("filename"),
+                        "mime": meta.get("mime"),
+                        "size": meta.get("size"),
+                        "request_id": meta.get("request_id"),
+                        "data": data_b64,
+                    }) + "\n").encode())
+                except Exception as e:
+                    try:
+                        sock.sendall((json.dumps({"action": "bot_mesh_file_data", "ok": False, "reason": str(e)}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if consume:
+                    with bot_temp_file_lock:
+                        removed = bot_temp_file_registry.pop(file_id, None)
+                    path = str((removed or {}).get("path", "") or "")
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception:
+                            pass
 
             elif action == "get_bot_rules":
                 if not _can_user_use_feature(user, "bot_rules"):
@@ -2328,6 +2806,21 @@ def handle_client(cs, addr):
                 if _is_registered_bot(to) and not _can_user_use_feature(user, "bots"):
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Bot messaging is disabled for your account."}).encode() + b"\n")
                     continue
+                body = str(msg.get("msg", "") or "")
+                if bot_runtime_config.get("moderation_watch_direct_messages", True):
+                    spam = _spam_signal_summary(body)
+                    _emit_bot_moderation_event("direct_message", {
+                        "from": frm,
+                        "to": to,
+                        "message_excerpt": _moderation_excerpt(body, int(bot_runtime_config.get("moderation_excerpt_limit", 280) or 280)),
+                        "message_length": len(body),
+                        "spam_score": spam.get("score", 0),
+                        "spam_reasons": spam.get("reasons", []),
+                        "flagged": bool(spam.get("flagged", False)),
+                        "from_is_guest": _is_guest_like_username(frm),
+                        "to_is_bot": _is_registered_bot(to),
+                        "sent_at": datetime.datetime.utcnow().isoformat(),
+                    })
                 con = sqlite3.connect(DB)
                 recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, frm)).fetchone()
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
@@ -2415,6 +2908,24 @@ def handle_client(cs, addr):
                 with transfer_lock:
                     pending_transfers[transfer_id] = {"from": user, "to": to, "files": files, "client_transfer_id": client_transfer_id}
 
+                if bot_runtime_config.get("moderation_watch_file_offers", True):
+                    _emit_bot_moderation_event("file_offer", {
+                        "from": user,
+                        "to": to,
+                        "transfer_id": transfer_id,
+                        "file_count": len(files),
+                        "files": [
+                            {
+                                "filename": str(f.get("filename", "") or ""),
+                                "size": int(f.get("size", 0) or 0),
+                                "mime": str(f.get("mime", "") or ""),
+                            }
+                            for f in files[:20]
+                        ],
+                        "from_is_guest": _is_guest_like_username(user),
+                        "sent_at": datetime.datetime.utcnow().isoformat(),
+                    })
+
                 try:
                     sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "files": files, "transfer_id": transfer_id}) + "\n").encode())
                 except:
@@ -2491,8 +3002,11 @@ def handle_client(cs, addr):
         try: cs.close()
         except: pass
         with lock:
-            if user in clients: del clients[user]
+            if user and clients.get(user) is sock:
+                del clients[user]
             client_statuses.pop(user, None)
+            session_preferences.pop(sock, None)
+        _cleanup_bot_session(user)
         if user:
             _remove_user_from_all_group_calls(user)
             broadcast_contact_status(user, False)

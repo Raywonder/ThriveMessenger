@@ -39,6 +39,8 @@ DEMO_VIDEOS = {
 # Core chat/login remains available; advanced controls stay disabled by default.
 LEGACY_SAFE_FEATURE_CAPS = {
     "bots": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
+    "bot_mesh": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
+    "bot_moderation": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
     "bot_rules": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
     "group_chat": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "group_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
@@ -395,6 +397,14 @@ def load_user_config():
         'notify_on_other_device_login': False,
         'message_timestamp_mode': 'start',
         'saved_history_date_order': 'mdy',
+        'bot_mesh_agent_enabled': False,
+        'bot_mesh_agent_moderation': True,
+        'bot_mesh_agent_backend': 'ollama',
+        'bot_mesh_agent_auth_type': 'codex',
+        'bot_mesh_agent_delegate_to': 'helper-bot',
+        'bot_mesh_agent_notify_user': '',
+        'bot_mesh_agent_user': '',
+        'bot_mesh_agent_host_label': platform.node() or 'local',
         'passkey_ids': {},
         'passkey_tokens': {},
     }
@@ -441,6 +451,16 @@ def load_user_config():
     settings['incoming_popup_on_message'] = bool(settings.get('incoming_popup_on_message', False))
     settings['incoming_alert_on_message'] = bool(settings.get('incoming_alert_on_message', False))
     settings['notify_on_other_device_login'] = bool(settings.get('notify_on_other_device_login', False))
+    settings['bot_mesh_agent_enabled'] = bool(settings.get('bot_mesh_agent_enabled', False))
+    settings['bot_mesh_agent_moderation'] = bool(settings.get('bot_mesh_agent_moderation', True))
+    settings['bot_mesh_agent_backend'] = str(settings.get('bot_mesh_agent_backend', 'ollama') or 'ollama').strip().lower()
+    if settings['bot_mesh_agent_backend'] not in ('ollama', 'command', 'auto', 'echo'):
+        settings['bot_mesh_agent_backend'] = 'ollama'
+    settings['bot_mesh_agent_auth_type'] = str(settings.get('bot_mesh_agent_auth_type', 'codex') or 'codex').strip().lower()
+    settings['bot_mesh_agent_delegate_to'] = str(settings.get('bot_mesh_agent_delegate_to', 'helper-bot') or 'helper-bot').strip()
+    settings['bot_mesh_agent_notify_user'] = str(settings.get('bot_mesh_agent_notify_user', '') or '').strip()
+    settings['bot_mesh_agent_user'] = str(settings.get('bot_mesh_agent_user', '') or '').strip()
+    settings['bot_mesh_agent_host_label'] = str(settings.get('bot_mesh_agent_host_label', platform.node() or 'local') or (platform.node() or 'local')).strip()
     incoming_behavior = str(settings.get('incoming_message_behavior', '') or '').strip().lower()
     valid_incoming_behaviors = ('popup', 'notify', 'do_nothing', 'play_sound', 'silent_count')
     if incoming_behavior not in valid_incoming_behaviors:
@@ -1491,6 +1511,54 @@ class SettingsDialog(wx.Dialog):
         self.btn_open_bot_rules.Bind(wx.EVT_BUTTON, self.on_open_bot_rules)
         self.btn_open_group_policy = wx.Button(admin_box.GetStaticBox(), label="Open Group Policy Manager")
         self.btn_open_group_policy.Bind(wx.EVT_BUTTON, self.on_open_group_policy)
+        self.bot_mesh_hint = wx.StaticText(admin_box.GetStaticBox(), label="Bot mesh lets local or remote bot accounts delegate work, monitor moderation events, and relay temp files through the server.")
+        self.bot_mesh_hint.Wrap(500)
+        bot_agent_row = wx.BoxSizer(wx.HORIZONTAL)
+        bot_agent_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Bot agent user:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_agent_user_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('bot_mesh_agent_user', '') or ''))
+        self.bot_agent_user_txt.SetName("Bot agent user")
+        self.bot_agent_user_txt.SetToolTip("Bot account username that will connect to this server.")
+        bot_agent_row.Add(self.bot_agent_user_txt, 1, wx.EXPAND)
+        backend_row = wx.BoxSizer(wx.HORIZONTAL)
+        backend_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Agent backend:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_agent_backend_choice = wx.Choice(admin_box.GetStaticBox(), choices=["ollama", "auto", "command", "echo"])
+        self.bot_agent_backend_choice.SetStringSelection(str(self.config.get('bot_mesh_agent_backend', 'ollama') or 'ollama'))
+        self.bot_agent_backend_choice.SetName("Agent backend")
+        self.bot_agent_backend_choice.SetToolTip("Local backend used by the bot mesh agent.")
+        backend_row.Add(self.bot_agent_backend_choice, 1, wx.EXPAND)
+        auth_row = wx.BoxSizer(wx.HORIZONTAL)
+        auth_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Auth type:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_agent_auth_choice = wx.Choice(admin_box.GetStaticBox(), choices=["codex", "opencode", "openclaw", "claude", "ollama", "assistant"])
+        self.bot_agent_auth_choice.SetStringSelection(str(self.config.get('bot_mesh_agent_auth_type', 'codex') or 'codex'))
+        self.bot_agent_auth_choice.SetName("Auth type")
+        self.bot_agent_auth_choice.SetToolTip("Identity label advertised by the bot mesh agent.")
+        auth_row.Add(self.bot_agent_auth_choice, 1, wx.EXPAND)
+        delegate_row = wx.BoxSizer(wx.HORIZONTAL)
+        delegate_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Delegate to:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_agent_delegate_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('bot_mesh_agent_delegate_to', 'helper-bot') or 'helper-bot'))
+        self.bot_agent_delegate_txt.SetName("Delegate to")
+        self.bot_agent_delegate_txt.SetToolTip("Optional bot username that receives delegated work if this agent cannot handle it.")
+        delegate_row.Add(self.bot_agent_delegate_txt, 1, wx.EXPAND)
+        notify_row = wx.BoxSizer(wx.HORIZONTAL)
+        notify_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Notify user:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_agent_notify_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('bot_mesh_agent_notify_user', '') or ''))
+        self.bot_agent_notify_txt.SetName("Notify user")
+        self.bot_agent_notify_txt.SetToolTip("Optional username that receives moderation summaries from this bot.")
+        notify_row.Add(self.bot_agent_notify_txt, 1, wx.EXPAND)
+        host_label_row = wx.BoxSizer(wx.HORIZONTAL)
+        host_label_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Host label:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.bot_agent_host_label_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=str(self.config.get('bot_mesh_agent_host_label', platform.node() or 'local') or (platform.node() or 'local')))
+        self.bot_agent_host_label_txt.SetName("Host label")
+        self.bot_agent_host_label_txt.SetToolTip("Short label for the computer or server running the bot agent.")
+        host_label_row.Add(self.bot_agent_host_label_txt, 1, wx.EXPAND)
+        self.bot_agent_enabled_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Enable local background bot agent profile")
+        self.bot_agent_enabled_cb.SetValue(bool(self.config.get('bot_mesh_agent_enabled', False)))
+        self.bot_agent_moderation_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Enable moderation watch for guest logins, spam, and file offers")
+        self.bot_agent_moderation_cb.SetValue(bool(self.config.get('bot_mesh_agent_moderation', True)))
+        self.btn_copy_bot_agent_cmd = wx.Button(admin_box.GetStaticBox(), label="Copy Bot Agent Command")
+        self.btn_copy_bot_agent_cmd.Bind(wx.EVT_BUTTON, self.on_copy_bot_agent_command)
+        self.btn_open_bot_agent_guide = wx.Button(admin_box.GetStaticBox(), label="Open Bot Mesh Agent Guide")
+        self.btn_open_bot_agent_guide.Bind(wx.EVT_BUTTON, self.on_open_bot_agent_guide)
         self.allow_cross_server_dm_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Allow direct messaging from Directory to users on other configured servers")
         self.allow_cross_server_dm_cb.SetValue(bool(self.config.get('allow_cross_server_directory_message', True)))
         edit_window_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -1548,6 +1616,17 @@ class SettingsDialog(wx.Dialog):
         admin_box.Add(edit_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(undo_window_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.allow_cross_server_dm_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.bot_mesh_hint, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(bot_agent_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(backend_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(auth_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(delegate_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(notify_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(host_label_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.bot_agent_enabled_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.bot_agent_moderation_cb, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.btn_copy_bot_agent_cmd, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.btn_open_bot_agent_guide, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
         admin_box.Add(self.btn_open_bot_rules, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_group_policy, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -1567,11 +1646,14 @@ class SettingsDialog(wx.Dialog):
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
+            self.bot_mesh_hint.SetForegroundColour(light_text_color)
             for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
-            for ctrl in [self.admin_host_txt, self.admin_port_txt, self.admin_cafile_txt, self.admin_feed_txt, self.admin_pref_repo_txt, self.admin_fallback_txt, self.message_edit_window_txt, self.message_undo_window_txt]:
+            self.bot_agent_enabled_cb.SetForegroundColour(light_text_color)
+            self.bot_agent_moderation_cb.SetForegroundColour(light_text_color)
+            for ctrl in [self.admin_host_txt, self.admin_port_txt, self.admin_cafile_txt, self.admin_feed_txt, self.admin_pref_repo_txt, self.admin_fallback_txt, self.message_edit_window_txt, self.message_undo_window_txt, self.bot_agent_user_txt, self.bot_agent_delegate_txt, self.bot_agent_notify_txt, self.bot_agent_host_label_txt]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
             self.restart_delay_txt.SetBackgroundColour(dark_color); self.restart_delay_txt.SetForegroundColour(light_text_color)
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
@@ -1579,10 +1661,14 @@ class SettingsDialog(wx.Dialog):
             self.incoming_behavior_choice.SetBackgroundColour(dark_color); self.incoming_behavior_choice.SetForegroundColour(light_text_color)
             self.timestamp_mode_choice.SetBackgroundColour(dark_color); self.timestamp_mode_choice.SetForegroundColour(light_text_color)
             self.saved_date_order_choice.SetBackgroundColour(dark_color); self.saved_date_order_choice.SetForegroundColour(light_text_color)
+            self.bot_agent_backend_choice.SetBackgroundColour(dark_color); self.bot_agent_backend_choice.SetForegroundColour(light_text_color)
+            self.bot_agent_auth_choice.SetBackgroundColour(dark_color); self.bot_agent_auth_choice.SetForegroundColour(light_text_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
             self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
             self.btn_open_bot_rules.SetBackgroundColour(dark_color); self.btn_open_bot_rules.SetForegroundColour(light_text_color)
             self.btn_open_group_policy.SetBackgroundColour(dark_color); self.btn_open_group_policy.SetForegroundColour(light_text_color)
+            self.btn_copy_bot_agent_cmd.SetBackgroundColour(dark_color); self.btn_copy_bot_agent_cmd.SetForegroundColour(light_text_color)
+            self.btn_open_bot_agent_guide.SetBackgroundColour(dark_color); self.btn_open_bot_agent_guide.SetForegroundColour(light_text_color)
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
@@ -1615,6 +1701,55 @@ class SettingsDialog(wx.Dialog):
         frame = self.GetParent()
         if frame and hasattr(frame, "on_manage_group_policy"):
             frame.on_manage_group_policy(None)
+    def build_bot_agent_command(self):
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "thrive_bot_mesh_agent.py")
+        host = self.admin_host_txt.GetValue().strip() or "msg.thecubed.cc"
+        port = self.admin_port_txt.GetValue().strip() or "2005"
+        bot_user = self.bot_agent_user_txt.GetValue().strip() or "<bot-user>"
+        auth_type = self.bot_agent_auth_choice.GetStringSelection().strip() or "codex"
+        backend = self.bot_agent_backend_choice.GetStringSelection().strip() or "ollama"
+        delegate_to = self.bot_agent_delegate_txt.GetValue().strip()
+        notify_user = self.bot_agent_notify_txt.GetValue().strip()
+        host_label = self.bot_agent_host_label_txt.GetValue().strip() or (platform.node() or "local")
+        parts = [
+            sys.executable,
+            script_path,
+            "--host", host,
+            "--port", port,
+            "--user", bot_user,
+            "--password", "<bot-password>",
+            "--backend", backend,
+            "--auth-type", auth_type,
+            "--host-label", host_label,
+            "--background",
+        ]
+        cafile = self.admin_cafile_txt.GetValue().strip()
+        if cafile:
+            parts.extend(["--ssl", "--cafile", cafile])
+        if self.bot_agent_moderation_cb.IsChecked():
+            parts.append("--moderation")
+        if notify_user:
+            parts.extend(["--notify-user", notify_user])
+        if delegate_to:
+            parts.extend(["--delegate-to", delegate_to])
+        return subprocess.list2cmdline(parts)
+    def on_copy_bot_agent_command(self, _):
+        command = self.build_bot_agent_command()
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(command))
+            wx.TheClipboard.Close()
+        wx.MessageBox("Bot agent command copied to the clipboard.", "Bot Mesh Agent", wx.OK | wx.ICON_INFORMATION, self)
+    def on_open_bot_agent_guide(self, _):
+        guide = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "BOT_MESH_AGENT.md")
+        try:
+            if sys.platform == "win32":
+                os.startfile(guide)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", guide])
+            else:
+                subprocess.Popen(["xdg-open", guide])
+        except Exception as e:
+            wx.MessageBox(f"Could not open bot mesh guide: {e}", "Bot Mesh Agent", wx.OK | wx.ICON_ERROR, self)
     def apply_admin_config(self):
         cfg = configparser.ConfigParser(interpolation=None)
         cfg.read(self.client_conf_path)
@@ -4351,6 +4486,14 @@ class MainFrame(wx.Frame):
                 app.user_config['message_edit_window_seconds'] = edit_window
                 app.user_config['message_undo_window_seconds'] = undo_window
                 app.user_config['allow_cross_server_directory_message'] = dlg.allow_cross_server_dm_cb.IsChecked()
+                app.user_config['bot_mesh_agent_enabled'] = dlg.bot_agent_enabled_cb.IsChecked()
+                app.user_config['bot_mesh_agent_moderation'] = dlg.bot_agent_moderation_cb.IsChecked()
+                app.user_config['bot_mesh_agent_backend'] = dlg.bot_agent_backend_choice.GetStringSelection().strip().lower() or 'ollama'
+                app.user_config['bot_mesh_agent_auth_type'] = dlg.bot_agent_auth_choice.GetStringSelection().strip().lower() or 'codex'
+                app.user_config['bot_mesh_agent_delegate_to'] = dlg.bot_agent_delegate_txt.GetValue().strip()
+                app.user_config['bot_mesh_agent_notify_user'] = dlg.bot_agent_notify_txt.GetValue().strip()
+                app.user_config['bot_mesh_agent_user'] = dlg.bot_agent_user_txt.GetValue().strip()
+                app.user_config['bot_mesh_agent_host_label'] = dlg.bot_agent_host_label_txt.GetValue().strip()
                 ok_admin, admin_err = (True, None)
                 if can_admin_settings:
                     ok_admin, admin_err = dlg.apply_admin_config()
@@ -4437,7 +4580,7 @@ class MainFrame(wx.Frame):
             save_user_config(app.user_config)
             wx.MessageBox("Server list updated. Changes apply on next login.", "Server Manager", wx.OK | wx.ICON_INFORMATION)
     def _known_bot_names(self):
-        names = {"openclaw-bot", "assistant-bot", "helper-bot"}
+        names = {"openclaw-bot", "assistant-bot", "helper-bot", "codex-bot", "opencode-bot", "ollama-bot", "claude-bot"}
         for c in self._all_contacts:
             uname = str(c.get("user", "")).strip()
             if not uname:
@@ -4807,10 +4950,11 @@ class MainFrame(wx.Frame):
             self._all_contacts.append({"user": c["user"], "status": status, "blocked": c["blocked"], "display_name": display_name})
         bot_token = str(c.get("bot_auth_token", "") or "").strip()
         if bot_token:
+            bot_auth_type = str(c.get("bot_auth_type", "") or "bot").strip() or "bot"
             show_notification("Bot Token Issued", f"{c['user']} token created for this client session.", timeout=8)
             chat = self.get_chat(c["user"])
             if chat:
-                chat.append(f"OpenClaw auth token issued: {bot_token}", "System", time.time())
+                chat.append(f"{bot_auth_type} bot auth token issued for this client session. The token is hidden for safety.", "System", time.time())
         self._apply_search_filter()
         chat = self.get_chat(c["user"])
         if chat:
