@@ -14,9 +14,13 @@ on:
       - "main.py"
       - "client.conf"
       - "sounds/**"
+      - "assets/**"
+      - "scripts/**"
       - ".github/workflows/build-windows.yml"
       - "pyproject.toml"
       - "Thrive Messenger.spec"
+      - "thrive_messenger_installer.iss"
+      - "vdata.yml"
 
 jobs:
   build:
@@ -37,25 +41,30 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller keyring plyer wxPython
+          pip install pyinstaller pyinstaller-versionfile keyring plyer wxPython
 
       - name: Build one-folder app
         shell: pwsh
         run: |
-          pyinstaller --clean --noconfirm --windowed --name "thrive_messenger" main.py
-          if (!(Test-Path "dist/thrive_messenger/sounds")) { New-Item -ItemType Directory -Path "dist/thrive_messenger/sounds" | Out-Null }
-          Copy-Item -Recurse -Force "sounds\*" "dist\thrive_messenger\sounds\"
-          Copy-Item -Force "client.conf" "dist\thrive_messenger\client.conf"
+          .\scripts\build_windows.ps1 -OutputDir "dist-windows"
 
-      - name: Package zip
+      - name: Build installer
         shell: pwsh
         run: |
-          if (Test-Path "dist/thrive_messenger.zip") { Remove-Item -Force "dist/thrive_messenger.zip" }
-          Compress-Archive -Path "dist/thrive_messenger/*" -DestinationPath "dist/thrive_messenger.zip" -Force
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc ".\thrive_messenger_installer.iss"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.BUILD_LABEL != '' && format('thrive-messenger-windows-{0}', env.BUILD_LABEL) || 'thrive-messenger-windows' }}
-          path: dist/thrive_messenger.zip
+          name: ${{ env.BUILD_LABEL != '' && format('thrive-messenger-windows-portable-{0}', env.BUILD_LABEL) || 'thrive-messenger-windows-portable' }}
+          path: dist-windows/thrive_messenger.zip
+          if-no-files-found: error
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUILD_LABEL != '' && format('thrive-messenger-windows-installer-{0}', env.BUILD_LABEL) || 'thrive-messenger-windows-installer' }}
+          path: dist-windows/thrive_messenger_installer.exe
           if-no-files-found: error

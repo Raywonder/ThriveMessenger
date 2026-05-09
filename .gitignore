@@ -3,5 +3,6 @@ srv/__pycache__/
 build/
 dist/
 dist-macos/
+dist-windows/
 *.spec
 assets/videos/.narration_work/
