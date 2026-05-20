@@ -2,12 +2,14 @@ import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os
 import urllib.request, urllib.parse
 import traceback, platform
 import keyring
+import concurrent.futures
+import hashlib
 try:
     import wx.html2 as wxhtml2
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.3"
+VERSION_TAG = "v2026-alpha15.5"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -17,6 +19,8 @@ KEYRING_SERVICE = "ThriveMessenger"
 PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
 DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
+DEFAULT_UPDATE_FEED_URL = "https://im.tappedin.fm/updates/latest.json"
+DEFAULT_SERVER_HOST = "im.tappedin.fm"
 DEMO_VIDEOS = {
     "onboarding": {
         "filename": "promo-onboarding.mp4",
@@ -146,24 +150,34 @@ if sys.platform == 'win32':
     try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('Thrive.Thrive_Messenger')
     except Exception: pass
 
+def get_program_dir():
+    if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def get_client_conf_path():
+    program_config = os.path.join(get_program_dir(), 'client.conf')
+    if os.path.isfile(program_config):
+        return program_config
+    return os.path.join(os.getcwd(), 'client.conf')
+
 def load_server_config():
     # Now reading connection details from client.conf instead of srv.conf
     config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
+    config.read(get_client_conf_path())
     return {
-        'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
+        'host': config.get('server', 'host', fallback=DEFAULT_SERVER_HOST),
         'port': config.getint('server', 'port', fallback=2005),
         'cafile': config.get('server', 'cafile', fallback=None),
     }
 
 def load_server_entries_from_client_conf():
     config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
+    config.read(get_client_conf_path())
     entries = []
     if config.has_section('server'):
         entries.append({
             'name': config.get('server', 'name', fallback='Default Server'),
-            'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
+            'host': config.get('server', 'host', fallback=DEFAULT_SERVER_HOST),
             'port': config.getint('server', 'port', fallback=2005),
             'cafile': config.get('server', 'cafile', fallback=''),
             'primary': config.getboolean('server', 'primary', fallback=False),
@@ -174,7 +188,7 @@ def load_server_entries_from_client_conf():
         if section.startswith('server ') or section.startswith('server:'):
             entries.append({
                 'name': config.get(section, 'name', fallback=section.replace('server', '', 1).strip(' :') or 'Server'),
-                'host': config.get(section, 'host', fallback='msg.thecubed.cc'),
+                'host': config.get(section, 'host', fallback=DEFAULT_SERVER_HOST),
                 'port': config.getint(section, 'port', fallback=2005),
                 'cafile': config.get(section, 'cafile', fallback=''),
                 'primary': config.getboolean(section, 'primary', fallback=False),
@@ -234,14 +248,14 @@ def _resolve_server_for_credentials(settings):
             return normalize_server_entry(entry)
     return normalize_server_entry(entries[0])
 
-def _keyring_account_for(username, settings):
-    server = _resolve_server_for_credentials(settings)
+def _keyring_account_for(username, settings, server_entry=None):
+    server = normalize_server_entry(server_entry) if server_entry is not None else _resolve_server_for_credentials(settings)
     return f"{username}@{server.get('host', '').lower()}:{server.get('port', 2005)}"
 
-def _load_password_from_keyring(username, settings):
+def _load_password_from_keyring(username, settings, server_entry=None):
     if not username:
         return ''
-    account = _keyring_account_for(username, settings)
+    account = _keyring_account_for(username, settings, server_entry=server_entry)
     # Server-aware key first, then legacy account for backward compatibility.
     candidates = [(KEYRING_SERVICE, account), (KEYRING_SERVICE, username)]
     for service, key_account in candidates:
@@ -527,6 +541,9 @@ SERVER_CONFIG = load_server_config()
 ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 _IPC_PORT = 48951
 _LOG_FILE_NAME = "thrive_client.log"
+IDLE_KEEPALIVE_SECONDS = 15 * 60
+KEEPALIVE_CHECK_INTERVAL = 30
+KEEPALIVE_RESPONSE_TIMEOUT = 10
 
 def get_logs_dir():
     p = os.path.join(os.path.dirname(get_settings_path()), "logs")
@@ -865,7 +882,7 @@ def _load_generated_help_templates():
 def ensure_help_docs():
     docs = {
         "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help. Press Escape or Command+W to close this help window and return.</p>",
-        "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add/edit endpoints. Use Set as Primary to choose your default server. Then enter username and password and sign in.</p><p>Server host supports normal DNS and Web3-style domains (including Freename/ENS/Unstoppable-style names).</p>",
+        "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add or remove endpoints. Use Set as Primary to choose your default server. Then enter username and password and sign in.</p><p>Server host supports normal DNS and Web3-style domains (including Freename/ENS/Unstoppable-style names).</p>",
         "main": "<h1>Contacts Window Help</h1><p>Manage contacts, statuses, files, and chats. Default action is Start Chat for the focused contact. User actions are available from User and context menus. File Transfers window shows sent/received files and their saved locations.</p>",
         "chat": "<h1>Chat Window Help</h1><p>Enter sends message, Ctrl+Enter sends file, and Cmd+Enter inserts a new line. Message history is keyboard navigable and links can be activated from selected items. Typing indicators and readout can be toggled in Settings.</p>",
         "directory": "<h1>User Directory Help</h1><p>Shows users from current and configured servers with server labels. Use Sort and Filter options for contacts. If a selected server does not support a feature, the related action is dimmed and explains why.</p>",
@@ -963,24 +980,212 @@ def parse_github_tag(tag):
     if not m: return None
     return (int(m.group(1)) - 2000, 0, int(m.group(2)), int(m.group(3)) if m.group(3) else 0)
 
+def _split_config_list(value):
+    parts = []
+    for item in re.split(r'[\n,]+', str(value or '')):
+        item = item.strip()
+        if item and item not in parts:
+            parts.append(item)
+    return parts
+
 def _load_update_settings():
     cfg = configparser.ConfigParser(interpolation=None)
-    cfg.read('client.conf')
-    update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
-    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='G4p-Studios/ThriveMessenger').strip()
-    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='Raywonder/ThriveMessenger').split(',') if x.strip()]
+    cfg.read(get_client_conf_path())
+    update_feed_url = cfg.get('updates', 'feed_url', fallback=DEFAULT_UPDATE_FEED_URL).strip()
+    fallback_feed_urls = cfg.get('updates', 'fallback_feed_urls', fallback='').strip()
+    preferred_repo = cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger').strip()
+    fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='G4p-Studios/ThriveMessenger').split(',') if x.strip()]
+    feed_urls = []
+    for candidate in _split_config_list(update_feed_url) + _split_config_list(fallback_feed_urls):
+        if candidate.startswith(("http://", "https://")) and candidate not in feed_urls:
+            feed_urls.append(candidate)
     repos = []
     for candidate in [preferred_repo] + fallback_repos:
         if '/' in candidate and candidate not in repos:
             repos.append(candidate)
     return {
         "feed_url": update_feed_url,
-        "repos": repos or ["G4p-Studios/ThriveMessenger", "Raywonder/ThriveMessenger"],
+        "feed_urls": feed_urls,
+        "repos": repos or ["Raywonder/ThriveMessenger", "G4p-Studios/ThriveMessenger"],
     }
 
-def get_program_dir():
-    if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+def _update_request_headers(accept="application/json, */*"):
+    return {"User-Agent": "ThriveMessenger/" + VERSION_TAG, "Accept": accept}
+
+def _as_url_list(value):
+    if isinstance(value, (list, tuple)):
+        raw = value
+    else:
+        raw = [value]
+    urls = []
+    for item in raw:
+        text = str(item or '').strip()
+        if not text or text.lower() in ('none', 'null', '#'):
+            continue
+        if 'example.' in text.lower() or 'placeholder' in text.lower():
+            continue
+        if text.startswith(("http://", "https://")) and text not in urls:
+            urls.append(text)
+    return urls
+
+def _feed_urls_for_keys(feed_data, keys):
+    urls = []
+    for key in keys:
+        urls.extend(_as_url_list(feed_data.get(key)))
+        if not key.endswith('s'):
+            urls.extend(_as_url_list(feed_data.get(key + 's')))
+    deduped = []
+    for url in urls:
+        if url not in deduped:
+            deduped.append(url)
+    return deduped
+
+def _artifact_key_for_url(url):
+    name = os.path.basename(urllib.parse.urlparse(str(url or '')).path).lower()
+    if name.endswith('.exe') or 'installer' in name:
+        return 'installer'
+    if 'mac' in name and name.endswith('.zip'):
+        return 'mac_zip'
+    if name.endswith('.zip'):
+        return 'win_zip'
+    return 'zip'
+
+def _sha256_for_url(feed_data, url, preferred_keys=()):
+    sha = feed_data.get('sha256')
+    filename = os.path.basename(urllib.parse.urlparse(str(url or '')).path)
+    keys = list(preferred_keys) + [_artifact_key_for_url(url), filename, url]
+    if isinstance(sha, dict):
+        for key in keys:
+            value = str(sha.get(key) or '').strip().lower()
+            if re.fullmatch(r'[0-9a-f]{64}', value):
+                return value
+    value = str(sha or '').strip().lower()
+    if re.fullmatch(r'[0-9a-f]{64}', value):
+        return value
+    return None
+
+def _url_reachable(url, timeout=6):
+    if not url or not str(url).startswith(("http://", "https://")):
+        return False
+    headers = _update_request_headers("*/*")
+    for method in ("HEAD", "GET"):
+        try:
+            req_headers = headers.copy()
+            if method == "GET":
+                req_headers["Range"] = "bytes=0-0"
+            req = urllib.request.Request(url, headers=req_headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return 200 <= int(getattr(resp, "status", 200)) < 400
+        except Exception:
+            continue
+    return False
+
+def _download_candidates_from_feed(feed_data, use_installer=None):
+    if use_installer is None:
+        use_installer = is_installer_install()
+    if sys.platform == 'darwin':
+        keys = ('mac_zip_url', 'mac_zip_urls', 'zip_url', 'zip_urls')
+        sha_keys = ('mac_zip', 'zip')
+    elif use_installer:
+        keys = ('win_installer_url', 'win_installer_urls', 'installer_url', 'installer_urls')
+        sha_keys = ('installer', 'win_installer')
+    else:
+        keys = ('win_zip_url', 'win_zip_urls', 'zip_url', 'zip_urls')
+        sha_keys = ('win_zip', 'zip')
+    candidates = []
+    for url in _feed_urls_for_keys(feed_data, keys):
+        candidates.append({"url": url, "sha256": _sha256_for_url(feed_data, url, sha_keys)})
+    return candidates
+
+def _normalize_feed_candidate(feed_url, feed_data, finish_order=0):
+    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
+    remote = parse_github_tag(tag)
+    if remote is None:
+        return None
+    candidates = _download_candidates_from_feed(feed_data)
+    reachable = [c for c in candidates if _url_reachable(c.get("url"))]
+    if not reachable:
+        return None
+    return {
+        "source": "feed",
+        "source_url": feed_url,
+        "finish_order": finish_order,
+        "repo": feed_data.get("repo"),
+        "tag": tag,
+        "remote": remote,
+        "published_at": feed_data.get("published_at"),
+        "download_candidates": reachable,
+    }
+
+def _fetch_feed_candidate(feed_url, finish_order=0):
+    req = urllib.request.Request(feed_url, headers=_update_request_headers())
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        feed_data = json.loads(resp.read().decode('utf-8', errors='replace'))
+    return _normalize_feed_candidate(feed_url, feed_data, finish_order=finish_order)
+
+def _github_candidate(repo, finish_order=0):
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers=_update_request_headers("application/vnd.github+json"))
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode('utf-8', errors='replace'))
+    tag = data.get("tag_name", "")
+    remote = parse_github_tag(tag)
+    if remote is None:
+        return None
+    return {
+        "source": "repo",
+        "source_url": url,
+        "finish_order": finish_order,
+        "repo": repo,
+        "tag": tag,
+        "remote": remote,
+        "published_at": data.get("published_at"),
+        "download_candidates": [],
+    }
+
+def _select_latest_candidate(candidates, local_version):
+    valid = [c for c in candidates if c and c.get("remote") and c["remote"] > local_version]
+    if not valid:
+        return None
+    return sorted(valid, key=lambda c: (c["remote"], -int(c.get("finish_order", 0))), reverse=True)[0]
+
+def _check_feed_sources(feed_urls, local_version):
+    candidates = []
+    finish_count = 0
+    if not feed_urls:
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(feed_urls))) as executor:
+        future_map = {executor.submit(_fetch_feed_candidate, url): url for url in feed_urls}
+        for future in concurrent.futures.as_completed(future_map):
+            finish_count += 1
+            url = future_map[future]
+            try:
+                candidate = future.result()
+                if candidate:
+                    candidate["finish_order"] = finish_count
+                    candidates.append(candidate)
+            except Exception as feed_err:
+                print(f"Update feed check failed for {url}: {feed_err}")
+    return _select_latest_candidate(candidates, local_version)
+
+def _check_github_sources(repos, local_version):
+    candidates = []
+    finish_count = 0
+    if not repos:
+        return None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(repos))) as executor:
+        future_map = {executor.submit(_github_candidate, repo): repo for repo in repos}
+        for future in concurrent.futures.as_completed(future_map):
+            finish_count += 1
+            repo = future_map[future]
+            try:
+                candidate = future.result()
+                if candidate:
+                    candidate["finish_order"] = finish_count
+                    candidates.append(candidate)
+            except Exception as repo_err:
+                print(f"Update check failed for {repo}: {repo_err}")
+    return _select_latest_candidate(candidates, local_version)
 
 def get_macos_app_bundle_path():
     if sys.platform != 'darwin':
@@ -1154,7 +1359,6 @@ def download_sound_file_if_missing(config_dict, pack, sound_file):
 
 def check_for_update(callback):
     def _check():
-        import urllib.request
         try:
             local = parse_github_tag(VERSION_TAG)
             if local is None:
@@ -1163,56 +1367,19 @@ def check_for_update(callback):
             settings = _load_update_settings()
             UPDATE_CONTEXT.clear()
 
-            feed_url = settings.get("feed_url")
-            if feed_url:
-                try:
-                    feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG, "Accept": "application/json"})
-                    with urllib.request.urlopen(feed_req, timeout=15) as resp:
-                        feed_data = json.loads(resp.read().decode())
-                    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
-                    remote = parse_github_tag(tag)
-                    if remote and remote > local:
-                        mac_zip = feed_data.get("mac_zip_url")
-                        win_zip = feed_data.get("win_zip_url")
-                        generic_zip = feed_data.get("zip_url")
-                        preferred_zip = generic_zip
-                        if sys.platform == "darwin":
-                            preferred_zip = mac_zip or generic_zip or win_zip
-                        elif sys.platform == "win32":
-                            preferred_zip = win_zip or generic_zip or mac_zip
-                        UPDATE_CONTEXT.update({
-                            "source": "feed",
-                            "feed_url": feed_url,
-                            "tag": tag,
-                            "zip_url": preferred_zip,
-                            "mac_zip_url": mac_zip,
-                            "win_zip_url": win_zip,
-                            "installer_url": feed_data.get("installer_url") or feed_data.get("win_installer_url"),
-                            "repo": feed_data.get("repo"),
-                        })
-                        wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
-                        return
-                except Exception as feed_err:
-                    print(f"Update feed check failed: {feed_err}")
+            best = _check_feed_sources(settings.get("feed_urls", []), local)
+            if best is None:
+                best = _check_github_sources(settings.get("repos", []), local)
 
-            best = None
-            for repo in settings.get("repos", []):
-                url = f"https://api.github.com/repos/{repo}/releases/latest"
-                req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
-                try:
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        data = json.loads(resp.read().decode())
-                except Exception as repo_err:
-                    print(f"Update check failed for {repo}: {repo_err}")
-                    continue
-                tag = data.get("tag_name", "")
-                remote = parse_github_tag(tag)
-                if remote is None:
-                    continue
-                if best is None or remote > best["remote"]:
-                    best = {"repo": repo, "tag": tag, "remote": remote}
-            if best and best["remote"] > local:
-                UPDATE_CONTEXT.update({"source": "repo", "repo": best["repo"], "tag": best["tag"]})
+            if best:
+                UPDATE_CONTEXT.update({
+                    "source": best.get("source"),
+                    "source_url": best.get("source_url"),
+                    "feed_url": best.get("source_url") if best.get("source") == "feed" else None,
+                    "repo": best.get("repo"),
+                    "tag": best.get("tag"),
+                    "download_candidates": best.get("download_candidates", []),
+                })
                 wx.CallAfter(callback, best["tag"], ".".join(str(x) for x in best["remote"]), None)
                 return
             wx.CallAfter(callback, None, None, None)
@@ -1220,24 +1387,51 @@ def check_for_update(callback):
             wx.CallAfter(callback, None, None, str(e))
     threading.Thread(target=_check, daemon=True).start()
 
-def download_update(url, dest, progress_dlg, callback):
+def download_update(urls, dest, progress_dlg, callback, expected_sha256=None):
     def _download():
-        import urllib.request
+        candidates = urls if isinstance(urls, list) else [{"url": urls, "sha256": expected_sha256}]
+        errors = []
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG})
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                total = int(resp.headers.get('Content-Length', 0))
-                downloaded = 0
-                with open(dest, 'wb') as f:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk: break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = min(int(downloaded * 100 / total), 100)
-                            wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
-            wx.CallAfter(callback, True, None)
+            for idx, candidate in enumerate(candidates, start=1):
+                url = str(candidate.get("url") if isinstance(candidate, dict) else candidate or "").strip()
+                expected = str((candidate.get("sha256") if isinstance(candidate, dict) else expected_sha256) or "").strip().lower()
+                if not url:
+                    continue
+                try:
+                    wx.CallAfter(progress_dlg.Update, 0, f"Downloading update from source {idx} of {len(candidates)}...")
+                    req = urllib.request.Request(url, headers=_update_request_headers("*/*"))
+                    hasher = hashlib.sha256()
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        total = int(resp.headers.get('Content-Length', 0))
+                        downloaded = 0
+                        tmp_dest = dest + ".part"
+                        with open(tmp_dest, 'wb') as f:
+                            while True:
+                                chunk = resp.read(65536)
+                                if not chunk: break
+                                f.write(chunk)
+                                hasher.update(chunk)
+                                downloaded += len(chunk)
+                                if total > 0:
+                                    pct = min(int(downloaded * 100 / total), 100)
+                                    wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
+                    actual = hasher.hexdigest()
+                    if expected and actual != expected:
+                        try: os.remove(tmp_dest)
+                        except Exception: pass
+                        errors.append(f"{url}: SHA256 mismatch")
+                        continue
+                    os.replace(tmp_dest, dest)
+                    wx.CallAfter(callback, True, None)
+                    return
+                except Exception as e:
+                    errors.append(f"{url}: {e}")
+                    try:
+                        if os.path.exists(dest + ".part"):
+                            os.remove(dest + ".part")
+                    except Exception:
+                        pass
+            wx.CallAfter(callback, False, "\n".join(errors) if errors else "No usable update URL was available.")
         except Exception as e:
             wx.CallAfter(callback, False, str(e))
     threading.Thread(target=_download, daemon=True).start()
@@ -1444,13 +1638,13 @@ class SettingsDialog(wx.Dialog):
         self.double_escape_chat_cb.SetValue(bool(self.config.get('double_escape_to_close_chat', True)))
 
         cfg = configparser.ConfigParser(interpolation=None)
-        self.client_conf_path = "client.conf"
+        self.client_conf_path = get_client_conf_path()
         cfg.read(self.client_conf_path)
         self.admin_hint = wx.StaticText(admin_box.GetStaticBox(), label="Admin settings apply to client/server connection and updater sources.")
         self.admin_hint.Wrap(500)
         host_row = wx.BoxSizer(wx.HORIZONTAL)
         host_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Server host:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.admin_host_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('server', 'host', fallback='msg.thecubed.cc'))
+        self.admin_host_txt = wx.TextCtrl(admin_box.GetStaticBox(), value=cfg.get('server', 'host', fallback=DEFAULT_SERVER_HOST))
         host_row.Add(self.admin_host_txt, 1, wx.EXPAND)
         port_row = wx.BoxSizer(wx.HORIZONTAL)
         port_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Server port:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -1811,7 +2005,7 @@ class ClientApp(wx.App):
 
     def _bootstrap_startup_ui(self):
         if getattr(self, "_startup_ui_started", False):
-            return
+            return True
         self._startup_ui_started = True
         try:
             ok = self.show_login_dialog()
@@ -1821,6 +2015,7 @@ class ClientApp(wx.App):
             ok = False
         if not ok:
             self.ExitMainLoop()
+        return ok
 
     def _signal_existing_instance(self):
         try:
@@ -1878,6 +2073,8 @@ class ClientApp(wx.App):
         self.session_password = ""
         self.reconnect_in_progress = False
         self.reconnect_stop_event = threading.Event()
+        self._last_activity = time.time()
+        self._keepalive_stop = threading.Event()
         self.active_server_entry = resolve_default_server_entry(self.user_config)
         self.connected_server_names = set()
         self.transfer_history = []
@@ -1904,9 +2101,14 @@ class ClientApp(wx.App):
         # On macOS, opening modal dialogs directly in OnInit can result in a
         # running process with no visible windows. Defer startup UI until the
         # event loop is active.
-        wx.CallAfter(self._bootstrap_startup_ui)
-        wx.CallLater(2000, self._startup_window_watchdog)
-        return True
+        if sys.platform == 'darwin':
+            # Startup creates the login dialog with CallAfter. Keep the app
+            # alive until that first top-level window exists.
+            self.SetExitOnFrameDelete(False)
+            wx.CallAfter(self._bootstrap_startup_ui)
+            wx.CallLater(2000, self._startup_window_watchdog)
+            return True
+        return bool(self._bootstrap_startup_ui())
 
     def add_transfer_history(self, direction, user, filename, path="", status="ok"):
         self.transfer_history.append({
@@ -2067,6 +2269,8 @@ class ClientApp(wx.App):
         self.reconnect_in_progress = False
         self.reconnect_stop_event.clear()
         self.intentional_disconnect = False
+        self._last_activity = time.time()
+        self._start_keepalive_monitor()
         self._set_socket_for_open_windows(sock)
         if getattr(self, 'frame', None):
             self.frame.refresh_connection_title(connected=True)
@@ -2227,6 +2431,8 @@ class ClientApp(wx.App):
     def start_main_session(self, username, sock, sf):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
         self.intentional_disconnect = False
+        self._last_activity = time.time()
+        self._start_keepalive_monitor()
         active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
         self.connected_server_names = {active.get("name") or active.get("host") or "Server"}
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
@@ -2296,6 +2502,10 @@ class ClientApp(wx.App):
         try:
             for line in self.sockfile:
                 try:
+                    self._last_activity = time.time()
+                except Exception:
+                    pass
+                try:
                     msg = json.loads(line)
                 except Exception:
                     continue
@@ -2344,6 +2554,55 @@ class ClientApp(wx.App):
         if not handled and self.sock is sock and not self.intentional_disconnect:
             print("Server closed connection.")
             wx.CallAfter(self.on_server_disconnect)
+
+    def _start_keepalive_monitor(self):
+        try:
+            old_stop = getattr(self, '_keepalive_stop', None)
+            if old_stop:
+                old_stop.set()
+        except Exception:
+            pass
+        self._keepalive_stop = threading.Event()
+        threading.Thread(target=self._keepalive_monitor, daemon=True).start()
+
+    def _keepalive_monitor(self):
+        try:
+            while True:
+                stop = getattr(self, '_keepalive_stop', None)
+                if stop and stop.is_set():
+                    return
+                last = getattr(self, '_last_activity', time.time())
+                if time.time() - last >= IDLE_KEEPALIVE_SECONDS:
+                    sock = getattr(self, 'sock', None)
+                    if not sock:
+                        return
+                    try:
+                        sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
+                    except Exception:
+                        try:
+                            wx.CallAfter(self.on_server_disconnect)
+                        except Exception:
+                            pass
+                        return
+                    initial = getattr(self, '_last_activity', 0)
+                    deadline = time.time() + KEEPALIVE_RESPONSE_TIMEOUT
+                    while time.time() < deadline:
+                        time.sleep(0.5)
+                        if getattr(self, '_last_activity', 0) > initial:
+                            break
+                    else:
+                        try:
+                            wx.CallAfter(self.on_server_disconnect)
+                        except Exception:
+                            pass
+                        return
+                for _ in range(int(KEEPALIVE_CHECK_INTERVAL)):
+                    stop = getattr(self, '_keepalive_stop', None)
+                    if stop and stop.is_set():
+                        return
+                    time.sleep(1)
+        except Exception as e:
+            print(f"Keepalive monitor stopped: {e}")
     
     def on_banned(self):
         self._return_to_login("You have been banned.", "Banned")
@@ -2351,6 +2610,11 @@ class ClientApp(wx.App):
     def on_server_disconnect(self):
         if self.intentional_disconnect:
             return
+        try:
+            if getattr(self, '_keepalive_stop', None):
+                self._keepalive_stop.set()
+        except Exception:
+            pass
         try:
             self.sock.close()
         except Exception:
@@ -2363,6 +2627,11 @@ class ClientApp(wx.App):
     def _return_to_login(self, message, title):
         if self.intentional_disconnect: return
         self.intentional_disconnect = True
+        try:
+            if getattr(self, '_keepalive_stop', None):
+                self._keepalive_stop.set()
+        except Exception:
+            pass
         try: self.sock.close()
         except: pass
         self.SetExitOnFrameDelete(False)
@@ -2653,32 +2922,14 @@ class ServerManagerDialog(wx.Dialog):
         self._refresh_list()
         s.Add(self.list, 1, wx.EXPAND | wx.ALL, 8)
 
-        form = wx.FlexGridSizer(2, 4, 6, 6)
-        form.AddGrowableCol(1, 1)
-        form.AddGrowableCol(3, 1)
-        self.name_txt = wx.TextCtrl(panel)
-        self.host_txt = wx.TextCtrl(panel)
-        self.port_txt = wx.TextCtrl(panel, value="2005")
-        self.cafile_txt = wx.TextCtrl(panel)
-        form.Add(wx.StaticText(panel, label="Name"), 0, wx.ALIGN_CENTER_VERTICAL)
-        form.Add(self.name_txt, 1, wx.EXPAND)
-        form.Add(wx.StaticText(panel, label="Host"), 0, wx.ALIGN_CENTER_VERTICAL)
-        form.Add(self.host_txt, 1, wx.EXPAND)
-        form.Add(wx.StaticText(panel, label="Port"), 0, wx.ALIGN_CENTER_VERTICAL)
-        form.Add(self.port_txt, 1, wx.EXPAND)
-        form.Add(wx.StaticText(panel, label="CA file (optional)"), 0, wx.ALIGN_CENTER_VERTICAL)
-        form.Add(self.cafile_txt, 1, wx.EXPAND)
-        s.Add(form, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
-        add_btn = wx.Button(panel, label="Add / Update")
-        del_btn = wx.Button(panel, label="Delete")
-        primary_btn = wx.Button(panel, label="Set Primary")
+        add_btn = wx.Button(panel, label="Add")
+        del_btn = wx.Button(panel, label="Remove")
+        primary_btn = wx.Button(panel, label="Set as Primary")
         close_btn = wx.Button(panel, wx.ID_OK, label="Done")
-        add_btn.Bind(wx.EVT_BUTTON, self.on_add_or_update)
+        add_btn.Bind(wx.EVT_BUTTON, self.on_add)
         del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
         primary_btn.Bind(wx.EVT_BUTTON, self.on_set_primary)
-        self.list.Bind(wx.EVT_LISTBOX, self.on_select)
         btn_row.Add(add_btn, 0, wx.RIGHT, 6)
         btn_row.Add(del_btn, 0, wx.RIGHT, 6)
         btn_row.Add(primary_btn, 0, wx.RIGHT, 6)
@@ -2694,39 +2945,19 @@ class ServerManagerDialog(wx.Dialog):
             suffix = " [Primary]" if entry.get('name') == self.primary_server_name else ""
             self.list.Append(f"{entry['name']}{suffix}  |  {entry['host']}:{entry['port']}")
 
-    def on_select(self, event):
-        index = event.GetSelection()
-        if index < 0 or index >= len(self.entries):
-            return
-        entry = self.entries[index]
-        self.name_txt.SetValue(entry['name'])
-        self.host_txt.SetValue(entry['host'])
-        self.port_txt.SetValue(str(entry['port']))
-        self.cafile_txt.SetValue(entry.get('cafile', ''))
-
-    def on_add_or_update(self, _):
-        name = self.name_txt.GetValue().strip()
-        host = self.host_txt.GetValue().strip()
-        port_text = self.port_txt.GetValue().strip() or "2005"
-        cafile = self.cafile_txt.GetValue().strip()
-        if not name or not host:
-            wx.MessageBox("Name and host are required.", "Validation Error", wx.ICON_ERROR)
-            return
-        try:
-            port = int(port_text)
-        except Exception:
-            wx.MessageBox("Port must be a valid number.", "Validation Error", wx.ICON_ERROR)
-            return
-        updated = False
-        for i, entry in enumerate(self.entries):
-            if entry['name'].lower() == name.lower():
-                self.entries[i] = {'name': name, 'host': host, 'port': port, 'cafile': cafile}
-                updated = True
-                break
-        if not updated:
-            self.entries.append({'name': name, 'host': host, 'port': port, 'cafile': cafile})
+    def on_add(self, _):
+        with AddServerDialog(self) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            entry = dlg.get_entry()
+        for existing in self.entries:
+            if existing.get('name', '').lower() == entry.get('name', '').lower():
+                wx.MessageBox("A server with that name already exists.", "Validation Error", wx.ICON_ERROR)
+                return
+        self.entries.append(entry)
         self.entries = dedupe_server_entries(self.entries)
         self._refresh_list()
+        self.list.SetSelection(len(self.entries) - 1)
 
     def on_delete(self, _):
         idx = self.list.GetSelection()
@@ -2755,9 +2986,58 @@ class ServerManagerDialog(wx.Dialog):
             return self.primary_server_name
         return self.entries[0]['name'] if self.entries else ""
 
+class AddServerDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Add Server", size=(420, 250))
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        form = wx.FlexGridSizer(4, 2, 6, 6)
+        form.AddGrowableCol(1, 1)
+        self.name_txt = wx.TextCtrl(panel)
+        self.host_txt = wx.TextCtrl(panel)
+        self.port_txt = wx.TextCtrl(panel, value="2005")
+        self.cafile_txt = wx.TextCtrl(panel)
+        form.Add(wx.StaticText(panel, label="Name"), 0, wx.ALIGN_CENTER_VERTICAL)
+        form.Add(self.name_txt, 1, wx.EXPAND)
+        form.Add(wx.StaticText(panel, label="Host"), 0, wx.ALIGN_CENTER_VERTICAL)
+        form.Add(self.host_txt, 1, wx.EXPAND)
+        form.Add(wx.StaticText(panel, label="Port"), 0, wx.ALIGN_CENTER_VERTICAL)
+        form.Add(self.port_txt, 1, wx.EXPAND)
+        form.Add(wx.StaticText(panel, label="CA file (optional)"), 0, wx.ALIGN_CENTER_VERTICAL)
+        form.Add(self.cafile_txt, 1, wx.EXPAND)
+        s.Add(form, 1, wx.EXPAND | wx.ALL, 10)
+        btn_sizer = wx.StdDialogButtonSizer()
+        ok_btn = wx.Button(panel, wx.ID_OK, label="Add")
+        ok_btn.Bind(wx.EVT_BUTTON, self.on_ok)
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        btn_sizer.AddButton(ok_btn)
+        btn_sizer.AddButton(cancel_btn)
+        btn_sizer.Realize()
+        s.Add(btn_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        panel.SetSizer(s)
+
+    def on_ok(self, _):
+        if not self.name_txt.GetValue().strip() or not self.host_txt.GetValue().strip():
+            wx.MessageBox("Name and host are required.", "Validation Error", wx.ICON_ERROR)
+            return
+        try:
+            int(self.port_txt.GetValue().strip() or "2005")
+        except Exception:
+            wx.MessageBox("Port must be a valid number.", "Validation Error", wx.ICON_ERROR)
+            return
+        self.EndModal(wx.ID_OK)
+
+    def get_entry(self):
+        return normalize_server_entry({
+            'name': self.name_txt.GetValue().strip(),
+            'host': self.host_txt.GetValue().strip(),
+            'port': int(self.port_txt.GetValue().strip() or "2005"),
+            'cafile': self.cafile_txt.GetValue().strip(),
+        })
+
 class LoginDialog(wx.Dialog):
     def __init__(self, parent, user_config, invite_context=None):
-        super().__init__(parent, title="Login", size=(390, 470)); self.user_config = user_config
+        super().__init__(parent, title="Login", size=(460, 560)); self.user_config = user_config
         self.invite_context = invite_context or {}
         self.invite_validation = None
         self.login_mode = "password"
@@ -2779,6 +3059,7 @@ class LoginDialog(wx.Dialog):
         server_box = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Server")
         self.server_choice = wx.Choice(server_box.GetStaticBox(), choices=[])
         self.server_choice.Bind(wx.EVT_CHOICE, self.on_server_choice)
+        self.server_choice.Bind(wx.EVT_CHAR_HOOK, self.on_server_choice_key)
         manage_servers_btn = wx.Button(server_box.GetStaticBox(), label="Manage Servers...")
         manage_servers_btn.Bind(wx.EVT_BUTTON, self.on_manage_servers)
         set_primary_btn = wx.Button(server_box.GetStaticBox(), label="Set as Primary")
@@ -2788,9 +3069,16 @@ class LoginDialog(wx.Dialog):
         server_row.Add(manage_servers_btn, 0, wx.EXPAND | wx.RIGHT, 4)
         server_row.Add(set_primary_btn, 0, wx.EXPAND)
         server_box.Add(server_row, 0, wx.EXPAND | wx.ALL, 5)
-        self.welcome_preview = wx.StaticText(server_box.GetStaticBox(), label="Welcome: (loading...)")
-        self.welcome_preview.Wrap(330)
-        server_box.Add(self.welcome_preview, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        self.welcome_preview = wx.TextCtrl(
+            server_box.GetStaticBox(),
+            value="Welcome: loading server information...",
+            style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_WORDWRAP | wx.BORDER_SIMPLE,
+            size=(-1, 150),
+        )
+        self.welcome_preview.SetName("Server welcome and status")
+        self.welcome_preview.SetToolTip("Read-only server welcome, status, and connection help. Use arrow keys to review the text.")
+        self.welcome_preview.SetHelpText("Read-only server welcome, status, and connection help. Use arrow keys to review the text.")
+        server_box.Add(self.welcome_preview, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.invite_preview = wx.StaticText(server_box.GetStaticBox(), label="")
         self.invite_preview.Wrap(330)
         server_box.Add(self.invite_preview, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
@@ -2818,14 +3106,14 @@ class LoginDialog(wx.Dialog):
             for box in [server_box, user_box, pass_box]:
                 box.GetStaticBox().SetForegroundColour(light_text_color)
                 box.GetStaticBox().SetBackgroundColour(dark_color)
-            for ctrl in [self.server_choice, self.u, self.p]:
+            for ctrl in [self.server_choice, self.welcome_preview, self.u, self.p]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
             for btn in [manage_servers_btn, set_primary_btn, login_btn, passkey_btn, create_btn, forgot_btn]:
                 btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
 
         self.populate_server_choice()
-        self.welcome_preview.SetLabel("Welcome: loading server information...")
+        self.welcome_preview.SetValue("Welcome: loading server information...")
         self.invite_preview.SetLabel("")
         wx.CallAfter(self.schedule_refresh_previews)
         s.Add(server_box, 0, wx.EXPAND | wx.ALL, 5)
@@ -2863,6 +3151,51 @@ class LoginDialog(wx.Dialog):
             self.selected_server = self.server_entries[idx]
             self.schedule_refresh_previews()
 
+    def on_server_choice_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
+            self.on_server_choice(event)
+            if self.try_saved_login_for_selected_server():
+                return
+            target = self.p if self.u.GetValue().strip() else self.u
+            target.SetFocus()
+            return
+        event.Skip()
+
+    def try_saved_login_for_selected_server(self):
+        username = self.u.GetValue().strip() or str(self.user_config.get('username', '') or '').strip()
+        if not username:
+            return False
+        mode = str(self.user_config.get('autologin_mode', 'password') or 'password')
+        if mode == "passkey":
+            token = _load_passkey_from_keyring(username, settings=self.user_config, server_entry=self.selected_server)
+            if token:
+                self.login_mode = "passkey"
+                self.username = username
+                self.password = ""
+                self.remember_checked = self.remember_cb.IsChecked()
+                self.autologin_checked = self.autologin_cb.IsChecked()
+                self._persist_login_server_selection()
+                self.EndModal(wx.ID_OK)
+                return True
+            return False
+        password = self.p.GetValue() or _load_password_from_keyring(username, self.user_config, server_entry=self.selected_server)
+        if not password and self.user_config.get('password_fallback'):
+            password = _decode_password_fallback(self.user_config.get('password_fallback', ''))
+        if not password:
+            return False
+        self.u.SetValue(username)
+        self.p.SetValue(password)
+        self.on_login(None)
+        return True
+
+    def _persist_login_server_selection(self):
+        for entry in self.server_entries:
+            entry['primary'] = (entry.get('name') == self.primary_server_name)
+        self.user_config['server_entries'] = self.server_entries
+        self.user_config['last_server_name'] = self.selected_server.get('name', '')
+        self.user_config['primary_server_name'] = self.primary_server_name
+
     def on_manage_servers(self, _):
         with ServerManagerDialog(self, self.server_entries, self.primary_server_name) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -2893,7 +3226,7 @@ class LoginDialog(wx.Dialog):
     def schedule_refresh_previews(self):
         server_entry = normalize_server_entry(self.selected_server)
         server_key = f"{server_entry.get('host','')}:{server_entry.get('port',0)}"
-        self.welcome_preview.SetLabel("Welcome: loading server information...")
+        self.welcome_preview.SetValue("Welcome: loading server information...")
         self.invite_preview.SetLabel("Checking invite token..." if self.invite_context.get("invite_token") else "")
         def _worker():
             info = fetch_server_welcome(server_entry)
@@ -2913,7 +3246,12 @@ class LoginDialog(wx.Dialog):
             "Connection help: Use Manage Servers to add more servers. "
             "Set one as Primary for default login. You can switch servers any time from this menu."
         )
-        motd = pre if (info.get('enabled') and pre) else "Welcome to Thrive Messenger."
+        motd = pre if (info.get('enabled') and pre) else (
+            "Welcome to Thrive Messenger. This server supports native Thrive authentication "
+            "and can also support WordPress authentication through the Thrive Server Sync plugin "
+            "for any WordPress site, letting users and admins link their WordPress and Thrive "
+            "accounts while site admins can manage server users from the WordPress admin dashboard."
+        )
         stats = (
             f"Server status: {snapshot.get('status', 'Unknown')}\n"
             f"Users online: {snapshot.get('online_users', 'Unknown')}\n"
@@ -2921,7 +3259,7 @@ class LoginDialog(wx.Dialog):
             f"Total users: {snapshot.get('total_users', 'Unknown')}\n"
             f"Server uptime: {snapshot.get('uptime', 'Unknown')}"
         )
-        self.welcome_preview.SetLabel(f"{motd}\n\n{stats}\n\n{guide}")
+        self.welcome_preview.SetValue(f"{motd}\n\n{stats}\n\n{guide}")
         token = str(self.invite_context.get("invite_token", "") or "").strip()
         if not token:
             self.invite_validation = None
@@ -3005,11 +3343,7 @@ class LoginDialog(wx.Dialog):
         self.password = p
         self.remember_checked = self.remember_cb.IsChecked()
         self.autologin_checked = self.autologin_cb.IsChecked()
-        for entry in self.server_entries:
-            entry['primary'] = (entry.get('name') == self.primary_server_name)
-        self.user_config['server_entries'] = self.server_entries
-        self.user_config['last_server_name'] = self.selected_server.get('name', '')
-        self.user_config['primary_server_name'] = self.primary_server_name
+        self._persist_login_server_selection()
         self.EndModal(wx.ID_OK)
 
     def on_login_passkey(self, _):
@@ -3026,11 +3360,7 @@ class LoginDialog(wx.Dialog):
         self.password = ""
         self.remember_checked = self.remember_cb.IsChecked()
         self.autologin_checked = self.autologin_cb.IsChecked()
-        for entry in self.server_entries:
-            entry['primary'] = (entry.get('name') == self.primary_server_name)
-        self.user_config['server_entries'] = self.server_entries
-        self.user_config['last_server_name'] = self.selected_server.get('name', '')
-        self.user_config['primary_server_name'] = self.primary_server_name
+        self._persist_login_server_selection()
         self.EndModal(wx.ID_OK)
 
     def on_key(self, event):
@@ -4658,13 +4988,13 @@ class MainFrame(wx.Frame):
             ]
         else:
             target_candidates = ["thrive_messenger_installer.exe"] if use_installer else ["thrive_messenger.zip"]
+        download_candidates = []
         asset_url = None
 
         if UPDATE_CONTEXT.get("source") == "feed":
-            if sys.platform == 'darwin':
-                asset_url = UPDATE_CONTEXT.get("mac_zip_url") or UPDATE_CONTEXT.get("zip_url")
-            else:
-                asset_url = UPDATE_CONTEXT.get("installer_url") if use_installer else (UPDATE_CONTEXT.get("win_zip_url") or UPDATE_CONTEXT.get("zip_url"))
+            download_candidates = UPDATE_CONTEXT.get("download_candidates", []) or []
+            if download_candidates:
+                asset_url = download_candidates[0].get("url")
 
         if not asset_url:
             repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "G4p-Studios/ThriveMessenger"
@@ -4691,6 +5021,8 @@ class MainFrame(wx.Frame):
                         break
         if not asset_url:
             wx.MessageBox(f"Could not find a matching update archive in release assets.", "Update Error", wx.ICON_ERROR); return
+        if not download_candidates:
+            download_candidates = [{"url": asset_url, "sha256": None}]
         ext = ".exe" if use_installer else ".zip"
         dest = os.path.join(tempfile.gettempdir(), f"thrive_update{ext}")
         progress = wx.ProgressDialog("Downloading Update", "Starting download...", maximum=100, parent=self,
@@ -4716,7 +5048,7 @@ class MainFrame(wx.Frame):
                 app.ExitMainLoop()
             else:
                 wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
-        download_update(asset_url, dest, progress, _done)
+        download_update(download_candidates, dest, progress, _done)
     def _prompt_invite_user(self, username, methods=None):
         with InviteUserDialog(self, username, methods=methods) as dlg:
             if dlg.ShowModal() == wx.ID_OK:

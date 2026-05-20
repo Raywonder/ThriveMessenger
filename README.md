@@ -110,11 +110,11 @@ Setup details are documented in:
 
 If you don't feel like fighting with UV and Python, a pre-compiled release is provided.
 
-1. [Download the latest Thrive Messenger release](https://github.com/G4p-Studios/ThriveMessenger/releases/latest/download/thrive_messenger.zip)
+1. [Download the latest Thrive Messenger release](https://github.com/Raywonder/ThriveMessenger/releases/latest/download/thrive_messenger.zip)
 2. Extract the zip file to a location of your choice.
 3. Navigate to where you extracted the zip file and run tmsg.exe. If your system isn't set up to show file extensions, the filename will just show as tmsg.
 
-Alternatively, you can [download the Thrive Messenger installer](https://github.com/G4p-Studios/ThriveMessenger/releases/latest/download/thrive_messenger_installer.exe) and run through the on-screen prompts to install the program.
+Alternatively, you can [download the Thrive Messenger installer](https://github.com/Raywonder/ThriveMessenger/releases/latest/download/thrive_messenger_installer.exe) and run through the on-screen prompts to install the program.
 
 As long as you have a PC with Windows 7 or higher, an internet connection and a working sound card, this release should work just fine.
 
@@ -278,7 +278,7 @@ With the Thrive Messenger client open and logged in, follow these steps to chang
 
 The client.conf file controls what server and port the Thrive Messenger client connects to. If you have your own Thrive Messenger server up, or you have one that you like to use, you can simply open client.conf in your text editor of choice, such as Notepad++, and modify the server hostname and port to point to your desired server.
 
-The default server is msg.thecubed.cc, running on port 2005.
+The default server is im.tappedin.fm, running on port 2005.
 
 If your server is published on a Web3 DNS name, set `host` to that domain directly (for example `myserver.eth`).
 
@@ -412,6 +412,36 @@ To allow your server to send emails, simply add these files to the end of your s
     email=your_username@host.tld
     password=your_password
     ```
+
+### WordPress authentication and account linking
+
+Thrive Messenger can optionally support WordPress authentication by accepting signed account sync events from any WordPress site. This lets existing WordPress user and admin accounts be linked to Thrive accounts while keeping the normal Thrive login flow available: native Thrive passwords, passkey login, SMTP account verification, password reset codes, and admin-created accounts continue to work as before.
+
+The compatible WordPress plugin lives in `wordpress/thrive-server-sync`. Install that folder as a normal WordPress plugin, then configure the Thrive host, port, TLS mode, and shared sync secret from Settings > Thrive Server Sync. The plugin defaults to `im.tappedin.fm` and checks `https://im.tappedin.fm/updates/thrive-server-sync.json` for plugin updates. It is disabled by default and never sends WordPress passwords to Thrive.
+
+Server operators can install and activate the plugin across detected WordPress sites with:
+
+    ```
+    scripts/install_wordpress_plugin.sh
+    ```
+
+The installer scans common WordPress roots such as `/home/*/public_html`, copies the plugin into each site's `wp-content/plugins` folder, and activates it with WP-CLI when WP-CLI is available. Set `WP_ROOTS` to a colon-separated list to restrict the scan.
+
+The plugin source is included for general use by any Thrive server operator with a WordPress site. It is not tied to a specific hosted Thrive server, domain, or fork, so upstream Thrive can include it in the main branch as an optional integration.
+
+Enable the matching server endpoint in `srv/srv.conf`:
+
+    ```
+    [wordpress]
+    enabled = true
+    sync_secret = use-a-long-random-secret-here
+    allow_admin_sync = true
+    signature_window_seconds = 300
+    ```
+
+The WordPress plugin signs each sync event with HMAC-SHA256. The Thrive server verifies the timestamp, nonce, and signature before linking or creating the Thrive account. Existing Thrive passwords are not overwritten; if the WordPress user or admin does not already exist in Thrive, the server creates a verified linked account with a random password so the person can later reset or use native Thrive authentication when needed.
+
+The same bridge can also provision WordPress users from Thrive signups. Set `provision_url` to the plugin REST endpoint, usually `https://example.com/wp-json/thrive-server-sync/v1/provision-user`, and keep `auto_provision_wordpress = true`. When a verified Thrive user has an email address, the server signs a provisioning request so WordPress can create or link the matching account and send the normal WordPress new-user notification.
 
 ### File transfer limits
 

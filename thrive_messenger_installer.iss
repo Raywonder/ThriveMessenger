@@ -2,9 +2,9 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.2"
+#define MyAppVersion "2026 Alpha 15.5"
 #define MyAppPublisher "G4p Studios"
-#define MyAppURL "https://github.com/G4p-Studios/ThriveMessenger"
+#define MyAppURL "https://im.tappedin.fm"
 #define MyAppExeName "thrive_messenger.exe"
 
 [Setup]
@@ -22,8 +22,8 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={pf}\Thrive\Thrive Messenger
 DefaultGroupName=Thrive\Thrive Messenger
 AllowNoIcons=yes
-InfoAfterFile=C:\git\ThriveMessenger\README.md
-OutputDir=C:\Users\seedy\Documents
+InfoAfterFile=README.md
+OutputDir=dist-installer
 OutputBaseFilename=thrive_messenger_installer
 Compression=lzma
 SolidCompression=yes
@@ -35,15 +35,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "C:\git\ThriveMessenger\dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\git\ThriveMessenger\dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{group}\{cm:ProgramOnTheWeb,{#MyAppName}}"; Filename: "{#MyAppURL}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

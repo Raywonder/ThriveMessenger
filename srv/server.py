@@ -1,7 +1,15 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib, hmac
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+    _ph = PasswordHasher()
+except Exception:
+    PasswordHasher = None
+    VerifyMismatchError = VerificationError = InvalidHashError = Exception
+    _ph = None
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
@@ -12,6 +20,7 @@ smtp_config = {}
 flexpbx_config = {}
 file_config = {}
 bot_runtime_config = {}
+wordpress_config = {}
 shutdown_timeout = 5
 max_status_length = 50
 pending_transfers = {}
@@ -564,9 +573,31 @@ def _status_for_user(username):
     with lock:
         return client_statuses.get(username, "online" if username in clients else "offline")
 
+def _default_bot_contacts():
+    raw = str(bot_runtime_config.get('default_bot_contacts', 'Clawdia') or '')
+    names = [name.strip() for name in raw.split(',') if name.strip()]
+    return [name for name in names if _is_registered_bot(name)]
+
+def _ensure_default_bot_contacts(username):
+    username = str(username or '').strip()
+    if not username:
+        return
+    bots = _default_bot_contacts()
+    if not bots:
+        return
+    con = sqlite3.connect(DB)
+    try:
+        for bot in bots:
+            if bot != username:
+                con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (username, bot))
+        con.commit()
+    finally:
+        con.close()
+
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     if not _is_virtual_bot(to_user):
         return False
+    _record_bot_memory(sender_user, to_user, "user", text)
     reply = _ollama_bot_reply(sender_user, to_user, text)
     if not reply:
         lower = (text or "").strip().lower()
@@ -594,6 +625,7 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     }
     if tts_payload:
         payload.update(tts_payload)
+    _record_bot_memory(sender_user, to_user, "assistant", reply)
     try:
         sender_sock.sendall((json.dumps(payload) + "\n").encode())
     except Exception:
@@ -647,6 +679,12 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         system_prompt += (
             " Follow the bot ruleset provided below. If a user asks what rules you follow, summarize these rules."
         )
+    memory_context = _bot_memory_context(sender_user, bot_name)
+    if memory_context:
+        system_prompt += (
+            " You have persistent per-user chat memory on this Thrive server. Use it to maintain continuity, "
+            "but do not reveal private memory unless it directly helps the current user."
+        )
 
     payload = {
         "model": model,
@@ -655,6 +693,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
             {"role": "system", "content": f"Agent rules context:\n{rules_context[:5000]}" if rules_context else "Agent rules context unavailable."},
+            {"role": "system", "content": f"Prior chat memory for {sender_user} with {bot_name}:\n{memory_context}" if memory_context else "Prior chat memory unavailable."},
             {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
         ]
     }
@@ -965,6 +1004,15 @@ def load_config():
         'api_token': config.get('flexpbx', 'api_token', fallback=''),
         'from_number': config.get('flexpbx', 'from_number', fallback=''),
     }
+    global wordpress_config
+    wordpress_config = {
+        'enabled': config.getboolean('wordpress', 'enabled', fallback=False),
+        'sync_secret': config.get('wordpress', 'sync_secret', fallback=''),
+        'allow_admin_sync': config.getboolean('wordpress', 'allow_admin_sync', fallback=True),
+        'signature_window_seconds': config.getint('wordpress', 'signature_window_seconds', fallback=300),
+        'provision_url': config.get('wordpress', 'provision_url', fallback=''),
+        'auto_provision_wordpress': config.getboolean('wordpress', 'auto_provision_wordpress', fallback=True),
+    }
     enforce_blackfiles = config.getboolean('server', 'enforce_blackfile_list', fallback=False)
     global file_config
     file_config = {
@@ -984,10 +1032,10 @@ def load_config():
         'post_login': config.get('welcome', 'post_login', fallback=''),
     }
     global bot_usernames
-    raw_bots = config.get('bots', 'names', fallback='assistant-bot,helper-bot')
+    raw_bots = config.get('bots', 'names', fallback='assistant-bot,helper-bot,Clawdia')
     bot_usernames = {name.strip() for name in raw_bots.split(',') if name.strip()}
     if not bot_usernames:
-        bot_usernames = {"assistant-bot", "helper-bot"}
+        bot_usernames = {"assistant-bot", "helper-bot", "Clawdia"}
     global bot_status_map
     bot_status_map = _parse_bot_map(config.get('bots', 'status_map', fallback=''))
     global bot_purpose_map
@@ -1019,6 +1067,8 @@ def load_config():
         'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
         'piper_default_voice': config.get('bots', 'piper_default_voice', fallback='en_US-lessac-medium'),
         'piper_timeout': config.getint('bots', 'piper_timeout', fallback=12),
+        'memory_messages_per_user': config.getint('bots', 'memory_messages_per_user', fallback=80),
+        'default_bot_contacts': config.get('bots', 'default_bot_contacts', fallback='Clawdia'),
     }
     return {
         'port': config.getint('server', 'port', fallback=5005),
@@ -1043,6 +1093,27 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS wordpress_account_links (
+        thrive_username TEXT PRIMARY KEY,
+        wp_user_id TEXT,
+        wp_email TEXT,
+        wp_login TEXT,
+        linked_at TEXT,
+        last_sync_at TEXT,
+        is_admin_link INTEGER DEFAULT 0
+    )''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS wordpress_sync_nonces (
+        nonce TEXT PRIMARY KEY,
+        created_at TEXT
+    )''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS bot_chat_memory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        bot TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )''')
     cur.execute('''CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
@@ -1061,6 +1132,197 @@ def init_db():
     conn.commit()
     _seed_feature_defaults()
     conn.close()
+
+def _hash_password_for_storage(password):
+    if _ph is not None:
+        return _ph.hash(password)
+    return password
+
+def _truthy_flag(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+def _record_bot_memory(username, bot_name, role, content):
+    username = str(username or '').strip()
+    bot_name = str(bot_name or '').strip()
+    role = str(role or '').strip()
+    content = str(content or '').strip()
+    if not username or not bot_name or role not in ('user', 'assistant') or not content:
+        return
+    con = sqlite3.connect(DB)
+    try:
+        con.execute(
+            "INSERT INTO bot_chat_memory(username, bot, role, content, created_at) VALUES(?,?,?,?,?)",
+            (username, bot_name, role, content[:4000], datetime.datetime.utcnow().isoformat()),
+        )
+        keep = int(bot_runtime_config.get('memory_messages_per_user', 80) or 80)
+        con.execute(
+            """
+            DELETE FROM bot_chat_memory
+            WHERE username=? AND bot=? AND id NOT IN (
+                SELECT id FROM bot_chat_memory
+                WHERE username=? AND bot=?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            """,
+            (username, bot_name, username, bot_name, max(20, keep)),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+def _bot_memory_context(username, bot_name, limit=16):
+    username = str(username or '').strip()
+    bot_name = str(bot_name or '').strip()
+    if not username or not bot_name:
+        return ""
+    con = sqlite3.connect(DB)
+    try:
+        rows = con.execute(
+            """
+            SELECT role, content, created_at
+            FROM bot_chat_memory
+            WHERE username=? AND bot=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (username, bot_name, int(limit)),
+        ).fetchall()
+    finally:
+        con.close()
+    lines = []
+    for role, content, created_at in reversed(rows):
+        lines.append(f"{created_at} {role}: {str(content)[:700]}")
+    return "\n".join(lines)
+
+def _wordpress_hmac(secret, fields):
+    message = "\n".join(str(x or '') for x in fields)
+    return hmac.new(str(secret).encode('utf-8'), message.encode('utf-8'), hashlib.sha256).hexdigest()
+
+def _verify_wordpress_signature(req):
+    if not wordpress_config.get('enabled'):
+        return False, "WordPress sync is disabled."
+    secret = str(wordpress_config.get('sync_secret') or '').strip()
+    if not secret:
+        return False, "WordPress sync secret is not configured."
+    try:
+        ts = int(str(req.get('timestamp', '')).strip())
+    except Exception:
+        return False, "Missing or invalid timestamp."
+    window = int(wordpress_config.get('signature_window_seconds') or 300)
+    if abs(int(time.time()) - ts) > max(30, window):
+        return False, "Signature timestamp is outside the allowed window."
+    nonce = str(req.get('nonce') or '').strip()
+    signature = str(req.get('signature') or '').strip().lower()
+    if not nonce or not signature:
+        return False, "Missing nonce or signature."
+    wp_user_id = str(req.get('wp_user_id') or '').strip()
+    username = str(req.get('username') or '').strip()
+    email = str(req.get('email') or '').strip().lower()
+    is_admin = '1' if _truthy_flag(req.get('is_admin')) else '0'
+    message = "\n".join([str(ts), nonce, wp_user_id, username, email, is_admin])
+    expected = _wordpress_hmac(secret, [str(ts), nonce, wp_user_id, username, email, is_admin])
+    if not hmac.compare_digest(expected, signature):
+        return False, "Invalid signature."
+    con = sqlite3.connect(DB)
+    try:
+        existing = con.execute("SELECT 1 FROM wordpress_sync_nonces WHERE nonce=?", (nonce,)).fetchone()
+        if existing:
+            return False, "Replay detected."
+        con.execute("INSERT INTO wordpress_sync_nonces(nonce, created_at) VALUES(?,?)", (nonce, datetime.datetime.utcnow().isoformat()))
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(seconds=max(600, window * 2))).isoformat()
+        con.execute("DELETE FROM wordpress_sync_nonces WHERE created_at < ?", (cutoff,))
+        con.commit()
+    finally:
+        con.close()
+    return True, ""
+
+def _handle_wordpress_sync(req):
+    ok, reason = _verify_wordpress_signature(req)
+    if not ok:
+        return {"status": "error", "reason": reason}
+    username = str(req.get('username') or '').strip()
+    email = str(req.get('email') or '').strip().lower()
+    wp_user_id = str(req.get('wp_user_id') or '').strip()
+    wp_login = str(req.get('wp_login') or '').strip()
+    is_admin = _truthy_flag(req.get('is_admin'))
+    if not username or not wp_user_id:
+        return {"status": "error", "reason": "username and wp_user_id are required."}
+    con = sqlite3.connect(DB)
+    try:
+        row = con.execute("SELECT username, email FROM users WHERE username=? COLLATE NOCASE LIMIT 1", (username,)).fetchone()
+        now = datetime.datetime.utcnow().isoformat()
+        created = False
+        if row:
+            canonical = row[0]
+            if email and not str(row[1] or '').strip():
+                con.execute("UPDATE users SET email=? WHERE username=?", (email, canonical))
+        else:
+            canonical = username
+            random_password = _hash_password_for_storage(secrets.token_urlsafe(48))
+            con.execute(
+                "INSERT INTO users(username, password, email, is_verified) VALUES(?,?,?,1)",
+                (canonical, random_password, email),
+            )
+            created = True
+        con.execute(
+            """
+            INSERT INTO wordpress_account_links(thrive_username, wp_user_id, wp_email, wp_login, linked_at, last_sync_at, is_admin_link)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(thrive_username) DO UPDATE SET
+                wp_user_id=excluded.wp_user_id,
+                wp_email=excluded.wp_email,
+                wp_login=excluded.wp_login,
+                last_sync_at=excluded.last_sync_at,
+                is_admin_link=excluded.is_admin_link
+            """,
+            (canonical, wp_user_id, email, wp_login, now, now, 1 if is_admin else 0),
+        )
+        con.commit()
+    finally:
+        con.close()
+    if is_admin and wordpress_config.get('allow_admin_sync', True):
+        add_admin(canonical)
+    return {"status": "ok", "user": canonical, "created": created, "linked": True, "is_admin": bool(is_admin)}
+
+def _provision_wordpress_user(username, email, is_admin=False):
+    if not wordpress_config.get('enabled') or not wordpress_config.get('auto_provision_wordpress', True):
+        return {"status": "skipped", "reason": "WordPress provisioning is disabled."}
+    secret = str(wordpress_config.get('sync_secret') or '').strip()
+    provision_url = str(wordpress_config.get('provision_url') or '').strip()
+    username = str(username or '').strip()
+    email = str(email or '').strip().lower()
+    if not secret or not provision_url or not username or not email:
+        return {"status": "skipped", "reason": "WordPress provisioning is not configured or user has no email."}
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(18)
+    admin_flag = '1' if is_admin else '0'
+    payload = {
+        "timestamp": ts,
+        "nonce": nonce,
+        "username": username,
+        "email": email,
+        "is_admin": admin_flag,
+    }
+    payload["signature"] = _wordpress_hmac(secret, [ts, nonce, username, email, admin_flag])
+    req = urllib.request.Request(
+        provision_url,
+        data=json.dumps(payload).encode('utf-8'),
+        method="POST",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read().decode('utf-8', errors='replace')
+        data = json.loads(body) if body else {}
+        if isinstance(data, dict):
+            return data
+        return {"status": "error", "reason": "Invalid WordPress provisioning response."}
+    except Exception as e:
+        print(f"WordPress provisioning failed for {username}: {e}")
+        return {"status": "error", "reason": str(e)}
 
 def broadcast_contact_status(user, online):
     with lock:
@@ -1156,6 +1418,15 @@ def handle_client(cs, addr):
                 "expires_at": str(expires_at or "").strip(),
             }) + "\n").encode())
             return
+
+        # --- WordPress Account Sync (pre-login, HMAC authenticated) ---
+        if action == "wordpress_sync_user":
+            result = _handle_wordpress_sync(req)
+            sock.sendall((json.dumps({
+                "action": "wordpress_sync_user_result",
+                **result,
+            }) + "\n").encode())
+            return
         
         # --- Create Account ---
         if action == "create_account":
@@ -1233,6 +1504,9 @@ def handle_client(cs, addr):
                 con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
             else:
                 con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+                for bot in _default_bot_contacts():
+                    if bot != new_user:
+                        con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (new_user, bot))
             if invite_token:
                 con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
             con.commit()
@@ -1248,6 +1522,7 @@ def handle_client(cs, addr):
             else:
                 sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
                 if email:
+                    _provision_wordpress_user(new_user, email, is_admin=False)
                     EmailManager.send_email(
                         email,
                         "Welcome to Thrive Messenger",
@@ -1265,6 +1540,7 @@ def handle_client(cs, addr):
                 con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
                 if row[1]:
+                    _provision_wordpress_user(u_ver, row[1], is_admin=False)
                     EmailManager.send_email(
                         row[1],
                         "Thrive Messenger - Account Verified",
@@ -1380,6 +1656,7 @@ def handle_client(cs, addr):
 
         user = row[0]
         bi, br, verified = row[2], row[3], row[4]
+        _ensure_default_bot_contacts(user)
         
         if smtp_config['enabled'] and verified == 0:
             sock.sendall(b'{"status":"error","reason":"Account not verified. Please recreate account to verify."}\n')
