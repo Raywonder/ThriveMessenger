@@ -19,7 +19,9 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={pf}\Thrive\Thrive Messenger
+DefaultDirName={commonpf32}\Thrive\Thrive Messenger
+PrivilegesRequired=admin
+UsePreviousAppDir=no
 DefaultGroupName=Thrive\Thrive Messenger
 AllowNoIcons=yes
 InfoAfterFile=README.md
@@ -37,7 +39,11 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "client.conf"; DestDir: "{app}"; Flags: ignoreversion
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
+
+[InstallDelete]
+Type: files; Name: "{app}\client.conf"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

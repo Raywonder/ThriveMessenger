@@ -17,6 +17,8 @@ clients = {}
 client_statuses = {}
 lock = threading.Lock()
 smtp_config = {}
+code_expires = 5 * 60
+code_expires_label = "5m"
 flexpbx_config = {}
 file_config = {}
 bot_runtime_config = {}
@@ -30,6 +32,7 @@ use_ssl = False
 server_started_at = time.time()
 bot_usernames = set()
 bot_status_map = {}
+bot_dynamic_status_map = {}
 bot_purpose_map = {}
 bot_service_map = {}
 bot_voice_map = {}
@@ -51,6 +54,8 @@ FEATURE_DEFAULTS = {
     "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Server side admin command console."},
     "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Server manager and server tools UI."},
 }
+
+BOT_STATUS_STATE_FILE = 'bot_status_state.json'
 
 GROUP_POLICY_SCHEMA = {
     "allow_group_text": ("bool", True, "Allow users to send text messages in groups."),
@@ -562,8 +567,49 @@ def _active_usernames():
 def _is_online_user(username):
     return username in _active_usernames()
 
+def _load_bot_dynamic_statuses():
+    global bot_dynamic_status_map
+    try:
+        with open(BOT_STATUS_STATE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cleaned = {}
+            for name, status in data.items():
+                bot_name = str(name or '').strip()
+                status_text = str(status or '').strip()[:max_status_length]
+                if bot_name and status_text:
+                    cleaned[bot_name] = status_text
+            bot_dynamic_status_map = cleaned
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        bot_dynamic_status_map = {}
+
+def _save_bot_dynamic_statuses():
+    try:
+        tmp = BOT_STATUS_STATE_FILE + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(bot_dynamic_status_map, f, indent=2, sort_keys=True)
+        os.replace(tmp, BOT_STATUS_STATE_FILE)
+    except Exception as e:
+        print(f"Could not save bot status state: {e}")
+
+def _set_bot_status(bot_name, status_text):
+    bot_name = str(bot_name or '').strip()
+    if not _is_registered_bot(bot_name):
+        return False, "Unknown bot."
+    status_text = str(status_text or '').strip()[:max_status_length]
+    if not status_text:
+        return False, "Status text is required."
+    with lock:
+        bot_dynamic_status_map[bot_name] = status_text
+        _save_bot_dynamic_statuses()
+    broadcast_contact_status(bot_name, True)
+    return True, None
+
 def _status_for_user(username):
     if _is_registered_bot(username):
+        dynamic_status = bot_dynamic_status_map.get(username)
+        if dynamic_status:
+            return dynamic_status
         status = bot_status_map.get(username, "online")
         if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
             purpose = "automation and assistant bot"
@@ -689,6 +735,10 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     payload = {
         "model": model,
         "stream": False,
+        "options": {
+            "num_predict": int(bot_runtime_config.get('ollama_num_predict', 180) or 180),
+            "temperature": float(bot_runtime_config.get('ollama_temperature', 0.4) or 0.4),
+        },
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
@@ -908,10 +958,26 @@ class EmailManager:
 
     @staticmethod
     def generate_code(length=6):
-        if length <= 6:
-            # Preserve a short user-facing code option while using CSPRNG.
-            return ''.join(secrets.choice('0123456789') for _ in range(length))
-        return secrets.token_hex(max(1, length // 2))
+        return secrets.token_hex(16)
+
+def _parse_duration(value, default_seconds=300):
+    text = str(value or "").strip().lower()
+    if not text:
+        return default_seconds
+    try:
+        if text.endswith("ms"):
+            return max(1, int(float(text[:-2]) / 1000))
+        if text.endswith("s"):
+            return max(1, int(float(text[:-1])))
+        if text.endswith("m"):
+            return max(1, int(float(text[:-1]) * 60))
+        if text.endswith("h"):
+            return max(1, int(float(text[:-1]) * 60 * 60))
+        if text.endswith("d"):
+            return max(1, int(float(text[:-1]) * 24 * 60 * 60))
+        return max(1, int(float(text)))
+    except Exception:
+        return default_seconds
 
 class FlexPBXManager:
     @staticmethod
@@ -985,6 +1051,17 @@ def broadcast_alert(message):
             try: sock.sendall(msg.encode())
             except: pass
 
+def broadcast_user_joined(username):
+    clean_user = str(username or "").strip()
+    if not clean_user:
+        return
+    print(f"Broadcasting new user joined notification for {clean_user}")
+    msg = json.dumps({"action": "user_joined_server", "user": clean_user}) + "\n"
+    with lock:
+        for sock in list(clients.values()):
+            try: sock.sendall(msg.encode())
+            except: pass
+
 def load_config():
     # Fix: interpolation=None prevents % characters in password from breaking the parser
     config = configparser.ConfigParser(interpolation=None)
@@ -997,6 +1074,9 @@ def load_config():
         'email': config.get('smtp', 'email', fallback=''),
         'password': config.get('smtp', 'password', fallback='')
     }
+    global code_expires, code_expires_label
+    code_expires_label = config.get('smtp', 'code_expires', fallback='5m')
+    code_expires = _parse_duration(code_expires_label, 5 * 60)
     global flexpbx_config
     flexpbx_config = {
         'enabled': config.getboolean('flexpbx', 'enabled', fallback=False),
@@ -1023,6 +1103,7 @@ def load_config():
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
     global max_status_length
     max_status_length = config.getint('server', 'max_status_length', fallback=50)
+    _load_bot_dynamic_statuses()
     global server_identity
     server_identity = config.get('server', 'name', fallback=config.get('server', 'host', fallback='Server'))
     global welcome_config
@@ -1061,6 +1142,8 @@ def load_config():
         'ollama_url': config.get('bots', 'ollama_url', fallback='http://127.0.0.1:11434'),
         'ollama_model': config.get('bots', 'ollama_model', fallback='llama3.2'),
         'ollama_timeout': config.getint('bots', 'ollama_timeout', fallback=20),
+        'ollama_num_predict': config.getint('bots', 'ollama_num_predict', fallback=180),
+        'ollama_temperature': config.getfloat('bots', 'ollama_temperature', fallback=0.4),
         'ollama_system_prompt': config.get('bots', 'ollama_system_prompt', fallback=''),
         'piper_enabled': config.getboolean('bots', 'piper_enabled', fallback=False),
         'piper_bin': config.get('bots', 'piper_bin', fallback='/usr/local/bin/piper'),
@@ -1086,8 +1169,10 @@ def init_db():
     existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)")]
     if 'email' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
     if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
+    if 'verification_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code_at REAL")
     if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
+    if 'reset_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code_at REAL")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
@@ -1137,6 +1222,18 @@ def _hash_password_for_storage(password):
     if _ph is not None:
         return _ph.hash(password)
     return password
+
+def _verify_password_for_login(stored_password, supplied_password):
+    stored_password = str(stored_password or "")
+    supplied_password = str(supplied_password or "")
+    if stored_password == supplied_password:
+        return True
+    if _ph is None or not stored_password.startswith("$argon2"):
+        return False
+    try:
+        return _ph.verify(stored_password, supplied_password)
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        return False
 
 def _truthy_flag(value):
     if isinstance(value, bool):
@@ -1326,7 +1423,10 @@ def _provision_wordpress_user(username, email, is_admin=False):
 
 def broadcast_contact_status(user, online):
     with lock:
-        status_text = client_statuses.get(user, "offline") if online else "offline"
+        if online and _is_registered_bot(user):
+            status_text = _status_for_user(user)
+        else:
+            status_text = client_statuses.get(user, "offline") if online else "offline"
     msg = json.dumps({"action":"contact_status","user":user,"online":online,"status_text":status_text}) + "\n"
     with lock:
         for owner, sock in clients.items():
@@ -1499,11 +1599,12 @@ def handle_client(cs, addr):
             # Logic: If SMTP is on, set verified=0, gen code, send email. Else verified=1.
             verified = 1 if not smtp_config['enabled'] else 0
             code = EmailManager.generate_code() if not verified else None
+            code_at = time.time() if code else None
             
             if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, verification_code_at=?, is_verified=? WHERE username=?", (new_pass, email, code, code_at, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+                con.execute("INSERT INTO users(username, password, email, verification_code, verification_code_at, is_verified) VALUES(?,?,?,?,?,?)", (new_user, new_pass, email, code, code_at, verified))
                 for bot in _default_bot_contacts():
                     if bot != new_user:
                         con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (new_user, bot))
@@ -1521,6 +1622,7 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Could not send verification email."}) + "\n").encode())
             else:
                 sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
+                broadcast_user_joined(new_user)
                 if email:
                     _provision_wordpress_user(new_user, email, is_admin=False)
                     EmailManager.send_email(
@@ -1535,9 +1637,15 @@ def handle_client(cs, addr):
             u_ver = req.get("user")
             code_ver = req.get("code")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code, email FROM users WHERE username=?", (u_ver,)).fetchone()
+            row = con.execute("SELECT verification_code, email, verification_code_at FROM users WHERE username=?", (u_ver,)).fetchone()
             if row and row[0] == code_ver:
-                con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
+                issued_at = row[2] or 0
+                if issued_at and time.time() - float(issued_at) > code_expires:
+                    con.execute("UPDATE users SET verification_code=NULL, verification_code_at=NULL WHERE username=?", (u_ver,))
+                    con.commit(); con.close()
+                    sock.sendall(json.dumps({"status": "error", "reason": f"Verification code expired. Request a new code; codes expire after {code_expires_label}."}).encode() + b"\n")
+                    return
+                con.execute("UPDATE users SET is_verified=1, verification_code=NULL, verification_code_at=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
                 if row[1]:
                     _provision_wordpress_user(u_ver, row[1], is_admin=False)
@@ -1546,6 +1654,7 @@ def handle_client(cs, addr):
                         "Thrive Messenger - Account Verified",
                         f"Hi {u_ver}, your account on {server_identity} has been verified and is ready to use."
                     )
+                broadcast_user_joined(u_ver)
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
                 con.close()
@@ -1562,7 +1671,7 @@ def handle_client(cs, addr):
                 t_user, t_email = row
                 if t_email:
                     code = EmailManager.generate_code()
-                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
+                    con.execute("UPDATE users SET reset_code=?, reset_code_at=? WHERE username=?", (code, time.time(), t_user))
                     con.commit()
                     EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
                     # Return OK even if email fails to prevent enumeration, mostly.
@@ -1581,9 +1690,15 @@ def handle_client(cs, addr):
             t_code = req.get("code")
             new_p = req.get("new_pass")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
+            row = con.execute("SELECT reset_code, reset_code_at FROM users WHERE username=?", (t_user,)).fetchone()
             if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                issued_at = row[1] or 0
+                if issued_at and time.time() - float(issued_at) > code_expires:
+                    con.execute("UPDATE users SET reset_code=NULL, reset_code_at=NULL WHERE username=?", (t_user,))
+                    con.commit(); con.close()
+                    sock.sendall(json.dumps({"status": "error", "reason": f"Reset code expired. Request a new code; codes expire after {code_expires_label}."}).encode() + b"\n")
+                    return
+                con.execute("UPDATE users SET password=?, reset_code=NULL, reset_code_at=NULL WHERE username=?", (new_p, t_user))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
@@ -1629,7 +1744,7 @@ def handle_client(cs, addr):
             return
 
         if action == "login":
-            if row[1] != req.get("pass", ""):
+            if not _verify_password_for_login(row[1], req.get("pass", "")):
                 sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
                 db.close()
                 return
@@ -2737,6 +2852,24 @@ def handle_client(cs, addr):
                 with lock: client_statuses[user] = status_text
                 broadcast_contact_status(user, True)
 
+            elif action == "set_bot_status":
+                bot_name = str(msg.get("bot", "") or msg.get("bot_name", "") or user).strip()
+                if user != bot_name and not _is_admin(user):
+                    sock.sendall((json.dumps({
+                        "action": "set_bot_status_result",
+                        "ok": False,
+                        "reason": "Only the bot or an admin can change a bot status.",
+                    }) + "\n").encode())
+                    continue
+                ok, reason = _set_bot_status(bot_name, msg.get("status_text", ""))
+                sock.sendall((json.dumps({
+                    "action": "set_bot_status_result",
+                    "ok": bool(ok),
+                    "bot": bot_name,
+                    "status_text": _status_for_user(bot_name) if ok else "",
+                    "reason": reason or "",
+                }) + "\n").encode())
+
             elif action == "change_password":
                 cur_pass = msg.get("current_pass", "")
                 new_pass = msg.get("new_pass", "")
@@ -2835,13 +2968,18 @@ def serve_loop(config):
     while True:
         try:
             newsocket, fromaddr = bindsocket.accept()
+            newsocket.settimeout(10)
             try:
                 if use_ssl:
                     connstream = context.wrap_socket(newsocket, server_side=True)
                 else:
                     connstream = newsocket
+                connstream.settimeout(None)
                 
                 threading.Thread(target=handle_client, args=(connstream, fromaddr), daemon=True).start()
+            except socket.timeout:
+                print(f"Timed out during TLS handshake from {fromaddr}. Ignoring.")
+                newsocket.close()
             except ssl.SSLError as e: 
                 print(f"SSL Error from {fromaddr}: {e}. Probably a port scan. Ignoring.")
                 newsocket.close()
