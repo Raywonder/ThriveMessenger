@@ -17,6 +17,9 @@ KEYRING_SERVICE = "ThriveMessenger"
 PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
 DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
+IDLE_KEEPALIVE_SECONDS = 15 * 60
+KEEPALIVE_CHECK_INTERVAL = 30
+KEEPALIVE_RESPONSE_TIMEOUT = 10
 DEMO_VIDEOS = {
     "onboarding": {
         "filename": "promo-onboarding.mp4",
@@ -379,6 +382,7 @@ def load_user_config():
         'primary_server_name': next((e['name'] for e in file_entries if e.get('primary')), file_entries[0]['name'] if file_entries else 'Default Server'),
         'auto_open_received_files': True,
         'read_messages_aloud': False,
+        'interrupt_speech': True,
         'typing_indicators': True,
         'announce_typing': True,
         'prefer_contact_display_names': False,
@@ -443,6 +447,7 @@ def load_user_config():
         settings['message_undo_window_seconds'] = 15
     settings['allow_cross_server_directory_message'] = bool(settings.get('allow_cross_server_directory_message', True))
     settings['double_escape_to_close_chat'] = bool(settings.get('double_escape_to_close_chat', True))
+    settings['interrupt_speech'] = bool(settings.get('interrupt_speech', True))
     settings['prefer_contact_display_names'] = bool(settings.get('prefer_contact_display_names', False))
     if not isinstance(settings.get('contact_display_names', {}), dict):
         settings['contact_display_names'] = {}
@@ -914,16 +919,36 @@ def ensure_help_docs():
         out[key] = path
     return out
 
-def speak_text(text):
+def speak_text(text, interrupt=None):
     try:
         if not text:
             return
+        app = wx.GetApp() if wx.GetApp() else None
+        if interrupt is None:
+            interrupt = bool(getattr(app, "user_config", {}).get('interrupt_speech', True)) if app else True
+        if interrupt and app:
+            previous = getattr(app, "_tts_process", None)
+            if previous and previous.poll() is None:
+                try:
+                    previous.terminate()
+                except Exception:
+                    pass
         if sys.platform == 'darwin':
-            subprocess.Popen(['say', text])
+            if interrupt:
+                subprocess.Popen(['killall', 'say'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(['say', text])
         elif sys.platform == 'win32':
             safe_text = text.replace("'", "''")
-            cmd = "Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak('{0}')".format(safe_text)
-            subprocess.Popen(["powershell", "-NoProfile", "-Command", cmd], creationflags=0x08000000)
+            cmd = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                "$s.Speak('{0}')"
+            ).format(safe_text)
+            proc = subprocess.Popen(["powershell", "-NoProfile", "-Command", cmd], creationflags=0x08000000)
+        else:
+            proc = None
+        if app and proc:
+            app._tts_process = proc
     except Exception as e:
         print(f"TTS speak failed: {e}")
 
@@ -1396,6 +1421,8 @@ class SettingsDialog(wx.Dialog):
         self.auto_open_files_cb.SetValue(bool(self.config.get('auto_open_received_files', True)))
         self.read_aloud_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Read incoming chat messages aloud")
         self.read_aloud_cb.SetValue(bool(self.config.get('read_messages_aloud', False)))
+        self.interrupt_speech_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Interrupt speech when new messages are read aloud")
+        self.interrupt_speech_cb.SetValue(bool(self.config.get('interrupt_speech', True)))
         self.global_chat_logging_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Save chat history by default")
         self.global_chat_logging_cb.SetValue(bool(self.config.get('save_chat_history_default', False)))
         self.show_main_actions_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Show action buttons in main window")
@@ -1580,6 +1607,7 @@ class SettingsDialog(wx.Dialog):
         call_audio_box.Add(self.call_output_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         accessibility_box.Add(self.auto_open_files_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.read_aloud_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.interrupt_speech_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.global_chat_logging_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.show_main_actions_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
@@ -1647,7 +1675,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -2021,6 +2049,8 @@ class ClientApp(wx.App):
         self.session_password = ""
         self.reconnect_in_progress = False
         self.reconnect_stop_event = threading.Event()
+        self._last_activity = time.time()
+        self._keepalive_stop = threading.Event()
         self.active_server_entry = resolve_default_server_entry(self.user_config)
         self.connected_server_names = set()
         self.transfer_history = []
@@ -2209,6 +2239,8 @@ class ClientApp(wx.App):
         self.sockfile = sf
         self.reconnect_in_progress = False
         self.reconnect_stop_event.clear()
+        self._last_activity = time.time()
+        self._start_keepalive_monitor()
         self.intentional_disconnect = False
         self._set_socket_for_open_windows(sock)
         if getattr(self, 'frame', None):
@@ -2220,6 +2252,10 @@ class ClientApp(wx.App):
         except Exception:
             pass
         threading.Thread(target=self.listen_loop, daemon=True).start()
+        try:
+            self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
+        except Exception:
+            pass
 
     def _start_reconnect_loop(self):
         if self.intentional_disconnect or self.reconnect_in_progress:
@@ -2370,6 +2406,8 @@ class ClientApp(wx.App):
     def start_main_session(self, username, sock, sf):
         self.username = username; self.sock = sock; self.sockfile = sf; self.pending_file_paths = {}
         self.intentional_disconnect = False
+        self._last_activity = time.time()
+        self._start_keepalive_monitor()
         active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
         self.connected_server_names = {active.get("name") or active.get("host") or "Server"}
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
@@ -2384,6 +2422,34 @@ class ClientApp(wx.App):
             pass
         self.sync_session_preferences()
         self.frame.on_check_updates(silent=True)
+
+    def _start_keepalive_monitor(self):
+        stop_event = getattr(self, "_keepalive_stop", None)
+        if stop_event:
+            stop_event.set()
+        self._keepalive_stop = threading.Event()
+        threading.Thread(target=self._keepalive_monitor, args=(self._keepalive_stop,), daemon=True).start()
+
+    def _keepalive_monitor(self, stop_event):
+        while not stop_event.wait(KEEPALIVE_CHECK_INTERVAL):
+            sock = getattr(self, "sock", None)
+            if not sock or self.intentional_disconnect:
+                continue
+            idle_for = time.time() - getattr(self, "_last_activity", time.time())
+            if idle_for < IDLE_KEEPALIVE_SECONDS:
+                continue
+            previous_activity = self._last_activity
+            try:
+                sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
+            except Exception:
+                if not self.intentional_disconnect:
+                    wx.CallAfter(self.on_server_disconnect)
+                return
+            if stop_event.wait(KEEPALIVE_RESPONSE_TIMEOUT):
+                return
+            if getattr(self, "_last_activity", previous_activity) <= previous_activity and not self.intentional_disconnect:
+                wx.CallAfter(self.on_server_disconnect)
+                return
 
     def sync_session_preferences(self):
         sock = getattr(self, "sock", None)
@@ -2455,6 +2521,7 @@ class ClientApp(wx.App):
                     msg = json.loads(line)
                 except Exception:
                     continue
+                self._last_activity = time.time()
                 act = msg.get("action")
                 try:
                     if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg.get("contacts", []))
@@ -2508,6 +2575,10 @@ class ClientApp(wx.App):
     def on_server_disconnect(self):
         if self.intentional_disconnect:
             return
+        try:
+            self._keepalive_stop.set()
+        except Exception:
+            pass
         try:
             self.sock.close()
         except Exception:
@@ -4463,6 +4534,7 @@ class MainFrame(wx.Frame):
                 app.user_config['call_output_volume'] = int(dlg.call_output_slider.GetValue())
                 app.user_config['auto_open_received_files'] = dlg.auto_open_files_cb.IsChecked()
                 app.user_config['read_messages_aloud'] = dlg.read_aloud_cb.IsChecked()
+                app.user_config['interrupt_speech'] = dlg.interrupt_speech_cb.IsChecked()
                 app.user_config['save_chat_history_default'] = dlg.global_chat_logging_cb.IsChecked()
                 app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
                 app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()

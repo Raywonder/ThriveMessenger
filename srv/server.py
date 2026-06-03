@@ -10,6 +10,8 @@ client_statuses = {}
 session_preferences = {}
 lock = threading.Lock()
 smtp_config = {}
+code_expires = 5 * 60
+code_expires_label = "5m"
 flexpbx_config = {}
 file_config = {}
 bot_runtime_config = {}
@@ -1069,10 +1071,26 @@ class EmailManager:
 
     @staticmethod
     def generate_code(length=6):
-        if length <= 6:
-            # Preserve a short user-facing code option while using CSPRNG.
-            return ''.join(secrets.choice('0123456789') for _ in range(length))
-        return secrets.token_hex(max(1, length // 2))
+        return secrets.token_hex(16)
+
+def _parse_duration(value, default_seconds=300):
+    text = str(value or "").strip().lower()
+    if not text:
+        return default_seconds
+    try:
+        if text.endswith("ms"):
+            return max(1, int(float(text[:-2]) / 1000))
+        if text.endswith("s"):
+            return max(1, int(float(text[:-1])))
+        if text.endswith("m"):
+            return max(1, int(float(text[:-1]) * 60))
+        if text.endswith("h"):
+            return max(1, int(float(text[:-1]) * 60 * 60))
+        if text.endswith("d"):
+            return max(1, int(float(text[:-1]) * 24 * 60 * 60))
+        return max(1, int(float(text)))
+    except Exception:
+        return default_seconds
 
 class FlexPBXManager:
     @staticmethod
@@ -1158,6 +1176,9 @@ def load_config():
         'email': config.get('smtp', 'email', fallback=''),
         'password': config.get('smtp', 'password', fallback='')
     }
+    global code_expires, code_expires_label
+    code_expires_label = config.get('smtp', 'code_expires', fallback='5m')
+    code_expires = _parse_duration(code_expires_label, 5 * 60)
     global flexpbx_config
     flexpbx_config = {
         'enabled': config.getboolean('flexpbx', 'enabled', fallback=False),
@@ -1252,8 +1273,10 @@ def init_db():
     existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)")]
     if 'email' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
     if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
+    if 'verification_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code_at REAL")
     if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
+    if 'reset_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code_at REAL")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
@@ -1444,11 +1467,12 @@ def handle_client(cs, addr):
             # Logic: If SMTP is on, set verified=0, gen code, send email. Else verified=1.
             verified = 1 if not smtp_config['enabled'] else 0
             code = EmailManager.generate_code() if not verified else None
+            code_at = time.time() if code else None
             
             if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, verification_code_at=?, is_verified=? WHERE username=?", (new_pass, email, code, code_at, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+                con.execute("INSERT INTO users(username, password, email, verification_code, verification_code_at, is_verified) VALUES(?,?,?,?,?,?)", (new_user, new_pass, email, code, code_at, verified))
             if invite_token:
                 con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
             con.commit()
@@ -1476,9 +1500,15 @@ def handle_client(cs, addr):
             u_ver = req.get("user")
             code_ver = req.get("code")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code, email FROM users WHERE username=?", (u_ver,)).fetchone()
+            row = con.execute("SELECT verification_code, email, verification_code_at FROM users WHERE username=?", (u_ver,)).fetchone()
             if row and row[0] == code_ver:
-                con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
+                issued_at = row[2] or 0
+                if issued_at and time.time() - float(issued_at) > code_expires:
+                    con.execute("UPDATE users SET verification_code=NULL, verification_code_at=NULL WHERE username=?", (u_ver,))
+                    con.commit(); con.close()
+                    sock.sendall(json.dumps({"status": "error", "reason": f"Verification code expired. Request a new code; codes expire after {code_expires_label}."}).encode() + b"\n")
+                    return
+                con.execute("UPDATE users SET is_verified=1, verification_code=NULL, verification_code_at=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
                 if row[1]:
                     EmailManager.send_email(
@@ -1502,7 +1532,7 @@ def handle_client(cs, addr):
                 t_user, t_email = row
                 if t_email:
                     code = EmailManager.generate_code()
-                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
+                    con.execute("UPDATE users SET reset_code=?, reset_code_at=? WHERE username=?", (code, time.time(), t_user))
                     con.commit()
                     EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
                     # Return OK even if email fails to prevent enumeration, mostly.
@@ -1521,9 +1551,15 @@ def handle_client(cs, addr):
             t_code = req.get("code")
             new_p = req.get("new_pass")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
+            row = con.execute("SELECT reset_code, reset_code_at FROM users WHERE username=?", (t_user,)).fetchone()
             if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                issued_at = row[1] or 0
+                if issued_at and time.time() - float(issued_at) > code_expires:
+                    con.execute("UPDATE users SET reset_code=NULL, reset_code_at=NULL WHERE username=?", (t_user,))
+                    con.commit(); con.close()
+                    sock.sendall(json.dumps({"status": "error", "reason": f"Reset code expired. Request a new code; codes expire after {code_expires_label}."}).encode() + b"\n")
+                    return
+                con.execute("UPDATE users SET password=?, reset_code=NULL, reset_code_at=NULL WHERE username=?", (new_p, t_user))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
