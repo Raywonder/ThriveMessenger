@@ -153,8 +153,7 @@ if sys.platform == 'win32':
 
 def load_server_config():
     # Now reading connection details from client.conf instead of srv.conf
-    config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
+    config = load_client_config()
     return {
         'host': config.get('server', 'host', fallback='msg.thecubed.cc'),
         'port': config.getint('server', 'port', fallback=2005),
@@ -162,8 +161,7 @@ def load_server_config():
     }
 
 def load_server_entries_from_client_conf():
-    config = configparser.ConfigParser(interpolation=None)
-    config.read('client.conf')
+    config = load_client_config()
     entries = []
     if config.has_section('server'):
         entries.append({
@@ -1011,8 +1009,7 @@ def parse_github_tag(tag):
     return (int(m.group(1)) - 2000, 0, int(m.group(2)), int(m.group(3)) if m.group(3) else 0)
 
 def _load_update_settings():
-    cfg = configparser.ConfigParser(interpolation=None)
-    cfg.read('client.conf')
+    cfg = load_client_config()
     update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
     preferred_repo = cfg.get('updates', 'preferred_repo', fallback='Raywonder/ThriveMessenger').strip()
     fallback_repos = [x.strip() for x in cfg.get('updates', 'fallback_repos', fallback='').split(',') if x.strip()]
@@ -1028,6 +1025,37 @@ def _load_update_settings():
 def get_program_dir():
     if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+def get_program_client_conf_path():
+    return os.path.join(get_program_dir(), 'client.conf')
+
+def get_user_client_conf_path():
+    return os.path.join(get_config_dir(), 'client.conf')
+
+def get_client_conf_read_paths():
+    paths = []
+    for candidate in (
+        get_program_client_conf_path(),
+        os.path.join(os.getcwd(), 'client.conf'),
+        get_user_client_conf_path(),
+    ):
+        if candidate not in paths and os.path.isfile(candidate):
+            paths.append(candidate)
+    return paths
+
+def get_client_conf_path():
+    user_config = get_user_client_conf_path()
+    if os.path.isfile(user_config):
+        return user_config
+    paths = get_client_conf_read_paths()
+    if paths:
+        return paths[0]
+    return user_config
+
+def load_client_config():
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(get_client_conf_read_paths())
+    return config
 
 def get_macos_app_bundle_path():
     if sys.platform != 'darwin':
@@ -1497,10 +1525,12 @@ class SettingsDialog(wx.Dialog):
         self.double_escape_chat_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Require double Escape to dismiss chat windows")
         self.double_escape_chat_cb.SetValue(bool(self.config.get('double_escape_to_close_chat', True)))
 
-        cfg = configparser.ConfigParser(interpolation=None)
-        self.client_conf_path = "client.conf"
-        cfg.read(self.client_conf_path)
-        self.admin_hint = wx.StaticText(admin_box.GetStaticBox(), label="Admin settings apply to client/server connection and updater sources.")
+        cfg = load_client_config()
+        self.client_conf_path = get_user_client_conf_path()
+        self.admin_hint = wx.StaticText(
+            admin_box.GetStaticBox(),
+            label=f"Advanced connection and update settings are saved to your user profile at {self.client_conf_path}."
+        )
         self.admin_hint.Wrap(500)
         host_row = wx.BoxSizer(wx.HORIZONTAL)
         host_row.Add(wx.StaticText(admin_box.GetStaticBox(), label="Server host:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -1780,7 +1810,7 @@ class SettingsDialog(wx.Dialog):
             wx.MessageBox(f"Could not open bot mesh guide: {e}", "Bot Mesh Agent", wx.OK | wx.ICON_ERROR, self)
     def apply_admin_config(self):
         cfg = configparser.ConfigParser(interpolation=None)
-        cfg.read(self.client_conf_path)
+        cfg.read(get_client_conf_read_paths())
         if not cfg.has_section('server'):
             cfg.add_section('server')
         if not cfg.has_section('updates'):
@@ -1796,6 +1826,7 @@ class SettingsDialog(wx.Dialog):
         cfg.set('updates', 'preferred_repo', self.admin_pref_repo_txt.GetValue().strip())
         cfg.set('updates', 'fallback_repos', self.admin_fallback_txt.GetValue().strip())
         try:
+            os.makedirs(os.path.dirname(self.client_conf_path), exist_ok=True)
             with open(self.client_conf_path, 'w', encoding='utf-8') as f:
                 cfg.write(f)
         except Exception as e:
@@ -4580,7 +4611,7 @@ class MainFrame(wx.Frame):
                     except Exception:
                         pass
                 if not ok_admin:
-                    wx.MessageBox(f"Settings saved, but admin config could not be written:\n{admin_err}", "Settings Saved With Warning", wx.OK | wx.ICON_WARNING)
+                    wx.MessageBox(f"Settings saved, but advanced client config could not be written:\n{admin_err}", "Settings Saved With Warning", wx.OK | wx.ICON_WARNING)
                 else:
                     wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
 
