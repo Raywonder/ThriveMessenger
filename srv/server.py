@@ -847,6 +847,22 @@ def _status_for_user(username):
     with lock:
         return client_statuses.get(username, "online" if username in clients else "offline")
 
+def _gateway_natural_reply(sender_user, bot_name, text):
+    lower = (text or "").strip().lower()
+    if not lower:
+        return None
+    tool_error_words = ("tool id", "not recognized", "invalid tool", "couldn't reach the model", "could not reach the model", "all models failed", "provider is in cooldown", "rate_limit")
+    if any(w in lower for w in tool_error_words):
+        return "I should not expose internal tool or model errors in chat. I will reread the recent messages, route the work through the OpenClaw/Codex gateway or a configured fallback when action is needed, and only report confirmed results."
+    reminder_words = ("remind me", "reminder", "remind us", "wake me", "tell me at")
+    if any(w in lower for w in reminder_words):
+        return "Got it. I should create the reminder through the approved scheduler or OpenClaw/Codex gateway, then confirm the exact time and subject. If the scheduler is unavailable, I should queue it instead of pretending to send a phone message."
+    note_markers = ("just saying", "fyi", "for your awareness", "so you know", "i already", "we already", "i just messaged", "rescheduled", "scheduled for")
+    action_words = ("send ", "message ", "call ", "email ", "delete", "unlink", "reset", "revoke", "change password")
+    if any(w in lower for w in note_markers) and not any(w in lower for w in action_words):
+        return "Noted. I will treat that as context, not as an instruction to message anyone or change anything."
+    return None
+
 def _default_bot_contacts():
     raw = str(bot_runtime_config.get('default_bot_contacts', 'Clawdia') or '')
     names = [name.strip() for name in raw.split(',') if name.strip()]
