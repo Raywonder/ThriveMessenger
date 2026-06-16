@@ -36,6 +36,7 @@ bot_service_map = {}
 bot_voice_map = {}
 bot_auth_map = {}
 bot_external_usernames = set()
+hidden_bot_usernames = set()
 allow_external_bot_contacts = True
 docs_cache = {}
 bot_rules_config = {}
@@ -361,6 +362,16 @@ def _is_registered_bot(username):
     if allow_external_bot_contacts and uname.lower().endswith("-bot"):
         return True
     return False
+
+def _is_hidden_bot(username):
+    uname = str(username or "").strip().lower()
+    return bool(uname and uname in hidden_bot_usernames)
+
+def _can_see_hidden_bot(viewer):
+    return _is_admin(viewer) or _is_registered_bot(viewer)
+
+def _should_hide_user_from_viewer(candidate, viewer):
+    return _is_hidden_bot(candidate) and not _can_see_hidden_bot(viewer)
 
 def _bot_auth_type(bot_name):
     name = str(bot_name or "").strip()
@@ -1334,6 +1345,9 @@ def load_config():
     global bot_external_usernames
     raw_external = config.get('bots', 'external_names', fallback='')
     bot_external_usernames = {name.strip() for name in raw_external.split(',') if name.strip()}
+    global hidden_bot_usernames
+    raw_hidden = config.get('bots', 'hidden_names', fallback='roomhelper')
+    hidden_bot_usernames = {name.strip().lower() for name in raw_hidden.split(',') if name.strip()}
     global allow_external_bot_contacts
     allow_external_bot_contacts = config.getboolean('bots', 'allow_external_bot_contacts', fallback=True)
     global bot_voice_map
@@ -2009,7 +2023,11 @@ def handle_client(cs, addr):
 
         admins = get_admins()
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
-        contacts = [{"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)} for c,b in rows]
+        contacts = [
+            {"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)}
+            for c,b in rows
+            if not _should_hide_user_from_viewer(c, user)
+        ]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
         _send_feature_caps(sock, user)
         db.close()
@@ -2210,6 +2228,10 @@ def handle_client(cs, addr):
                 contact_to_add = msg["to"]
                 if contact_to_add == user: 
                     reason = "You cannot add yourself as a contact."
+                    sock.sendall((json.dumps({"action": "add_contact_failed", "reason": reason}) + "\n").encode())
+                    continue
+                if _should_hide_user_from_viewer(contact_to_add, user):
+                    reason = "That contact is not available."
                     sock.sendall((json.dumps({"action": "add_contact_failed", "reason": reason}) + "\n").encode())
                     continue
                 con = sqlite3.connect(DB)
@@ -2638,6 +2660,8 @@ def handle_client(cs, addr):
                 if include_bots:
                     extra = set(bot_usernames) | set(bot_external_usernames)
                 for uname in sorted(known | extra):
+                    if _should_hide_user_from_viewer(uname, user):
+                        continue
                     is_bot = _is_registered_bot(uname)
                     bot_session = _bot_session_snapshot(uname) if is_bot else None
                     directory.append({

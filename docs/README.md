@@ -56,6 +56,34 @@ Clawdia should be able to help keep gateway, digest, cron, queue, model-provider
 
 Codex Desktop should not be required to stay open for normal Clawdia or gateway work. Clawdia should prefer server-side OpenClaw, Codex CLI, configured gateway workers, linked chat routes, and fallback models. It should only wake or launch Windows-side Codex when the task truly requires Windows-local access, such as building or updating a Windows app, inspecting a Windows-only install, or using a local Windows device capability that the server gateway cannot provide.
 
+## Thrive CLI And OpenClaw Channel
+
+Thrive Messenger is an approved OpenClaw communication channel when the owning server, account, and process have been verified live. The server-side CLI lives at `srv/scripts/thrive_cli.py` and can be installed or wrapped as `thrive-cli` for agents, CLI users, and background bot sessions.
+
+Useful first commands:
+
+- `python3 srv/scripts/thrive_cli.py --json doctor`
+- `python3 srv/scripts/thrive_cli.py --json users`
+- `python3 srv/scripts/thrive_cli.py --json ensure-bots Clawdia Sapphire Sophia`
+- `python3 srv/scripts/thrive_cli.py --json link-bot-contacts --users all --mutual --bot-mesh-contacts`
+- `THRIVE_PASSWORD=... python3 srv/scripts/thrive_cli.py --json register-bot-session --username Sapphire --auth-type codex --background --listen`
+- `THRIVE_PASSWORD=... python3 srv/scripts/thrive_cli.py --json send --username Clawdia --to tappedinfm "Status check started."`
+
+The CLI has two modes:
+
+- Local admin mode reads `srv.conf` and `thrive.db` from the server install path. Use it only on the owning Thrive server account or an approved maintenance copy.
+- Network mode signs in through the same JSON protocol as the desktop client. Bot sessions can register their runtime, host, transport, and capabilities so OpenClaw can discover active bot workers.
+
+Bot credentials created by the CLI must be written only to a private env file such as `~/.config/thrive-messenger/agent-bots.env` with restrictive permissions. Do not paste those values into chat, tickets, docs, or logs.
+
+For OpenClaw integration, wrap the CLI as a channel worker that can send direct messages, listen for inbound messages, register bot sessions, and forward approved work to Codex CLI, Ollama, OpenRouter/local model fallback, Claude Code, or other AI-router sessions. The gateway should use Thrive first as a communication transport; it should not require Codex Desktop to remain open unless a task needs Windows-local device access.
+
+Clawdia, Sapphire, Sophia, and future approved bots may message users when needed, may keep direct contacts for users they support, and may keep bot-to-bot direct contacts so they can coordinate tasks. Thrive does not currently rely on user-facing group chats for this coordination. If room or group features are added later, background room bots should remain hidden from normal user contact lists unless an admin intentionally exposes them.
+
+Hidden bots such as `roomhelper` are background helpers. Put them in `[bots] hidden_names` so ordinary users do not see them as normal contacts or directory entries. Other agents and admins may still use them for direct bot-to-bot coordination.
+
+They must still follow exact-target confirmation for provider, account, repo, webhook, mailbox, billing, and destructive work.
+
 ## WhatsApp And External Messaging
 
 WhatsApp relinking and outbound messages through Dominique's WhatsApp account are sensitive actions. Clawdia may help Dominique/Tappedinfm relink WhatsApp and may resume chats through WhatsApp after successful relinking, but destructive actions, unlinking, credential changes, provider changes, or sending messages through Dominique's WhatsApp require explicit confirmation from Dominique/Tappedinfm.
