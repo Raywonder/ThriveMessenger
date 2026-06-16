@@ -795,7 +795,8 @@ def _ensure_default_bot_contacts(username):
         con.close()
 
 def _known_clawdia_reply(sender_user, bot_name, text):
-    if str(bot_name or "").strip().lower() != "clawdia":
+    agent_names = {"clawdia", "sapphire", "saphire", "sophia", "sofia"}
+    if str(bot_name or "").strip().lower() not in agent_names:
         return None
     lower = (text or "").strip().lower()
     if not lower:
@@ -803,8 +804,8 @@ def _known_clawdia_reply(sender_user, bot_name, text):
     service_words = ("linked service", "linked services", "service status", "status of linked", "what services", "what is linked")
     if any(w in lower for w in service_words):
         return (
-            "Confirmed right now: Thrive Messenger is available here, Discord is connected for Clawdia/OpenClaw work, "
-            "and WhatsApp relinking is in progress but not fully authenticated yet. I do not have live proof that Twitch, "
+            "Known from the latest local server notes: Thrive Messenger is available here, Discord has been used for Clawdia/OpenClaw work, "
+            "and WhatsApp relinking was in progress but not fully authenticated yet. I should run a live gateway/provider check before calling any of those current. I do not have live proof that Twitch, "
             "YouTube, Facebook, or Twitter are linked for this chat, so I will not list them as active unless the gateway confirms them."
         )
     whatsapp_words = ("whatsapp", "wa ", "wa.", "wa,", "relink", "pairing code", "pair code")
@@ -830,6 +831,41 @@ def _known_clawdia_reply(sender_user, bot_name, text):
     if any(w in lower for w in fallback_words):
         return (
             "If Codex is limited or broken, I should self-repair where safe: check gateway health, Ollama health, OpenRouter or local fallback models, and Codex auth state; restart broken gateway/Ollama services when safe; and ask for reauthentication only when credentials or a user approval step is required."
+        )
+    desktop_words = ("close codex", "codex desktop", "codex app", "codex stay open", "windows codex", "launch codex")
+    if any(w in lower for w in desktop_words):
+        return (
+            "Codex Desktop should not have to stay open for normal Clawdia work. I should use the server-side OpenClaw gateway, Codex CLI, linked chat routes, and fallback models first, and only wake or launch Windows Codex when a task truly needs Windows-local building, updating, or device access."
+        )
+    update_words = ("upstream", "new version", "new versions", "update agents", "update bots", "agent update", "bot update", "upgrade agents")
+    if any(w in lower for w in update_words):
+        return (
+            "I can help check approved upstream versions for Clawdia, Sapphire, Sophia, and related gateway helpers through the right repo or package source. "
+            "Safe updates should be applied through the proper agent or gateway with backups, tests, affected-service restart only, and a rollback note; unknown or cross-account updates need confirmation first."
+        )
+    delegate_words = ("delegate", "delegation", "agents", "subagents", "dev related", "development task", "coding task", "build task", "release task")
+    if any(w in lower for w in delegate_words):
+        return (
+            "I can coordinate development and operations work by delegating to the available Codex/OpenClaw agents, then summarize what each agent changed, tested, pushed, or could not finish. "
+            "From normal chat I can prepare or route the work; actual delegation requires a connected backend worker or bot-mesh request. I should verify evidence before saying work is complete, and I should ask for confirmation before destructive or provider/account-impacting actions."
+        )
+    repo_words = ("gitea", "github", "git repo", "repos", "repository", "pull request", "issue", "branches", "remotes")
+    if any(w in lower for w in repo_words):
+        return (
+            "I can help manage repositories through the proper agent or gateway: check dirty trees, remotes, Gitea and GitHub sync, issues, pull requests, releases, mirrors, and visibility. "
+            "I will not claim a repo is clean, pushed, mirrored, or released until Git/Gitea/GitHub returns evidence; destructive Git or visibility changes need exact target confirmation, live repo/provider checks, nearby-target comparison, and rollback notes."
+        )
+    inbox_words = ("agent email", "agent inbox", "email inbox", "inboxes", "support inbox", "tickets", "ticket queue", "whmcs tickets")
+    if any(w in lower for w in inbox_words):
+        return (
+            "I can help inspect approved agent-owned inboxes, support queues, WHMCS tickets, and gateway report mail through the server-side agent path. "
+            "I should summarize safely, avoid secrets and private client data in chat, and require exact target confirmation, owning account checks, live routing checks, and rollback notes before sending mail or changing mailbox routing."
+        )
+    context_words = ("entire chat", "prior chat", "other chats", "this chat", "chat history", "remember from")
+    if any(w in lower for w in context_words):
+        return (
+            "I should use the current Thrive conversation plus approved memory, queue, digest, ticket, and agent-report context when available. "
+            "If broader history is needed, I should ask a context-aware agent to inspect it and return a concise evidence-backed summary."
         )
     big_task_words = ("codex", "openclaw", "gateway", "server side", "serverside", "run task", "fix server", "build", "deploy", "restart", "logs", "check server")
     if any(w in lower for w in big_task_words):
