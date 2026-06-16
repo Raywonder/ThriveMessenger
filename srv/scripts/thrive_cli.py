@@ -408,6 +408,7 @@ def cmd_register_bot_session(args: argparse.Namespace) -> None:
         response = recv_until_action(sock, ["bot_session_registered"], timeout=args.wait)
         emit({"status": "ok" if response.get("ok") else "error", "response": response}, args.json)
         if args.listen and response.get("ok"):
+            sock.settimeout(None)
             while True:
                 event = recv_json_line(sock)
                 if args.json:
