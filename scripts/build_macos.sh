@@ -34,6 +34,9 @@ pyinstaller \
   --add-data "assets/help:assets/help" \
   --add-data "assets/videos:assets/videos" \
   --add-data "sounds:sounds" \
+  --add-data "scripts/thrive_bot_mesh_agent.py:scripts" \
+  --add-data "scripts/BOT_MESH_AGENT.md:scripts" \
+  --add-data "README.md:." \
   main.py
 
 APP_PATH="dist/${APP_NAME}.app"

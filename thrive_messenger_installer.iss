@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.3"
+#define MyAppVersion "2026 Alpha 15.6"
 #define MyAppPublisher "G4p Studios"
 #define MyAppURL "https://github.com/Raywonder/ThriveMessenger"
 #define MyAppExeName "thrive_messenger.exe"
@@ -19,7 +19,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={pf}\Thrive\Thrive Messenger
+DefaultDirName={commonpf}\Thrive\Thrive Messenger
 DefaultGroupName=Thrive\Thrive Messenger
 AllowNoIcons=yes
 InfoAfterFile={#SourcePath}\README.md
