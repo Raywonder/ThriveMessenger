@@ -163,6 +163,9 @@ def recv_until_action(sock: socket.socket, wanted_actions: Iterable[str], timeou
 
 def login(args: argparse.Namespace, password: Optional[str] = None) -> socket.socket:
     pwd = password or args.password or os.environ.get("THRIVE_PASSWORD")
+    if not pwd and getattr(args, "username", ""):
+        env_values = read_agent_env(args.agent_env)
+        pwd = env_values.get(env_key_for_bot(args.username))
     if not pwd and not args.no_prompt:
         pwd = getpass.getpass(f"Password for {args.username}: ")
     if not pwd:
