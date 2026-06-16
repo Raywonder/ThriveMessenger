@@ -813,6 +813,24 @@ def _known_clawdia_reply(sender_user, bot_name, text):
             "I can help with the WhatsApp relink from Thrive. Because this affects Dominique's WhatsApp account, I will only act "
             "on Dominique/Tappedinfm's confirmed request. Current state: pairing was attempted, but the gateway has not confirmed a completed login yet."
         )
+    tt_words = ("tt ", " tt", "teamtalk", "team talk")
+    if any(w in lower for w in tt_words):
+        return (
+            "I understand `tt` as the server-side TeamTalk utility and the TeamTalk servers it manages. "
+            "For a real status check I should use the server-side OpenClaw/Codex path, inspect the configured TeamTalk instances, utility output, service health, and recent logs, then summarize what was healthy, degraded, or blocked. "
+            "I will not claim it was checked until that backend task returns."
+        )
+    digest_words = ("digest", "daily report", "fleet", "queue", "status report")
+    if any(w in lower for w in digest_words):
+        return (
+            "I can route digest and fleet-status work to the OpenClaw/Codex gateway path, then report back with concise evidence. "
+            "Those reports should separate transport health, listener health, CLI health, and provider/model health instead of blending them together."
+        )
+    fallback_words = ("fallback model", "ollama", "openrouter", "codex broken", "codex limit", "rate limit", "reauth", "re-auth")
+    if any(w in lower for w in fallback_words):
+        return (
+            "If Codex is limited or broken, I should self-repair where safe: check gateway health, Ollama health, OpenRouter or local fallback models, and Codex auth state; restart broken gateway/Ollama services when safe; and ask for reauthentication only when credentials or a user approval step is required."
+        )
     big_task_words = ("codex", "openclaw", "gateway", "server side", "serverside", "run task", "fix server", "build", "deploy", "restart", "logs", "check server")
     if any(w in lower for w in big_task_words):
         return (
