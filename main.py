@@ -24,6 +24,7 @@ DEFAULT_UPDATE_FEED_URL = "https://im.tappedin.fm/updates/latest.json"
 DEFAULT_SERVER_HOST = "im.tappedin.fm"
 DEFAULT_SERVER_NAME = "TappedIn.fm"
 DEFAULT_SERVER_PORT = 2005
+DEFAULT_MAX_DIRECT_MESSAGE_LENGTH = 20000
 DEMO_VIDEOS = {
     "onboarding": {
         "filename": "promo-onboarding.mp4",
@@ -4294,6 +4295,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{self.format_user_label(user)} has gone offline.")
 
     def __init__(self, user, sock):
+        self.max_direct_message_length = DEFAULT_MAX_DIRECT_MESSAGE_LENGTH
         super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')

@@ -24,6 +24,8 @@ bot_runtime_config = {}
 wordpress_config = {}
 shutdown_timeout = 5
 max_status_length = 50
+max_direct_message_length = 20000
+max_bot_reply_length = 4000
 pending_transfers = {}
 transfer_lock = threading.Lock()
 server_port = 0
@@ -91,6 +93,26 @@ GROUP_POLICY_SCHEMA = {
     "group_retention_days": ("int", 0, "Message retention days (0 keeps indefinitely)."),
     "group_require_verified_users": ("bool", False, "Require verified accounts for group participation."),
 }
+
+def _limit_text(value, max_chars):
+    text = str(value or "")
+    try:
+        max_chars = int(max_chars)
+    except Exception:
+        max_chars = 0
+    if max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+def _message_too_long(text, max_chars):
+    try:
+        max_chars = int(max_chars)
+    except Exception:
+        return False
+    return max_chars > 0 and len(str(text or "")) > max_chars
+
+def _send_json_line(sock, payload):
+    sock.sendall((json.dumps(payload) + "\n").encode())
 
 def _group_policy_defaults():
     return {k: GROUP_POLICY_SCHEMA[k][1] for k in GROUP_POLICY_SCHEMA}
@@ -1061,7 +1083,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         content = str(content or "").strip()
         if not content:
             return None
-        return content[:700]
+        return _limit_text(content, max_bot_reply_length)
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
         _append_agent_task("model_repair_needed", {
@@ -1382,6 +1404,9 @@ def load_config():
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
     global max_status_length
     max_status_length = config.getint('server', 'max_status_length', fallback=50)
+    global max_direct_message_length, max_bot_reply_length
+    max_direct_message_length = max(1000, config.getint('server', 'max_direct_message_length', fallback=20000))
+    max_bot_reply_length = max(500, config.getint('bots', 'max_reply_length', fallback=4000))
     global server_identity
     server_identity = config.get('server', 'name', fallback=config.get('server', 'host', fallback='Server'))
     global welcome_config
@@ -2091,6 +2116,11 @@ def handle_client(cs, addr):
             if not _should_hide_user_from_viewer(c, user)
         ]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
+        _send_json_line(sock, {
+            "action": "server_limits",
+            "max_direct_message_length": max_direct_message_length,
+            "max_status_length": max_status_length,
+        })
         _send_feature_caps(sock, user)
         db.close()
 
@@ -3267,6 +3297,16 @@ def handle_client(cs, addr):
 
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
+                message_text = str(msg.get("msg", "") or "")
+                if _message_too_long(message_text, max_direct_message_length):
+                    _send_json_line(sock, {
+                        "action": "msg_failed",
+                        "to": to,
+                        "reason": f"Message is too long. This server allows up to {max_direct_message_length} characters per direct message.",
+                        "max_length": max_direct_message_length,
+                    })
+                    continue
+                msg["msg"] = message_text
                 if _is_registered_bot(to) and not _can_user_use_feature(user, "bots"):
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Bot messaging is disabled for your account."}).encode() + b"\n")
                     continue

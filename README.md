@@ -158,6 +158,10 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Alt P will check for updates to the program and allow you to auto download them.
 * Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
 
+### Message length
+
+Server owners can configure direct message length with `max_direct_message_length` in `srv/srv.conf`. The default is 20,000 characters. If a message is too long, the sender receives a clear delivery error instead of a silent failure. Bot replies can be capped with `max_reply_length` under `[bots]`; the default is 4,000 characters so agent replies have room to be useful without flooding clients.
+
 ### Sending and receiving messages
 
 You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
