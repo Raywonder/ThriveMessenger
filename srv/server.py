@@ -794,11 +794,40 @@ def _ensure_default_bot_contacts(username):
     finally:
         con.close()
 
+def _known_clawdia_reply(sender_user, bot_name, text):
+    if str(bot_name or "").strip().lower() != "clawdia":
+        return None
+    lower = (text or "").strip().lower()
+    if not lower:
+        return None
+    service_words = ("linked service", "linked services", "service status", "status of linked", "what services", "what is linked")
+    if any(w in lower for w in service_words):
+        return (
+            "Confirmed right now: Thrive Messenger is available here, Discord is connected for Clawdia/OpenClaw work, "
+            "and WhatsApp relinking is in progress but not fully authenticated yet. I do not have live proof that Twitch, "
+            "YouTube, Facebook, or Twitter are linked for this chat, so I will not list them as active unless the gateway confirms them."
+        )
+    whatsapp_words = ("whatsapp", "wa ", "wa.", "wa,", "relink", "pairing code", "pair code")
+    if "whatsapp" in lower or any(w in lower for w in whatsapp_words):
+        return (
+            "I can help with the WhatsApp relink from Thrive. Because this affects Dominique's WhatsApp account, I will only act "
+            "on Dominique/Tappedinfm's confirmed request. Current state: pairing was attempted, but the gateway has not confirmed a completed login yet."
+        )
+    big_task_words = ("codex", "openclaw", "gateway", "server side", "serverside", "run task", "fix server", "build", "deploy", "restart", "logs", "check server")
+    if any(w in lower for w in big_task_words):
+        return (
+            "For bigger work, I can hand the task to the server-side OpenClaw/Codex path and report back here. "
+            "I will ask for confirmation before destructive actions, provider/account changes, unlinking services, or sending outbound messages through WhatsApp."
+        )
+    return None
+
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     if not _is_virtual_bot(to_user):
         return False
     _record_bot_memory(sender_user, to_user, "user", text)
-    reply = _ollama_bot_reply(sender_user, to_user, text)
+    reply = _known_clawdia_reply(sender_user, to_user, text)
+    if not reply:
+        reply = _ollama_bot_reply(sender_user, to_user, text)
     if not reply:
         lower = (text or "").strip().lower()
         if not lower:
