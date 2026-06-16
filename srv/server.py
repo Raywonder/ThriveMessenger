@@ -56,7 +56,7 @@ FEATURE_DEFAULTS = {
     "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
     "bot_moderation": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot-powered moderation watch, spam scoring, and guest activity feeds."},
     "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
-    "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group chat create/join/send features."},
+    "group_chat": {"enabled": False, "ui_visible": False, "scope": "admin", "description": "Reserved for future group chat create/join/send features."},
     "group_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group call session and signaling features."},
     "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
     "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Server side admin command console."},
@@ -216,6 +216,18 @@ def _seed_feature_defaults():
                 datetime.datetime.utcnow().isoformat(),
             ),
         )
+    con.commit()
+    # Do not advertise group chat until create/join/send message handlers exist.
+    con.execute(
+        """
+        UPDATE feature_policies
+        SET enabled=0, ui_visible=0, scope='admin',
+            description='Reserved for future group chat create/join/send features.',
+            updated_by='system', updated_at=?
+        WHERE feature_key='group_chat'
+        """,
+        (datetime.datetime.utcnow().isoformat(),),
+    )
     con.commit()
     con.close()
 
@@ -421,15 +433,44 @@ def _bot_session_snapshot(username):
             "moderation": dict(data.get("moderation", {}) or {}),
         }
 
-def _active_bot_sessions():
+def _active_bot_sessions(viewer=None):
     sessions = []
     with bot_session_lock:
         names = sorted(bot_session_registry.keys(), key=lambda x: x.lower())
     for name in names:
+        if viewer is not None and _should_hide_user_from_viewer(name, viewer):
+            continue
         snap = _bot_session_snapshot(name)
         if snap:
             sessions.append(snap)
     return sessions
+
+def _agent_task_queue_path():
+    configured = str(bot_runtime_config.get("agent_task_queue", "") or "").strip()
+    if configured:
+        return os.path.expanduser(configured)
+    return os.path.expanduser("~/.openclaw/thrive-agent-tasks.jsonl")
+
+def _append_agent_task(task_type, payload):
+    try:
+        path = _agent_task_queue_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        safe_payload = payload if isinstance(payload, dict) else {}
+        record = {
+            "id": str(uuid.uuid4()),
+            "type": str(task_type or "task"),
+            "status": "queued",
+            "source": "thrive-messenger",
+            "server": server_identity,
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "payload": safe_payload,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return record
+    except Exception as e:
+        print(f"Failed to append agent task: {e}")
+        return None
 
 def _cleanup_bot_session(username):
     uname = str(username or "").strip()
@@ -908,7 +949,17 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         elif "admin" in lower:
             reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
         else:
-            reply = "I couldn't reach the model right now. Ask again in a moment."
+            _append_agent_task("model_followup_needed", {
+                "user": sender_user,
+                "bot": to_user,
+                "reason": "No model reply or known intent matched. Re-read recent messages, repair model/gateway if needed, and continue the chat.",
+                "latest_user_message": _moderation_excerpt(text, 500),
+                "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
+            })
+            reply = (
+                "I have the latest message and I am keeping the task queued for the backend agent path. "
+                "I will continue from the recent chat context when the worker is ready."
+            )
     tts_payload = _build_bot_tts_payload(to_user, reply, text)
     payload = {
         "action": "msg",
@@ -1013,6 +1064,16 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         return content[:700]
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
+        _append_agent_task("model_repair_needed", {
+            "user": sender_user,
+            "bot": bot_name,
+            "model": model,
+            "provider": "ollama",
+            "error": _moderation_excerpt(str(e), 500),
+            "latest_user_message": _moderation_excerpt(text, 500),
+            "recent_context": _bot_memory_context(sender_user, bot_name, limit=6),
+            "requested_action": "Check Ollama/OpenClaw/Codex fallback health, re-read recent messages, and continue the user conversation without exposing a model failure alert.",
+        })
         return None
 
 def _build_bot_tts_payload(bot_name, reply_text, request_text):
@@ -1382,6 +1443,7 @@ def load_config():
         'piper_timeout': config.getint('bots', 'piper_timeout', fallback=12),
         'bot_mesh_temp_root': config.get('bots', 'bot_mesh_temp_root', fallback=os.path.join(tempfile.gettempdir(), 'thrive_bot_mesh')),
         'bot_mesh_max_file_size': config.getint('bots', 'bot_mesh_max_file_size', fallback=10485760),
+        'agent_task_queue': config.get('bots', 'agent_task_queue', fallback=os.path.expanduser('~/.openclaw/thrive-agent-tasks.jsonl')),
         'moderation_watch_direct_messages': config.getboolean('bots', 'moderation_watch_direct_messages', fallback=True),
         'moderation_watch_file_offers': config.getboolean('bots', 'moderation_watch_file_offers', fallback=True),
         'moderation_watch_guest_logins': config.getboolean('bots', 'moderation_watch_guest_logins', fallback=True),
@@ -2751,7 +2813,7 @@ def handle_client(cs, addr):
                     _deny_feature("bot_mesh", "bot_mesh_directory")
                     continue
                 try:
-                    sock.sendall((json.dumps({"action": "bot_mesh_directory", "ok": True, "sessions": _active_bot_sessions()}) + "\n").encode())
+                    sock.sendall((json.dumps({"action": "bot_mesh_directory", "ok": True, "sessions": _active_bot_sessions(user)}) + "\n").encode())
                 except Exception:
                     pass
 
@@ -2763,6 +2825,12 @@ def handle_client(cs, addr):
                 if not target:
                     try:
                         sock.sendall((json.dumps({"action": action, "ok": False, "reason": "Target bot is required."}) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if _should_hide_user_from_viewer(target, user):
+                    try:
+                        sock.sendall((json.dumps({"action": action, "ok": False, "reason": "Target bot is not available."}) + "\n").encode())
                     except Exception:
                         pass
                     continue

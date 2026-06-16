@@ -56,6 +56,10 @@ Clawdia should be able to help keep gateway, digest, cron, queue, model-provider
 
 Codex Desktop should not be required to stay open for normal Clawdia or gateway work. Clawdia should prefer server-side OpenClaw, Codex CLI, configured gateway workers, linked chat routes, and fallback models. It should only wake or launch Windows-side Codex when the task truly requires Windows-local access, such as building or updating a Windows app, inspecting a Windows-only install, or using a local Windows device capability that the server gateway cannot provide.
 
+When a model provider cannot be reached, bots should not send raw failure alerts such as "I couldn't reach the model right now." The server should queue a background task for Codex/OpenClaw, include recent non-secret chat context, let agents repair the provider or fallback route silently where safe, then continue the chat from the latest messages. If a synchronous reply is unavoidable, it should be a calm continuity message that the task is queued and will continue, not an error dump.
+
+Agents should re-read the last few relevant messages before replying after a model, gateway, or worker failure. They should wait for active backend tasks to finish when practical and should not ask users to repeat themselves unless the needed context is actually unavailable.
+
 ## Thrive CLI And OpenClaw Channel
 
 Thrive Messenger is an approved OpenClaw communication channel when the owning server, account, and process have been verified live. The server-side CLI lives at `srv/scripts/thrive_cli.py` and can be installed or wrapped as `thrive-cli` for agents, CLI users, and background bot sessions.
@@ -75,6 +79,8 @@ The CLI has two modes:
 - Network mode signs in through the same JSON protocol as the desktop client. Bot sessions can register their runtime, host, transport, and capabilities so OpenClaw can discover active bot workers.
 
 Bot credentials created by the CLI must be written only to a private env file such as `~/.config/thrive-messenger/agent-bots.env` with restrictive permissions. Do not paste those values into chat, tickets, docs, or logs.
+
+Background repair and follow-up work is queued as JSONL at `[bots] agent_task_queue`, normally `~/.openclaw/thrive-agent-tasks.jsonl` under the Thrive service account. OpenClaw or Codex workers should monitor that queue, mark tasks when claimed/completed in their own task system, and include evidence before reporting a fix.
 
 For OpenClaw integration, wrap the CLI as a channel worker that can send direct messages, listen for inbound messages, register bot sessions, and forward approved work to Codex CLI, Ollama, OpenRouter/local model fallback, Claude Code, or other AI-router sessions. The gateway should use Thrive first as a communication transport; it should not require Codex Desktop to remain open unless a task needs Windows-local device access.
 
