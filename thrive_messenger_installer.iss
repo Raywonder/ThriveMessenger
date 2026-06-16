@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.5"
+#define MyAppVersion "2026 Alpha 15.6"
 #define MyAppPublisher "G4p Studios"
 #define MyAppURL "https://im.tappedin.fm"
 #define MyAppExeName "thrive_messenger.exe"
@@ -19,7 +19,7 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={commonpf32}\Thrive\Thrive Messenger
+DefaultDirName={commonpf}\Thrive\Thrive Messenger
 PrivilegesRequired=admin
 UsePreviousAppDir=no
 DefaultGroupName=Thrive\Thrive Messenger
@@ -48,6 +48,7 @@ Source: "assets\videos\*"; DestDir: "{app}\assets\videos"; Flags: ignoreversion 
 
 [InstallDelete]
 Type: files; Name: "{app}\client.conf"
+Type: filesandordirs; Name: "{commonpf32}\Thrive\Thrive Messenger"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"

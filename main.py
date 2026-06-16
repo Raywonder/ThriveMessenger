@@ -9,7 +9,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.5"
+VERSION_TAG = "v2026-alpha15.6"
 _nvda_controller = None
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
