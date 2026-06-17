@@ -1,4 +1,4 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
@@ -14,6 +14,8 @@ file_config = {}
 bot_runtime_config = {}
 shutdown_timeout = 5
 max_status_length = 50
+max_direct_message_length = 20000
+max_bot_reply_length = 4000
 pending_transfers = {}
 transfer_lock = threading.Lock()
 server_port = 0
@@ -71,6 +73,26 @@ GROUP_POLICY_SCHEMA = {
     "group_retention_days": ("int", 0, "Message retention days (0 keeps indefinitely)."),
     "group_require_verified_users": ("bool", False, "Require verified accounts for group participation."),
 }
+
+def _limit_text(value, max_chars):
+    text = str(value or "")
+    try:
+        max_chars = int(max_chars)
+    except Exception:
+        max_chars = 0
+    if max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+def _message_too_long(text, max_chars):
+    try:
+        max_chars = int(max_chars)
+    except Exception:
+        return False
+    return max_chars > 0 and len(str(text or "")) > max_chars
+
+def _send_json_line(sock, payload):
+    sock.sendall((json.dumps(payload) + "\n").encode())
 
 def _group_policy_defaults():
     return {k: GROUP_POLICY_SCHEMA[k][1] for k in GROUP_POLICY_SCHEMA}
@@ -564,10 +586,98 @@ def _status_for_user(username):
     with lock:
         return client_statuses.get(username, "online" if username in clients else "offline")
 
+def _gateway_natural_reply(sender_user, bot_name, text):
+    lower = (text or "").strip().lower()
+    if not lower:
+        return None
+    tool_error_words = ("tool id", "not recognized", "invalid tool", "couldn't reach the model", "could not reach the model", "all models failed", "provider is in cooldown", "rate_limit")
+    if any(w in lower for w in tool_error_words):
+        return "I should not expose internal tool or model errors in chat. I will reread the recent messages, route the work through the OpenClaw/Codex gateway or a configured fallback when action is needed, and only report confirmed results."
+    reminder_words = ("remind me", "reminder", "remind us", "wake me", "tell me at")
+    if any(w in lower for w in reminder_words):
+        return "Got it. I should create the reminder through the approved scheduler or OpenClaw/Codex gateway, then confirm the exact time and subject. If the scheduler is unavailable, I should queue it instead of pretending to send a phone message."
+    note_markers = ("just saying", "fyi", "for your awareness", "so you know", "i already", "we already", "i just messaged", "rescheduled", "scheduled for")
+    action_words = ("send ", "message ", "call ", "email ", "delete", "unlink", "reset", "revoke", "change password")
+    if any(w in lower for w in note_markers) and not any(w in lower for w in action_words):
+        return "Noted. I will treat that as context, not as an instruction to message anyone or change anything."
+    return None
+
+def _safe_bot_reply_text(text):
+    reply = str(text or "").strip()
+    if not reply:
+        return None
+    lower = reply.lower()
+    blocked_fragments = (
+        '"type":"function"',
+        '"type": "function"',
+        '"name":"tool_call"',
+        '"name": "tool_call"',
+        '"name":"tool_describe"',
+        '"name": "tool_describe"',
+        '"parameters":{"id"',
+        '"parameters": {"id"',
+        "i could not get a live model reply quickly",
+        "i couldn't reach the model right now",
+        "i could not reach the model right now",
+        "provider is in cooldown",
+        "all models failed",
+        "tool id",
+        "not recognized",
+    )
+    if any(fragment in lower for fragment in blocked_fragments):
+        return None
+    # Some model/tool bridges emit one JSON object per line. Do not expose those
+    # envelopes to users even when they are not perfectly formatted.
+    stripped = reply.lstrip()
+    if stripped.startswith("{") and ("tool_" in lower or '"function"' in lower or '"parameters"' in lower):
+        return None
+    return reply
+
+def _queue_gateway_chat_context(sender_user, bot_name, text):
+    queue_path = str(bot_runtime_config.get('agent_task_queue', '') or '').strip()
+    if not queue_path:
+        return False
+    user_text = str(text or "").strip()
+    if not user_text:
+        return False
+    try:
+        queue_path = os.path.expanduser(queue_path)
+        queue_dir = os.path.dirname(queue_path)
+        if queue_dir:
+            os.makedirs(queue_dir, mode=0o700, exist_ok=True)
+        record = {
+            "id": str(uuid.uuid4()),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "source": "thrive",
+            "kind": "bot_direct_chat",
+            "status": "queued",
+            "sender": sender_user,
+            "bot": bot_name,
+            "message": user_text,
+            "reply_policy": "plain_text_only",
+            "privacy": "keep chat context within addressed participants; do not expose internal routing",
+            "preferred_worker": "openclaw-codex",
+        }
+        with open(queue_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            os.chmod(queue_path, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"Gateway task queue write failed for {bot_name}: {e}")
+        return False
+
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     if not _is_virtual_bot(to_user):
         return False
-    reply = _ollama_bot_reply(sender_user, to_user, text)
+    _queue_gateway_chat_context(sender_user, to_user, text)
+    reply = _gateway_natural_reply(sender_user, to_user, text)
+    reply = _safe_bot_reply_text(reply)
+    if reply is None:
+        reply = _ollama_bot_reply(sender_user, to_user, text)
+        reply = _safe_bot_reply_text(reply)
     if not reply:
         lower = (text or "").strip().lower()
         if not lower:
@@ -583,7 +693,7 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         elif "admin" in lower:
             reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
         else:
-            reply = "I couldn't reach the model right now. Ask again in a moment."
+            reply = "I am here and keeping the recent conversation in mind. Tell me the next thing you want handled, or mention a server, app, or person and I will stay with that context."
     tts_payload = _build_bot_tts_payload(to_user, reply, text)
     payload = {
         "action": "msg",
@@ -626,6 +736,12 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             "For status-style questions like 'who is online', provide the direct answer immediately. "
             "Avoid repeating the user's message. If a feature is unsupported, say that clearly and suggest alternatives."
         )
+    system_prompt += (
+        " Observe available chat context quietly to preserve continuity, but do not reply to notes, private context, "
+        "or conversations unless directly addressed or asked to act. Keep private or hidden-chat context within the "
+        "participants of that chat and never share it with unrelated users. When Codex/OpenClaw or another worker is "
+        "used internally, keep that routing silent and answer as the configured bot in normal conversation."
+    )
     if purpose:
         system_prompt += f" Your role on this server: {purpose}."
     if service_scope:
@@ -648,16 +764,22 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             " Follow the bot ruleset provided below. If a user asks what rules you follow, summarize these rules."
         )
 
-    payload = {
-        "model": model,
-        "stream": False,
-        "messages": [
+    def build_payload(extra_instruction=""):
+        messages = [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
             {"role": "system", "content": f"Agent rules context:\n{rules_context[:5000]}" if rules_context else "Agent rules context unavailable."},
-            {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
         ]
-    }
+        if extra_instruction:
+            messages.append({"role": "system", "content": extra_instruction})
+        messages.append({"role": "user", "content": f"User '{sender_user}' says: {user_text}"})
+        return {
+            "model": model,
+            "stream": False,
+            "messages": messages,
+        }
+
+    payload = build_payload()
     req = urllib.request.Request(
         f"{base_url}/api/chat",
         data=json.dumps(payload).encode('utf-8'),
@@ -673,7 +795,31 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         content = str(content or "").strip()
         if not content:
             return None
-        return content[:700]
+        safe_content = _safe_bot_reply_text(content)
+        if safe_content:
+            return _limit_text(safe_content, max_bot_reply_length)
+
+        retry_payload = build_payload(
+            "Your previous answer was an internal tool/function envelope. "
+            "Do not use tools, JSON, markdown code fences, tool names, or function calls. "
+            "Answer as the bot in normal plain English, directly and briefly. "
+            "If action is needed, say what you can confirm now and what will be queued."
+        )
+        retry_req = urllib.request.Request(
+            f"{base_url}/api/chat",
+            data=json.dumps(retry_payload).encode('utf-8'),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(retry_req, timeout=timeout) as retry_resp:
+            retry_raw = retry_resp.read().decode('utf-8', errors='replace')
+        retry_data = json.loads(retry_raw)
+        retry_message = retry_data.get("message", {}) if isinstance(retry_data, dict) else {}
+        retry_content = retry_message.get("content", "") if isinstance(retry_message, dict) else ""
+        retry_content = _safe_bot_reply_text(str(retry_content or "").strip())
+        if not retry_content:
+            return None
+        return _limit_text(retry_content, max_bot_reply_length)
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
         return None
@@ -786,6 +932,67 @@ def _revoke_bot_token(owner, bot_name):
     con.execute("DELETE FROM bot_tokens WHERE owner=? AND bot=?", (owner, bot_name))
     con.commit()
     con.close()
+
+def _create_invite_token(invited_user, invited_email, invited_by, expires_hours=168):
+    token = secrets.token_urlsafe(24)
+    now = datetime.datetime.utcnow()
+    expires_at = (now + datetime.timedelta(hours=max(1, int(expires_hours)))).isoformat()
+    con = sqlite3.connect(DB)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO invite_tokens(token, invited_user, invited_email, invited_by, created_at, expires_at, used)
+        VALUES(?,?,?,?,?,?,0)
+        """,
+        (
+            token,
+            str(invited_user or "").strip(),
+            str(invited_email or "").strip(),
+            str(invited_by or "").strip(),
+            now.isoformat(),
+            expires_at,
+        ),
+    )
+    con.commit()
+    con.close()
+    return token
+
+def _is_invite_expired(expires_at):
+    try:
+        expires = datetime.datetime.fromisoformat(str(expires_at or "").strip())
+    except Exception:
+        return True
+    return datetime.datetime.utcnow() > expires
+
+def _hash_passkey_secret(raw_secret):
+    return hashlib.sha256(str(raw_secret or "").encode("utf-8")).hexdigest()
+
+def _get_server_setting(key, default_value=None):
+    try:
+        con = sqlite3.connect(DB)
+        row = con.execute("SELECT value FROM server_settings WHERE key=?", (str(key),)).fetchone()
+        con.close()
+        if row and len(row) > 0:
+            return row[0]
+    except Exception:
+        pass
+    return default_value
+
+def _set_server_setting(key, value):
+    con = sqlite3.connect(DB)
+    con.execute(
+        "INSERT OR REPLACE INTO server_settings(key, value) VALUES(?, ?)",
+        (str(key), str(value)),
+    )
+    con.commit()
+    con.close()
+
+def _max_accounts_per_email():
+    raw = _get_server_setting("max_accounts_per_email", "0")
+    try:
+        limit = int(str(raw))
+        return max(0, limit)
+    except Exception:
+        return 0
 
 class EmailManager:
     @staticmethod
@@ -914,6 +1121,9 @@ def load_config():
     shutdown_timeout = config.getint('server', 'shutdown_timeout', fallback=5)
     global max_status_length
     max_status_length = config.getint('server', 'max_status_length', fallback=50)
+    global max_direct_message_length, max_bot_reply_length
+    max_direct_message_length = max(1000, config.getint('server', 'max_direct_message_length', fallback=20000))
+    max_bot_reply_length = max(500, config.getint('bots', 'max_reply_length', fallback=4000))
     global server_identity
     server_identity = config.get('server', 'name', fallback=config.get('server', 'host', fallback='Server'))
     global welcome_config
@@ -953,6 +1163,7 @@ def load_config():
         'ollama_model': config.get('bots', 'ollama_model', fallback='llama3.2'),
         'ollama_timeout': config.getint('bots', 'ollama_timeout', fallback=20),
         'ollama_system_prompt': config.get('bots', 'ollama_system_prompt', fallback=''),
+        'agent_task_queue': config.get('bots', 'agent_task_queue', fallback='~/.openclaw/thrive-agent-tasks.jsonl'),
         'piper_enabled': config.getboolean('bots', 'piper_enabled', fallback=False),
         'piper_bin': config.get('bots', 'piper_bin', fallback='/usr/local/bin/piper'),
         'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
@@ -980,6 +1191,9 @@ def init_db():
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS feature_policies (feature_key TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, ui_visible INTEGER DEFAULT 1, scope TEXT DEFAULT 'all', description TEXT, updated_by TEXT, updated_at TEXT)''')
@@ -992,6 +1206,8 @@ def init_db():
     if 'file_type' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN file_type TEXT")
     if 'until_date' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN until_date TEXT")
     if 'reason' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN reason TEXT")
+    conn.commit()
+    cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('max_accounts_per_email', '0')")
     conn.commit()
     _seed_feature_defaults()
     conn.close()
@@ -1042,18 +1258,117 @@ def handle_client(cs, addr):
                 "post_login": welcome_config.get('post_login', '') if welcome_config.get('enabled', False) else '',
             }) + "\n").encode())
             return
+
+        # --- Validate Invite Token (pre-login) ---
+        if action == "validate_invite":
+            invite_token = str(req.get("invite_token", "") or "").strip()
+            if not invite_token:
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Missing invite token.",
+                }) + "\n").encode())
+                return
+            con = sqlite3.connect(DB)
+            row = con.execute(
+                "SELECT invited_user, invited_email, invited_by, expires_at, used FROM invite_tokens WHERE token=?",
+                (invite_token,),
+            ).fetchone()
+            con.close()
+            if not row:
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Invite token is invalid.",
+                }) + "\n").encode())
+                return
+            invited_user, invited_email, invited_by, expires_at, used = row
+            if int(used or 0) != 0:
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Invite token has already been used.",
+                }) + "\n").encode())
+                return
+            if _is_invite_expired(expires_at):
+                sock.sendall((json.dumps({
+                    "action": "invite_validation",
+                    "status": "error",
+                    "reason": "Invite token has expired.",
+                }) + "\n").encode())
+                return
+            sock.sendall((json.dumps({
+                "action": "invite_validation",
+                "status": "ok",
+                "invite_user": str(invited_user or "").strip(),
+                "invite_email": str(invited_email or "").strip(),
+                "invited_by": str(invited_by or "").strip(),
+                "expires_at": str(expires_at or "").strip(),
+            }) + "\n").encode())
+            return
         
         # --- Create Account ---
         if action == "create_account":
             new_user = req.get("user")
             new_pass = req.get("pass")
             email = req.get("email", "")
+            invite_token = str(req.get("invite_token", "") or "").strip()
             if not new_user or not new_pass: 
                 sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Missing fields."}) + "\n").encode())
                 return
             
             con = sqlite3.connect(DB)
+            invite_row = None
+            if invite_token:
+                invite_row = con.execute(
+                    "SELECT invited_user, invited_email, expires_at, used FROM invite_tokens WHERE token=?",
+                    (invite_token,),
+                ).fetchone()
+                if not invite_row:
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token is invalid."}) + "\n").encode())
+                    return
+                invited_user, invited_email, expires_at, used = invite_row
+                if int(used or 0) != 0:
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token has already been used."}) + "\n").encode())
+                    return
+                if _is_invite_expired(expires_at):
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token has expired."}) + "\n").encode())
+                    return
+                invited_user = str(invited_user or "").strip()
+                invited_email = str(invited_email or "").strip()
+                if invited_user and str(new_user).strip().lower() != invited_user.lower():
+                    con.close()
+                    sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token does not match this username."}) + "\n").encode())
+                    return
+                if invited_email:
+                    if str(email or "").strip():
+                        if str(email).strip().lower() != invited_email.lower():
+                            con.close()
+                            sock.sendall((json.dumps({"action": "create_account_failed", "reason": "Invite token does not match this email."}) + "\n").encode())
+                            return
+                    else:
+                        email = invited_email
+
             row = con.execute("SELECT is_verified FROM users WHERE username=?", (new_user,)).fetchone()
+            normalized_email = str(email or "").strip().lower()
+            if normalized_email:
+                limit = _max_accounts_per_email()
+                if limit > 0:
+                    count_row = con.execute(
+                        "SELECT COUNT(*) FROM users WHERE lower(trim(email))=?",
+                        (normalized_email,),
+                    ).fetchone()
+                    existing_count = int((count_row or [0])[0] or 0)
+                    if existing_count >= limit and not row:
+                        con.close()
+                        sock.sendall((json.dumps({
+                            "action": "create_account_failed",
+                            "reason": "An account already exists for this email. Please log in with your existing account.",
+                        }) + "\n").encode())
+                        return
             
             # Allow overwriting unverified users
             if row and (row[0] == 1 or not smtp_config['enabled']):
@@ -1068,6 +1383,8 @@ def handle_client(cs, addr):
                 con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
             else:
                 con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+            if invite_token:
+                con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
             con.commit()
             con.close()
 
@@ -1093,10 +1410,16 @@ def handle_client(cs, addr):
             u_ver = req.get("user")
             code_ver = req.get("code")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT verification_code FROM users WHERE username=?", (u_ver,)).fetchone()
+            row = con.execute("SELECT verification_code, email FROM users WHERE username=?", (u_ver,)).fetchone()
             if row and row[0] == code_ver:
                 con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
+                if row[1]:
+                    EmailManager.send_email(
+                        row[1],
+                        "Thrive Messenger - Account Verified",
+                        f"Hi {u_ver}, your account on {server_identity} has been verified and is ready to use."
+                    )
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
                 con.close()
@@ -1142,7 +1465,7 @@ def handle_client(cs, addr):
                 sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
             return
 
-        if action != "login": 
+        if action not in ("login", "login_passkey"):
             sock.sendall(b'{"status":"error","reason":"Expected login"}\n')
             return
 
@@ -1174,10 +1497,36 @@ def handle_client(cs, addr):
             return
         row = rows[0] if rows else None
 
-        if not row or row[1] != req["pass"]:
+        if not row:
             sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
             db.close()
             return
+
+        if action == "login":
+            if row[1] != req.get("pass", ""):
+                sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
+                db.close()
+                return
+        else:
+            passkey_token = str(req.get("passkey_token", "") or "").strip()
+            if not passkey_token:
+                sock.sendall(b'{"status":"error","reason":"Missing passkey token"}\n')
+                db.close()
+                return
+            passkey_hash = _hash_passkey_secret(passkey_token)
+            passkey_row = db.execute(
+                "SELECT id FROM user_passkeys WHERE username=? AND token_hash=? AND revoked=0 LIMIT 1",
+                (row[0], passkey_hash),
+            ).fetchone()
+            if not passkey_row:
+                sock.sendall(b'{"status":"error","reason":"Invalid passkey"}\n')
+                db.close()
+                return
+            db.execute(
+                "UPDATE user_passkeys SET last_used_at=? WHERE id=?",
+                (datetime.datetime.utcnow().isoformat(), passkey_row[0]),
+            )
+            db.commit()
 
         user = row[0]
         bi, br, verified = row[2], row[3], row[4]
@@ -1203,6 +1552,11 @@ def handle_client(cs, addr):
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
         contacts = [{"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)} for c,b in rows]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
+        _send_json_line(sock, {
+            "action": "server_limits",
+            "max_direct_message_length": max_direct_message_length,
+            "max_status_length": max_status_length,
+        })
         _send_feature_caps(sock, user)
         db.close()
         
@@ -1222,7 +1576,33 @@ def handle_client(cs, addr):
                 except Exception:
                     pass
             
-            if action == "get_feature_caps":
+            if action == "register_bot_session":
+                session_info = {
+                    "auth_type": str(msg.get("auth_type", "") or ""),
+                    "runtime": str(msg.get("runtime", "") or ""),
+                    "host_label": str(msg.get("host_label", "") or ""),
+                    "platform": str(msg.get("platform", "") or ""),
+                    "capabilities": msg.get("capabilities", []) if isinstance(msg.get("capabilities", []), list) else [],
+                    "transports": msg.get("transports", []) if isinstance(msg.get("transports", []), list) else [],
+                    "background": bool(msg.get("background", False)),
+                    "accepts_files": bool(msg.get("accepts_files", False)),
+                    "delegation": bool(msg.get("delegation", True)),
+                    "registered_at": datetime.datetime.utcnow().isoformat() + "Z",
+                }
+                with lock:
+                    client_statuses[user] = "online"
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "bot_session_registered",
+                        "ok": True,
+                        "user": user,
+                        "session": session_info,
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+                broadcast_contact_status(user, True)
+
+            elif action == "get_feature_caps":
                 _send_feature_caps(sock, user)
 
             elif action == "get_feature_policies":
@@ -1432,6 +1812,107 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "add_contact_success", "contact": contact_data}) + "\n").encode())
                 con.close()
 
+            elif action == "register_passkey":
+                label = str(msg.get("label", "") or "").strip()
+                raw_token = str(msg.get("passkey_token", "") or "").strip()
+                if not raw_token or len(raw_token) < 24:
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "passkey_register_result",
+                            "ok": False,
+                            "reason": "Passkey token is missing or too short.",
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                if not label:
+                    label = f"Thrive Messenger - {user}"
+                now = datetime.datetime.utcnow().isoformat()
+                token_hash = _hash_passkey_secret(raw_token)
+                con = sqlite3.connect(DB)
+                existing = con.execute(
+                    "SELECT id FROM user_passkeys WHERE username=? AND token_hash=? LIMIT 1",
+                    (user, token_hash),
+                ).fetchone()
+                if existing:
+                    passkey_id = existing[0]
+                    con.execute(
+                        "UPDATE user_passkeys SET label=?, revoked=0 WHERE id=?",
+                        (label, passkey_id),
+                    )
+                else:
+                    passkey_id = str(uuid.uuid4())
+                    con.execute(
+                        "INSERT INTO user_passkeys(id, username, label, token_hash, created_at, last_used_at, revoked) VALUES(?,?,?,?,?,?,0)",
+                        (passkey_id, user, label, token_hash, now, now),
+                    )
+                con.commit()
+                con.close()
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "passkey_register_result",
+                        "ok": True,
+                        "passkey_id": passkey_id,
+                        "label": label,
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "list_passkeys":
+                con = sqlite3.connect(DB)
+                rows = con.execute(
+                    "SELECT id, label, created_at, last_used_at, revoked FROM user_passkeys WHERE username=? ORDER BY created_at DESC",
+                    (user,),
+                ).fetchall()
+                con.close()
+                entries = [
+                    {
+                        "id": r[0],
+                        "label": r[1],
+                        "created_at": r[2],
+                        "last_used_at": r[3],
+                        "revoked": bool(r[4]),
+                    }
+                    for r in rows
+                ]
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "passkey_list",
+                        "passkeys": entries,
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
+            elif action == "revoke_passkey":
+                passkey_id = str(msg.get("passkey_id", "") or "").strip()
+                if not passkey_id:
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "passkey_revoke_result",
+                            "ok": False,
+                            "reason": "Missing passkey id.",
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
+                    continue
+                con = sqlite3.connect(DB)
+                res = con.execute(
+                    "UPDATE user_passkeys SET revoked=1 WHERE id=? AND username=?",
+                    (passkey_id, user),
+                )
+                con.commit()
+                changed = int(getattr(res, "rowcount", 0) or 0)
+                con.close()
+                try:
+                    sock.sendall((json.dumps({
+                        "action": "passkey_revoke_result",
+                        "ok": changed > 0,
+                        "passkey_id": passkey_id,
+                        "reason": "" if changed > 0 else "Passkey not found.",
+                    }) + "\n").encode())
+                except Exception:
+                    pass
+
             elif action == "invite_user":
                 target_user = str(msg.get("username", "")).strip()
                 method = str(msg.get("method", "email")).strip().lower()
@@ -1498,7 +1979,31 @@ def handle_client(cs, addr):
                 else:
                     cmd_parts = msg.get("cmd", "").split()
                     command = cmd_parts[0].lower() if cmd_parts else ""
-                    if command == "exit" and len(cmd_parts) == 1:
+                    if command in ("help", "?"):
+                        response = (
+                            "To get more help, type ? or help!\n"
+                            "Server command help:\n"
+                            "/help or /?  Show this help\n"
+                            "/alert <message>  Send an alert to all online users\n"
+                            "/create <user> <pass> [email]  Create an account\n"
+                            "/invite <user> <email>  Email invite with magic signup link\n"
+                            "/accountlimit show  Show max accounts allowed per email (0=unlimited)\n"
+                            "/accountlimit set <number>  Set max accounts per email (1=single account)\n"
+                            "/ban <user> <MM/DD/YYYY> <reason>  Ban a user until date\n"
+                            "/unban <user>  Remove user ban\n"
+                            "/del <user>  Delete a user\n"
+                            "/admin <user>  Grant admin role\n"
+                            "/unadmin <user>  Remove admin role\n"
+                            "/banfile <user> <ext|all> [MM/DD/YYYY] <reason>  Ban file uploads\n"
+                            "/unbanfile <user> [ext]  Remove file upload ban\n"
+                            "/gpolicy show [group]  Show group policy\n"
+                            "/gpolicy set <key> <value> [group]  Set group policy key\n"
+                            "/gpolicy reset [group]  Reset group policy to defaults\n"
+                            "/gpolicy keys  List available group policy keys\n"
+                            "/restart  Restart server after configured timeout\n"
+                            "/exit  Shut down server after configured timeout"
+                        )
+                    elif command == "exit" and len(cmd_parts) == 1:
                         print(f"Shutdown initiated by admin: {user}")
                         broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
                         time.sleep(shutdown_timeout)
@@ -1516,6 +2021,46 @@ def handle_client(cs, addr):
                             response = f"User '{cmd_parts[1]}' created."
                         else:
                             response = f"Error: Username '{cmd_parts[1]}' is already taken."
+                    elif command == "invite" and len(cmd_parts) >= 3:
+                        invite_user = str(cmd_parts[1] or "").strip()
+                        invite_email = str(cmd_parts[2] or "").strip()
+                        if not invite_user or not invite_email or "@" not in invite_email:
+                            response = "Error: invite syntax: /invite <username> <email>"
+                        elif not smtp_config.get('enabled', False):
+                            response = "Error: SMTP email is not enabled on this server."
+                        else:
+                            token = _create_invite_token(invite_user, invite_email, user)
+                            magic_link = (
+                                "https://im.tappedin.fm/thrive-messenger-setup/"
+                                f"?invite={urllib.parse.quote(token)}"
+                                f"&user={urllib.parse.quote(invite_user)}"
+                                f"&email={urllib.parse.quote(invite_email)}"
+                            )
+                            body = (
+                                f"{user} invited you to join Thrive Messenger on {server_identity}.\n\n"
+                                "Use this magic link to start account creation:\n"
+                                f"{magic_link}\n\n"
+                                "After account creation, a verification/confirmation email will be sent automatically."
+                            )
+                            sent = EmailManager.send_email(invite_email, "You're invited to Thrive Messenger", body)
+                            if sent:
+                                response = f"Invite sent to {invite_email} for user '{invite_user}'."
+                            else:
+                                response = f"Error: Invite email failed for {invite_email}."
+                    elif command == "accountlimit" and len(cmd_parts) >= 2:
+                        sub = str(cmd_parts[1] or "").strip().lower()
+                        if sub == "show":
+                            limit = _max_accounts_per_email()
+                            response = f"Current max accounts per email: {limit} (0 means unlimited)."
+                        elif sub == "set" and len(cmd_parts) >= 3:
+                            try:
+                                limit = max(0, int(str(cmd_parts[2]).strip()))
+                                _set_server_setting("max_accounts_per_email", str(limit))
+                                response = f"Updated max accounts per email to {limit}."
+                            except Exception:
+                                response = "Error: accountlimit set requires a non-negative integer."
+                        else:
+                            response = "Error: accountlimit syntax: /accountlimit show OR /accountlimit set <number>"
                     elif command == "ban" and len(cmd_parts) >= 4: 
                         handle_ban(cmd_parts[1], cmd_parts[2], " ".join(cmd_parts[3:]))
                         response = f"User '{cmd_parts[1]}' banned."
@@ -1582,7 +2127,7 @@ def handle_client(cs, addr):
                         else:
                             response = "Error: gpolicy syntax: /gpolicy show [group], /gpolicy set <key> <value> [group], /gpolicy reset [group], /gpolicy keys"
                     else:
-                        response = "Error: Unknown command or incorrect syntax."
+                        response = "Error: Unknown command or incorrect syntax. To get more help, type ? or help!"
                 try: sock.sendall((json.dumps({"action":"admin_response", "response": response})+"\n").encode())
                 except: pass
 
@@ -1961,6 +2506,16 @@ def handle_client(cs, addr):
 
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
+                message_text = str(msg.get("msg", "") or "")
+                if _message_too_long(message_text, max_direct_message_length):
+                    _send_json_line(sock, {
+                        "action": "msg_failed",
+                        "to": to,
+                        "reason": f"Message is too long. This server allows up to {max_direct_message_length} characters per direct message.",
+                        "max_length": max_direct_message_length,
+                    })
+                    continue
+                msg["msg"] = message_text
                 if _is_registered_bot(to) and not _can_user_use_feature(user, "bots"):
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Bot messaging is disabled for your account."}).encode() + b"\n")
                     continue
