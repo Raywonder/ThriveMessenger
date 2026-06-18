@@ -1171,6 +1171,31 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             "but do not reveal private memory unless it directly helps the current user."
         )
 
+    max_system_chars = int(bot_runtime_config.get('ollama_system_prompt_chars', 2500) or 2500)
+    max_docs_chars = int(bot_runtime_config.get('ollama_docs_chars', 1200) or 1200)
+    max_rules_chars = int(bot_runtime_config.get('ollama_rules_chars', 1600) or 1600)
+    max_memory_chars = int(bot_runtime_config.get('ollama_memory_chars', 1200) or 1200)
+    system_prompt = _limit_text(system_prompt, max_system_chars)
+    docs_context = _limit_text(docs_context, max_docs_chars)
+    rules_context = _limit_text(rules_context, max_rules_chars)
+    memory_context = _limit_text(memory_context, max_memory_chars)
+
+    prompt_parts = [
+        system_prompt,
+    ]
+    if docs_context:
+        prompt_parts.append(f"Documentation context:\n{docs_context}")
+    if rules_context:
+        prompt_parts.append(f"Agent rules context:\n{rules_context}")
+    if memory_context:
+        prompt_parts.append(f"Prior chat memory for {sender_user} with {bot_name}:\n{memory_context}")
+    prompt_parts.append(
+        "Reply as the current bot in a natural chat style. "
+        "Do not expose tool calls, JSON, provider errors, or internal routing. "
+        f"User '{sender_user}' says: {user_text}"
+    )
+    prompt = "\n\n".join(part for part in prompt_parts if str(part or "").strip())
+
     payload = {
         "model": model,
         "stream": False,
@@ -1178,16 +1203,10 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             "num_predict": int(bot_runtime_config.get('ollama_num_predict', 180) or 180),
             "temperature": float(bot_runtime_config.get('ollama_temperature', 0.4) or 0.4),
         },
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "system", "content": f"Documentation context:\n{docs_context}" if docs_context else "Documentation context unavailable."},
-            {"role": "system", "content": f"Agent rules context:\n{rules_context[:5000]}" if rules_context else "Agent rules context unavailable."},
-            {"role": "system", "content": f"Prior chat memory for {sender_user} with {bot_name}:\n{memory_context}" if memory_context else "Prior chat memory unavailable."},
-            {"role": "user", "content": f"User '{sender_user}' says: {user_text}"}
-        ]
+        "prompt": prompt,
     }
     req = urllib.request.Request(
-        f"{base_url}/api/chat",
+        f"{base_url}/api/generate",
         data=json.dumps(payload).encode('utf-8'),
         method="POST",
         headers={"Content-Type": "application/json"},
@@ -1196,8 +1215,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode('utf-8', errors='replace')
         data = json.loads(raw)
-        message = data.get("message", {}) if isinstance(data, dict) else {}
-        content = message.get("content", "") if isinstance(message, dict) else ""
+        content = data.get("response", "") if isinstance(data, dict) else ""
         content = str(content or "").strip()
         if not content:
             return None
