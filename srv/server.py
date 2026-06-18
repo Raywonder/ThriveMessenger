@@ -873,27 +873,69 @@ def _load_docs_text():
     key = "docs_text"
     if key in docs_cache:
         return docs_cache[key]
+    max_docs_files = int(bot_runtime_config.get('bot_docs_max_files', 24) or 24)
+    max_doc_file_chars = int(bot_runtime_config.get('bot_docs_max_file_chars', 12000) or 12000)
+    max_total_chars = int(bot_runtime_config.get('bot_docs_total_chars', 120000) or 120000)
     roots = [
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
         os.getcwd(),
     ]
     candidates = []
+    seen = set()
+    def add_candidate(path):
+        ap = os.path.abspath(path)
+        lower = ap.lower()
+        if ap in seen:
+            return
+        if any(part in lower for part in (
+            os.sep + ".git" + os.sep,
+            os.sep + "__pycache__" + os.sep,
+            os.sep + "node_modules" + os.sep,
+            os.sep + "venv" + os.sep,
+            os.sep + ".venv" + os.sep,
+        )):
+            return
+        base = os.path.basename(ap).lower()
+        if ".bak" in base or base.endswith((".tmp", ".log", ".db", ".sqlite", ".pyc")):
+            return
+        seen.add(ap)
+        candidates.append(ap)
+
     for root in roots:
-        candidates.extend([
+        for path in [
             os.path.join(root, "README.md"),
             os.path.join(root, "F1_HELP.md"),
             os.path.join(root, "HELP.md"),
             os.path.join(root, "docs", "README.md"),
-        ])
+        ]:
+            add_candidate(path)
+        docs_root = os.path.join(root, "docs")
+        if os.path.isdir(docs_root):
+            for dirpath, dirnames, filenames in os.walk(docs_root):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in (".git", "__pycache__", "node_modules", "venv", ".venv")
+                    and not d.startswith(".")
+                ]
+                for name in sorted(filenames):
+                    if len(candidates) >= max_docs_files:
+                        break
+                    if name.lower().endswith((".md", ".txt")):
+                        add_candidate(os.path.join(dirpath, name))
+                if len(candidates) >= max_docs_files:
+                    break
     chunks = []
     for path in candidates:
         if os.path.isfile(path):
             try:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    chunks.append(f"# Source: {os.path.basename(path)}\n{f.read()}")
+                    rel = os.path.relpath(path, roots[0]) if path.startswith(roots[0]) else os.path.basename(path)
+                    chunks.append(f"# Source: {rel}\n{f.read(max_doc_file_chars)}")
+                if sum(len(c) for c in chunks) >= max_total_chars:
+                    break
             except Exception:
                 pass
-    docs_text = "\n\n".join(chunks)
+    docs_text = "\n\n".join(chunks)[:max_total_chars]
     docs_cache[key] = docs_text
     return docs_text
 
@@ -1150,6 +1192,14 @@ def _ollama_bot_reply(sender_user, bot_name, text):
             f" You are trained for these services/features: {service_scope}. "
             "When users ask about these services, provide concrete usage steps and troubleshooting."
         )
+    bot_identity = str(bot_name or "assistant").strip() or "assistant"
+    system_prompt = (
+        f"You are {bot_identity}. Your visible name is {bot_identity}; never call yourself Thrive Messenger, "
+        "the app, or the server. Thrive Messenger is only the chat platform you are using. "
+        "Start from the recent conversation naturally, as if the chat has been ongoing. "
+        "Do not reintroduce yourself, recap old messages, or mention that you are using memory unless the user asks. "
+        + system_prompt
+    )
     user_text = (text or "").strip()
     if not user_text:
         user_text = "Introduce yourself and explain how you can help in one short message."
@@ -1168,7 +1218,8 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     if memory_context:
         system_prompt += (
             " You have persistent per-user chat memory on this Thrive server. Use it to maintain continuity, "
-            "but do not reveal private memory unless it directly helps the current user."
+            "but do not reveal private memory unless it directly helps the current user. "
+            "Use the memory quietly to choose tone, continuity, and context."
         )
 
     max_system_chars = int(bot_runtime_config.get('ollama_system_prompt_chars', 2500) or 2500)
@@ -1190,7 +1241,8 @@ def _ollama_bot_reply(sender_user, bot_name, text):
     if memory_context:
         prompt_parts.append(f"Prior chat memory for {sender_user} with {bot_name}:\n{memory_context}")
     prompt_parts.append(
-        "Reply as the current bot in a natural chat style. "
+        f"Reply as {bot_identity} in a natural chat style. "
+        f"If you refer to yourself by name, use only {bot_identity}. "
         "Do not expose tool calls, JSON, provider errors, or internal routing. "
         f"User '{sender_user}' says: {user_text}"
     )
