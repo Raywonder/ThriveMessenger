@@ -161,6 +161,49 @@ def _message_too_long(text, max_chars):
         return False
     return max_chars > 0 and len(str(text or "")) > max_chars
 
+def _normalize_identity_token(value):
+    token = str(value or "").strip()
+    if not token:
+        return ""
+    lowered = token.lower()
+    if lowered.startswith("whatsapp:"):
+        rest = lowered.split(":", 1)[1].strip()
+        if rest.startswith("+"):
+            return "whatsapp:" + "+" + re.sub(r"\D", "", rest)
+        return "whatsapp:" + rest
+    if "@" in token and not lowered.startswith("http"):
+        return lowered
+    compact = re.sub(r"\s+", " ", token).strip()
+    return compact.lower()
+
+def _parse_identity_aliases(raw):
+    aliases = {}
+    for group in str(raw or "").split(";"):
+        group = group.strip()
+        if not group:
+            continue
+        if ":" in group:
+            canonical, raw_aliases = group.split(":", 1)
+        else:
+            canonical, raw_aliases = group, ""
+        canonical = str(canonical or "").strip()
+        canonical_key = _normalize_identity_token(canonical)
+        if not canonical or not canonical_key:
+            continue
+        aliases[canonical_key] = canonical
+        for alias in raw_aliases.split(","):
+            alias_key = _normalize_identity_token(alias)
+            if alias_key:
+                aliases[alias_key] = canonical
+    return aliases
+
+def _canonical_chat_identity(username):
+    key = _normalize_identity_token(username)
+    if not key:
+        return str(username or "").strip()
+    aliases = bot_runtime_config.get('identity_aliases', {}) if isinstance(bot_runtime_config, dict) else {}
+    return aliases.get(key, str(username or "").strip())
+
 def _send_json_line(sock, payload):
     sock.sendall((json.dumps(payload) + "\n").encode())
 
@@ -1564,9 +1607,11 @@ def load_config():
         'moderation_excerpt_limit': config.getint('bots', 'moderation_excerpt_limit', fallback=280),
         'memory_messages_per_user': config.getint('bots', 'memory_messages_per_user', fallback=80),
         'default_bot_contacts': config.get('bots', 'default_bot_contacts', fallback='Clawdia'),
+        'identity_aliases': _parse_identity_aliases(config.get('bots', 'identity_aliases', fallback='Dominique:Dominique,Tappedinfm,tappedinfm,Adonis,Adonis1111')),
     }
     return {
         'port': config.getint('server', 'port', fallback=5005),
+        'bind_host': config.get('server', 'bind_host', fallback='0.0.0.0').strip() or '0.0.0.0',
         'certfile': config.get('server', 'certfile', fallback='server.crt'),
         'keyfile': config.get('server', 'keyfile', fallback='server.key'),
     }
@@ -1646,7 +1691,7 @@ def _truthy_flag(value):
     return str(value or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 def _record_bot_memory(username, bot_name, role, content):
-    username = str(username or '').strip()
+    username = _canonical_chat_identity(username)
     bot_name = str(bot_name or '').strip()
     role = str(role or '').strip()
     content = str(content or '').strip()
@@ -1676,7 +1721,7 @@ def _record_bot_memory(username, bot_name, role, content):
         con.close()
 
 def _bot_memory_context(username, bot_name, limit=16):
-    username = str(username or '').strip()
+    username = _canonical_chat_identity(username)
     bot_name = str(bot_name or '').strip()
     if not username or not bot_name:
         return ""
@@ -3650,16 +3695,16 @@ def serve_loop(config):
     try:
         context.load_cert_chain(certfile=config['certfile'], keyfile=config['keyfile'])
         use_ssl = True
-        print(f"Secure (SSL) server listening on port {config['port']}...")
+        print(f"Secure (SSL) server listening on {config.get('bind_host', '0.0.0.0')}:{config['port']}...")
     except (FileNotFoundError, ssl.SSLError) as e:
         print(f"WARNING: Certificate or key file not found or invalid ({e}).")
         print(f"Looking for Cert: {os.path.abspath(config['certfile'])}")
         print(f"Looking for Key:  {os.path.abspath(config['keyfile'])}")
-        print(f"Server running in INSECURE (UNENCRYPTED) mode on port {config['port']}...")
+        print(f"Server running in INSECURE (UNENCRYPTED) mode on {config.get('bind_host', '0.0.0.0')}:{config['port']}...")
 
     bindsocket = socket.socket()
     bindsocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    bindsocket.bind(("0.0.0.0", config['port']))
+    bindsocket.bind((config.get('bind_host', '0.0.0.0'), config['port']))
     bindsocket.listen(5)
     
     while True:
