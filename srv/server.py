@@ -1,5 +1,6 @@
 import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib, hmac
 import smtplib, secrets
+import re
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
 try:
@@ -103,6 +104,55 @@ def _limit_text(value, max_chars):
     if max_chars > 0 and len(text) > max_chars:
         return text[:max_chars]
     return text
+
+_INTERNAL_TOOL_JSON_RE = re.compile(
+    r'^\s*(?:```(?:json)?\s*)?\{[\s\S]*(?:"type"\s*:\s*"function"|"name"\s*:\s*"tool_call"|"name"\s*:\s*"tool_describe"|"id"\s*:\s*"openclaw"|whatsapp:\d+:direct)[\s\S]*\}\s*(?:```)?\s*$',
+    re.IGNORECASE,
+)
+_INTERNAL_MARKER_RE = re.compile(
+    r'(?:\btool_(?:call|describe|result)\b|\bfunction_call\b|\[\s*Tool Call:|<invoke\b|</?minimax:tool_call>|<think\b|</think>)',
+    re.IGNORECASE,
+)
+_PROVIDER_NOISE_RE = re.compile(
+    r'(?:Provider .* cooldown|subscription usage limit|tool ID .* not recognized|live model reply|could not get a live model reply|I couldn\'t reach the model right now)',
+    re.IGNORECASE,
+)
+
+def _strip_internal_markup(text):
+    text = re.sub(r'<invoke\b[\s\S]*?</invoke>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'</?minimax:tool_call[^>]*>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<think\b[^>]*>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[\s*Tool Call:[^\]]*\]', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[\s*Tool Result:[^\]]*\]', '', text, flags=re.IGNORECASE)
+    return text
+
+def _looks_like_internal_json_payload(text):
+    raw = str(text or "").strip()
+    raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
+    raw = re.sub(r'```\s*$', '', raw, flags=re.IGNORECASE).strip()
+    if not (raw.startswith('{') and raw.endswith('}')):
+        return False
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+    lowered = json.dumps(data, sort_keys=True).lower()
+    return any(key in lowered for key in ("tool_call", "tool_describe", "tool_result", "function_call", "openclaw"))
+
+def _user_facing_bot_output(text):
+    raw = str(text or "")
+    if not raw.strip():
+        return "", False, None
+    if _INTERNAL_TOOL_JSON_RE.match(raw) or _looks_like_internal_json_payload(raw):
+        return "", True, "json-tool-payload"
+    if _PROVIDER_NOISE_RE.search(raw):
+        return "", True, "provider-or-tool-noise"
+    cleaned = _strip_internal_markup(raw).strip()
+    if not cleaned and _INTERNAL_MARKER_RE.search(raw):
+        return "", True, "internal-marker-only"
+    if _looks_like_internal_json_payload(cleaned):
+        return "", True, "sanitized-json-tool-payload"
+    return cleaned, False, None
 
 def _message_too_long(text, max_chars):
     try:
@@ -994,10 +1044,19 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
                 "latest_user_message": _moderation_excerpt(text, 500),
                 "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
             })
-            reply = (
-                "I have the latest message and I am keeping the task queued for the backend agent path. "
-                "I will continue from the recent chat context when the worker is ready."
-            )
+            return True
+    original_reply = str(reply or "")
+    reply, blocked, reason = _user_facing_bot_output(original_reply)
+    if blocked or not reply:
+        _append_agent_task("blocked_bot_reply", {
+            "user": sender_user,
+            "bot": to_user,
+            "reason": reason or "empty-after-sanitizing",
+            "latest_user_message": _moderation_excerpt(text, 500),
+            "blocked_reply_excerpt": _moderation_excerpt(original_reply, 500),
+            "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
+        })
+        return True
     tts_payload = _build_bot_tts_payload(to_user, reply, text)
     payload = {
         "action": "msg",
@@ -1099,6 +1158,17 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         content = str(content or "").strip()
         if not content:
             return None
+        content, blocked, reason = _user_facing_bot_output(content)
+        if blocked or not content:
+            _append_agent_task("blocked_model_reply", {
+                "user": sender_user,
+                "bot": bot_name,
+                "provider": "ollama",
+                "reason": reason or "empty-after-sanitizing",
+                "latest_user_message": _moderation_excerpt(text, 500),
+                "recent_context": _bot_memory_context(sender_user, bot_name, limit=6),
+            })
+            return None
         return _limit_text(content, max_bot_reply_length)
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
@@ -1119,6 +1189,9 @@ def _build_bot_tts_payload(bot_name, reply_text, request_text):
         return None
     reply = str(reply_text or "").strip()
     if not reply:
+        return None
+    reply, blocked, _reason = _user_facing_bot_output(reply)
+    if blocked or not reply:
         return None
     # If users ask how they sound, provide a clear voice-preview response.
     asked_preview = any(
