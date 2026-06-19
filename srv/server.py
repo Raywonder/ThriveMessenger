@@ -118,6 +118,14 @@ _PROVIDER_NOISE_RE = re.compile(
     r'(?:Provider .* cooldown|subscription usage limit|tool ID .* not recognized|live model reply|could not get a live model reply|I couldn\'t reach the model right now)',
     re.IGNORECASE,
 )
+_CODE_OR_SCHEMA_REPLY_RE = re.compile(
+    r"(```|#!/usr/bin/env|^\s*(?:import\s+os|import\s+json|from\s+\w+\s+import)\b|"
+    r"\b(?:def|class)\s+\w+\s*\(|\bos\.system\s*\(|/path/to/|"
+    r"Conversation info\s*\(untrusted metadata\)|'_all_of'|\"_all_of\"|"
+    r"\bmin_length\b|\bmax_length\b|\bMESSAGE_ID\b|\bPARTIAL_ID\b|"
+    r"Here's an updated version of (?:your|the) script|This script establishes)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 def _strip_internal_markup(text):
     text = re.sub(r'<invoke\b[\s\S]*?</invoke>', '', text, flags=re.IGNORECASE)
@@ -144,6 +152,8 @@ def _user_facing_bot_output(text):
     raw = str(text or "")
     if not raw.strip():
         return "", False, None
+    if _CODE_OR_SCHEMA_REPLY_RE.search(raw):
+        return "", True, "code-or-schema-payload"
     if _INTERNAL_TOOL_JSON_RE.match(raw) or _looks_like_internal_json_payload(raw):
         return "", True, "json-tool-payload"
     if _PROVIDER_NOISE_RE.search(raw):

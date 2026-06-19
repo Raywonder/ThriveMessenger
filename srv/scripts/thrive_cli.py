@@ -151,11 +151,21 @@ INTERNAL_REPLY_RE = re.compile(
     r"provider .*cooldown|live model reply|could not get a live model|schema|openclaw)",
     re.IGNORECASE,
 )
+CODE_OR_SCHEMA_REPLY_RE = re.compile(
+    r"(```|#!/usr/bin/env|^\s*(?:import\s+os|import\s+json|from\s+\w+\s+import)\b|"
+    r"\b(?:def|class)\s+\w+\s*\(|\bos\.system\s*\(|/path/to/|"
+    r"Conversation info\s*\(untrusted metadata\)|'_all_of'|\"_all_of\"|"
+    r"\bmin_length\b|\bmax_length\b|\bMESSAGE_ID\b|\bPARTIAL_ID\b|"
+    r"Here's an updated version of (?:your|the) script|This script establishes)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def user_facing_reply(text: Any) -> str:
     reply = str(text or "").strip()
     if not reply:
+        return ""
+    if CODE_OR_SCHEMA_REPLY_RE.search(reply):
         return ""
     if reply.startswith("{") or reply.startswith("["):
         try:
