@@ -1053,7 +1053,7 @@ def _status_for_user(username):
         if snap and snap.get("session_state") == "connected":
             status = "online"
         elif snap and snap.get("session_state") == "reconnecting":
-            status = "online, reconnecting"
+            status = "online"
         elif str(status).lower().startswith("reconnecting") and _is_online_user(username):
             status = "online"
         if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
