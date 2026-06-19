@@ -1050,8 +1050,12 @@ def _status_for_user(username):
     if _is_registered_bot(username):
         snap = _bot_session_snapshot(username)
         status = bot_status_map.get(username, "online")
-        if snap and snap.get("session_state") == "reconnecting":
-            status = "reconnecting"
+        if snap and snap.get("session_state") == "connected":
+            status = "online"
+        elif snap and snap.get("session_state") == "reconnecting":
+            status = "online, reconnecting"
+        elif str(status).lower().startswith("reconnecting") and _is_online_user(username):
+            status = "online"
         if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
             purpose = "automation and assistant bot"
         else:
