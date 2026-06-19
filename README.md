@@ -93,6 +93,19 @@ It produces:
 - `thrive_messenger-macos-x86_64.zip`
 - `thrive_messenger-macos-arm64.zip`
 
+### Server auto-deploy workflow (PM2)
+
+This repo includes an optional server deploy flow that can pull latest code and restart a PM2 server process when server-relevant files changed:
+
+- GitHub Actions workflow: `.github/workflows/deploy-server.yml`
+- Deploy script: `srv/scripts/deploy_and_restart.sh`
+- Optional deploy API endpoint: `srv/scripts/deploy_hook_api.py`
+- Shared handoff workflow: `.github/workflows/stage-server-shared.yml`
+
+Setup details are documented in:
+
+- `srv/scripts/DEPLOY.md`
+
 ### Running compiled
 
 If you don't feel like fighting with UV and Python, a pre-compiled release is provided.
@@ -114,6 +127,19 @@ Logging into your Thrive Messenger account is as simple as logging into your com
 3.  Optionally, check the boxes to remember your credentials and log in automatically.
 4.  Click Login or Press Alt + L to log into Thrive Messenger. A sound will play to tell you that you're logged in.
 
+### Web3 Domain Support
+
+Server owners can use Web3 DNS domains for server hostnames. In Server Manager or `client.conf`, set the server host to your domain as normal.
+
+Examples:
+
+* `myserver.eth`
+* `voice.crypto`
+* `chat.nft`
+* Freename-managed domains
+
+The client accepts standard hostnames and Web3-style domains for server entries, and link detection/opening in chat/status also supports Web3-style links and bare domains.
+
 ### The Thrive Messenger UI
 
 When you log into Thrive Messenger, you will land on your contact list. Of course, if your account is brand new, you won't have any contacts to chat with. This list view will show you the name of each contact, as well as their online status. You can navigate your contact list with the up and down arrow keys. Using the Tab key will allow you to navigate the rest of the UI.
@@ -132,6 +158,10 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Alt P will check for updates to the program and allow you to auto download them.
 * Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
 
+### Message length
+
+Server owners can configure direct message length with `max_direct_message_length` in `srv/srv.conf`. The default is 20,000 characters. If a message is too long, the sender receives a clear delivery error instead of a silent failure. Bot replies can be capped with `max_reply_length` under `[bots]`; the default is 4,000 characters so agent replies have room to be useful without flooding clients.
+
 ### Sending and receiving messages
 
 You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
@@ -143,7 +173,7 @@ Note: server owners might place file size limits and certain file type restricti
 
 ### Server side commands
 
-If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter.
+If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter. To get more help in this text box, type `?` or `help` (with or without a leading slash).
 
 Each server side command must start with a forward slash (/). The following server side commands are available.
 
@@ -254,13 +284,15 @@ The client.conf file controls what server and port the Thrive Messenger client c
 
 The default server is msg.thecubed.cc, running on port 2005.
 
+If your server is published on a Web3 DNS name, set `host` to that domain directly (for example `myserver.eth`).
+
 You can also control update sources in `client.conf`:
 
 ```
 [updates]
 feed_url = https://im.tappedin.fm/updates/latest.json
-preferred_repo = Raywonder/ThriveMessenger
-fallback_repos = G4p-Studios/ThriveMessenger
+preferred_repo = G4p-Studios/ThriveMessenger
+fallback_repos = Raywonder/ThriveMessenger
 ```
 
 - `feed_url` is optional. If set, the client checks your hosted feed first.

@@ -5,3 +5,35 @@ dist/
 dist-macos/
 *.spec
 assets/videos/.narration_work/
+*.pyc
+*.pyo
+
+# Live server/runtime state
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.pid
+srv/certs/
+srv/~/
+
+# Private server credentials and local secrets
+*.env
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+srv/.bot-credentials.txt
+srv/.smtp-credentials.txt
+srv/.wordpress-sync-secret
+
+# Agent/live deployment backups
+.agent-backups/
+backups/
+*.bak
+*.bak-*
+*.bak.*
+*.before-*
+*.old

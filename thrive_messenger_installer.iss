@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.2"
+#define MyAppVersion "2026 Alpha 15.5"
 #define MyAppPublisher "G4p Studios"
 #define MyAppURL "https://github.com/G4p-Studios/ThriveMessenger"
 #define MyAppExeName "thrive_messenger.exe"
@@ -19,11 +19,11 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-DefaultDirName={pf}\Thrive\Thrive Messenger
+DefaultDirName={commonpf}\Thrive\Thrive Messenger
 DefaultGroupName=Thrive\Thrive Messenger
 AllowNoIcons=yes
-InfoAfterFile=C:\git\ThriveMessenger\README.md
-OutputDir=C:\Users\seedy\Documents
+InfoAfterFile=README.md
+OutputDir=dist\installer
 OutputBaseFilename=thrive_messenger_installer
 Compression=lzma
 SolidCompression=yes
@@ -35,8 +35,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "C:\git\ThriveMessenger\dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\git\ThriveMessenger\dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "client.conf"; DestDir: "{app}"; Flags: ignoreversion
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "sounds\*"; DestDir: "{app}\sounds"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "assets\help\*"; DestDir: "{app}\assets\help"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "assets\videos\*"; DestDir: "{app}\assets\videos"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
