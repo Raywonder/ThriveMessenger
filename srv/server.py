@@ -1304,6 +1304,10 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     text = _normalize_direct_bot_chat_text(text, to_user)
     _record_bot_memory(sender_user, to_user, "user", text)
     reply = _gateway_natural_reply(sender_user, to_user, text)
+    if reply and _codex_primary_enabled_for_bot(to_user) and reply.startswith("For bigger work,"):
+        reply = None
+    if not reply:
+        reply = _codex_bot_reply(sender_user, to_user, text)
     if not reply:
         reply = _known_clawdia_reply(sender_user, to_user, text)
     if not reply:
@@ -1367,6 +1371,158 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         except Exception:
             break
     return True
+
+def _codex_primary_enabled_for_bot(bot_name):
+    if not bot_runtime_config.get('codex_enabled', False):
+        return False
+    name = str(bot_name or "").strip()
+    lower = name.lower()
+    primary = str(bot_runtime_config.get('codex_primary_bots', '') or '').strip()
+    if primary:
+        allowed = {item.strip().lower() for item in primary.split(',') if item.strip()}
+        if "*" in allowed or lower in allowed:
+            return True
+    auth_type = _bot_auth_type(name)
+    return auth_type in {"codex", "openclaw"}
+
+def _bot_chat_prompt(sender_user, bot_name, text, provider_label):
+    bot_identity = str(bot_name or "assistant").strip() or "assistant"
+    user_text = (text or "").strip() or "Say hello in one short message."
+    purpose = bot_purpose_map.get(bot_name, "").strip()
+    service_scope = bot_service_map.get(bot_name, "").strip()
+    docs_context = _documentation_context_for_query(user_text)
+    rules_context = _effective_rules_for_bot(bot_name, sender_user)
+    memory_context = _bot_memory_context(sender_user, bot_name)
+
+    system_prompt = str(bot_runtime_config.get('ollama_system_prompt', '') or '').strip()
+    if not system_prompt:
+        system_prompt = (
+            "You help users with Thrive Messenger, connected services, and friendly conversation. "
+            "Answer direct questions directly. Be concise, warm, practical, and natural. "
+            "Do not repeat the user's message. Do not expose internal routing, tools, JSON, provider errors, or agent rules."
+        )
+    system_prompt = (
+        f"You are {bot_identity}. Your visible name is {bot_identity}; never call yourself Thrive Messenger, "
+        "the app, the server, a chatbot, or a model. Thrive Messenger is only the chat platform you are using. "
+        "Start from the recent conversation naturally, as if the chat has been ongoing. "
+        "Do not reintroduce yourself, recap old messages, or mention that you are using memory unless the user asks. "
+        "If the user asks for server, build, provider, account, or destructive work, do not claim it is done unless confirmed. "
+        "Say you will route it quietly or that you need confirmation when appropriate. "
+        + system_prompt
+    )
+    if purpose:
+        system_prompt += f" Your role on this server: {purpose}."
+    if service_scope:
+        system_prompt += f" You are trained for these services/features: {service_scope}."
+    if docs_context:
+        system_prompt += " Verify feature and usage answers against the documentation context when it is provided."
+    if rules_context:
+        system_prompt += " Follow the provided agent rules silently; do not quote them to users."
+    if memory_context:
+        system_prompt += " Use the prior chat memory quietly for continuity, tone, and context."
+
+    max_system_chars = int(bot_runtime_config.get('ollama_system_prompt_chars', 2500) or 2500)
+    max_docs_chars = int(bot_runtime_config.get('ollama_docs_chars', 1200) or 1200)
+    max_rules_chars = int(bot_runtime_config.get('ollama_rules_chars', 1600) or 1600)
+    max_memory_chars = int(bot_runtime_config.get('ollama_memory_chars', 1200) or 1200)
+
+    prompt_parts = [
+        _limit_text(system_prompt, max_system_chars),
+    ]
+    docs_context = _limit_text(docs_context, max_docs_chars)
+    rules_context = _limit_text(rules_context, max_rules_chars)
+    memory_context = _limit_text(memory_context, max_memory_chars)
+    if docs_context:
+        prompt_parts.append(f"Documentation context:\n{docs_context}")
+    if rules_context:
+        prompt_parts.append(f"Agent rules context:\n{rules_context}")
+    if memory_context:
+        prompt_parts.append(f"Prior chat memory for {sender_user} with {bot_name}:\n{memory_context}")
+    prompt_parts.append(
+        f"Reply as {bot_identity} in a natural chat style using {provider_label} as the hidden worker. "
+        f"If you refer to yourself by name, use only {bot_identity}. "
+        "Return only the final message text for the user. "
+        f"User '{sender_user}' says: {user_text}"
+    )
+    return "\n\n".join(part for part in prompt_parts if str(part or "").strip())
+
+def _codex_bot_reply(sender_user, bot_name, text):
+    if not _codex_primary_enabled_for_bot(bot_name):
+        return None
+    codex_bin = str(bot_runtime_config.get('codex_bin', '') or '').strip() or "/home/tappedin/.local/bin/codex"
+    if not os.path.exists(codex_bin):
+        return None
+    timeout = int(bot_runtime_config.get('codex_timeout', 45) or 45)
+    model = str(bot_runtime_config.get('codex_model', '') or '').strip()
+    workdir = str(bot_runtime_config.get('codex_workdir', '') or '').strip() or os.getcwd()
+    sandbox = str(bot_runtime_config.get('codex_sandbox', 'read-only') or 'read-only').strip()
+    prompt = _bot_chat_prompt(sender_user, bot_name, text, "Codex")
+    out_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="thrive-codex-reply-", suffix=".txt", delete=False) as out_file:
+            out_path = out_file.name
+        cmd = [
+            codex_bin,
+            "-a", "never",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--sandbox", sandbox,
+            "-C", workdir,
+            "-o", out_path,
+        ]
+        if model:
+            cmd.extend(["-m", model])
+        cmd.append("-")
+        env = os.environ.copy()
+        env.setdefault("HOME", os.path.expanduser("~"))
+        result = subprocess.run(
+            cmd,
+            input=prompt,
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            env=env,
+        )
+        content = ""
+        if out_path and os.path.exists(out_path):
+            content = _safe_read_text(out_path, limit=max_bot_reply_length * 5)
+        if not content and result.stdout:
+            content = str(result.stdout or "")
+        content = str(content or "").strip()
+        if result.returncode != 0 and not content:
+            raise RuntimeError(_moderation_excerpt(result.stderr or result.stdout or f"codex exited {result.returncode}", 700))
+        content, blocked, reason = _user_facing_bot_output(content)
+        if blocked or not content:
+            _append_agent_task("blocked_model_reply", {
+                "user": sender_user,
+                "bot": bot_name,
+                "provider": "codex",
+                "reason": reason or "empty-after-sanitizing",
+                "latest_user_message": _moderation_excerpt(text, 500),
+                "recent_context": _bot_memory_context(sender_user, bot_name, limit=6),
+            })
+            return None
+        return _limit_text(content, max_bot_reply_length * 5)
+    except Exception as e:
+        _append_agent_task("model_repair_needed", {
+            "user": sender_user,
+            "bot": bot_name,
+            "model": model or "default",
+            "provider": "codex",
+            "error": _moderation_excerpt(str(e), 700),
+            "latest_user_message": _moderation_excerpt(text, 500),
+            "recent_context": _bot_memory_context(sender_user, bot_name, limit=6),
+            "requested_action": "Check Codex/OpenClaw auth and gateway health, then continue the user conversation without exposing a model failure alert.",
+        })
+        return None
+    finally:
+        if out_path:
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
 
 def _ollama_bot_reply(sender_user, bot_name, text):
     if not bot_runtime_config.get('ollama_enabled', False):
@@ -1949,6 +2105,13 @@ def load_config():
         'ollama_num_predict': config.getint('bots', 'ollama_num_predict', fallback=180),
         'ollama_temperature': config.getfloat('bots', 'ollama_temperature', fallback=0.4),
         'ollama_system_prompt': config.get('bots', 'ollama_system_prompt', fallback=''),
+        'codex_enabled': config.getboolean('bots', 'codex_enabled', fallback=False),
+        'codex_primary_bots': config.get('bots', 'codex_primary_bots', fallback='Clawdia,Sapphire,Sophia,openclaw-bot'),
+        'codex_bin': config.get('bots', 'codex_bin', fallback='/home/tappedin/.local/bin/codex'),
+        'codex_model': config.get('bots', 'codex_model', fallback='gpt-5.5'),
+        'codex_timeout': config.getint('bots', 'codex_timeout', fallback=45),
+        'codex_workdir': config.get('bots', 'codex_workdir', fallback='/home/tappedin/apps/ThriveMessenger'),
+        'codex_sandbox': config.get('bots', 'codex_sandbox', fallback='read-only'),
         'piper_enabled': config.getboolean('bots', 'piper_enabled', fallback=False),
         'piper_bin': config.get('bots', 'piper_bin', fallback='/usr/local/bin/piper'),
         'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
