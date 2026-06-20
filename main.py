@@ -13,7 +13,7 @@ try:
 except Exception:
     wxmedia = None
 
-VERSION_TAG = "v2026-alpha15.8"
+VERSION_TAG = "v2026-alpha15.9"
 _nvda_controller = None
 _active_tts_media = []
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
@@ -29,7 +29,7 @@ DEFAULT_UPDATE_FEED_URL = "https://im.tappedin.fm/updates/latest.json"
 DEFAULT_SERVER_HOST = "im.tappedin.fm"
 DEFAULT_SERVER_NAME = "TappedIn.fm"
 DEFAULT_SERVER_PORT = 2005
-DEFAULT_MAX_DIRECT_MESSAGE_LENGTH = 20000
+DEFAULT_MAX_DIRECT_MESSAGE_LENGTH = 100000
 DEMO_VIDEOS = {
     "onboarding": {
         "filename": "promo-onboarding.mp4",
@@ -446,6 +446,11 @@ def load_user_config():
         'sound_volume': 80,
         'call_input_volume': 80,
         'call_output_volume': 80,
+        'call_input_device': 'System default',
+        'call_output_device': 'System default',
+        'tts_engine': 'screen_reader',
+        'tts_voice': 'System default',
+        'tts_rate': 0,
         'show_main_action_buttons': False,
         'chat_logging': {},
         'server_entries': file_entries,
@@ -956,10 +961,10 @@ def ensure_help_docs():
         "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help. Press Escape or Command+W to close this help window and return.</p>",
         "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add or remove endpoints. Use Set as Primary to choose your default server. Then enter username and password and sign in.</p><p>Server host supports normal DNS and Web3-style domains (including Freename/ENS/Unstoppable-style names).</p>",
         "main": "<h1>Contacts Window Help</h1><p>Manage contacts, statuses, files, and chats. Default action is Start Chat for the focused contact. User actions are available from User and context menus. File Transfers window shows sent/received files and their saved locations.</p>",
-        "chat": "<h1>Chat Window Help</h1><p>Enter sends message, Ctrl+Enter sends file, and Cmd+Enter inserts a new line. Message history is keyboard navigable and links can be activated from selected items. Typing indicators and readout can be toggled in Settings.</p>",
+        "chat": "<h1>Chat Window Help</h1><p>Enter sends a message. Ctrl+Enter sends a file. Alt+Enter or Shift+Enter inserts a new line on Windows; Command+Enter, Option+Enter, or Shift+Enter inserts a new line on macOS. Message history is keyboard navigable and links can be activated from selected items. Typing indicators and readout can be toggled in Settings.</p>",
         "directory": "<h1>User Directory Help</h1><p>Shows users from current and configured servers with server labels. Use Sort and Filter options for contacts. If a selected server does not support a feature, the related action is dimmed and explains why.</p>",
         "admin": "<h1>Admin Commands Help</h1><p>Commands start with '/'. Example: /alert message, /create username password, /admin username.</p><p>To get more help in the command text box, type ? or help (with or without a leading slash).</p>",
-        "settings": "<h1>Settings Help</h1><p>Configure sound pack, default sound pack selection, sound volume, call input/output levels, and chat accessibility options. Settings are remembered by the app.</p><p>Administration server host supports standard DNS hostnames and Web3-style domains.</p>",
+        "settings": "<h1>Settings Help</h1><p>Configure sound pack, sound volume, call input/output devices and levels, text-to-speech voice and speed, and chat accessibility options. Settings are remembered by the app.</p><p>Administration server host supports standard DNS hostnames and Web3-style domains.</p>",
         "server_info": "<h1>Server Info Help</h1><p>Shows active server host, port, encryption state, user counts, and file policy limits.</p>",
         "bot_rules": "<h1>Bot Rules Help</h1><p>Admins can load, edit, save, and reset bot rules. Non-admin users can view active rules but cannot edit.</p>",
     }
@@ -985,11 +990,13 @@ def speak_text(text, interrupt=None):
     try:
         if not text:
             return
-        if sys.platform == 'win32' and _speak_with_nvda_controller(text):
-            return
         app = wx.GetApp() if wx.GetApp() else None
+        cfg = getattr(app, "user_config", {}) if app else {}
+        tts_engine = str(cfg.get('tts_engine', 'screen_reader') or 'screen_reader').strip().lower()
+        if sys.platform == 'win32' and tts_engine != 'windows_voice' and _speak_with_nvda_controller(text):
+            return
         if interrupt is None:
-            interrupt = bool(getattr(app, "user_config", {}).get('interrupt_speech', True)) if app else True
+            interrupt = bool(cfg.get('interrupt_speech', True)) if app else True
         if interrupt and app:
             previous = getattr(app, "_tts_process", None)
             if previous and previous.poll() is None:
@@ -1003,11 +1010,19 @@ def speak_text(text, interrupt=None):
             proc = subprocess.Popen(['say', text])
         elif sys.platform == 'win32':
             safe_text = text.replace("'", "''")
+            voice = str(cfg.get('tts_voice', 'System default') or 'System default')
+            safe_voice = voice.replace("'", "''")
+            try:
+                rate = max(-10, min(10, int(cfg.get('tts_rate', 0) or 0)))
+            except Exception:
+                rate = 0
             cmd = (
                 "Add-Type -AssemblyName System.Speech; "
                 "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                "$s.Rate={1}; "
+                "if ('{2}' -and '{2}' -ne 'System default') {{ try {{ $s.SelectVoice('{2}') }} catch {{ }} }}; "
                 "$s.Speak('{0}')"
-            ).format(safe_text)
+            ).format(safe_text, rate, safe_voice)
             proc = subprocess.Popen(["powershell", "-NoProfile", "-Command", cmd], creationflags=0x08000000)
         else:
             proc = None
@@ -1048,6 +1063,75 @@ def _nvda_controller_candidates():
     for root in [base_dir, source_dir, os.getcwd()]:
         for name in names:
             yield os.path.join(root, name)
+
+def list_tts_voices():
+    voices = ["System default"]
+    if sys.platform == 'win32':
+        try:
+            cmd = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                "$s.GetInstalledVoices() | ForEach-Object { $_.VoiceInfo.Name }"
+            )
+            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, stderr=subprocess.DEVNULL, timeout=6, creationflags=0x08000000)
+            for line in out.splitlines():
+                name = line.strip()
+                if name and name not in voices:
+                    voices.append(name)
+        except Exception:
+            pass
+    elif sys.platform == 'darwin':
+        try:
+            out = subprocess.check_output(["say", "-v", "?"], text=True, stderr=subprocess.DEVNULL, timeout=6)
+            for line in out.splitlines():
+                name = line.split()[0].strip() if line.strip() else ""
+                if name and name not in voices:
+                    voices.append(name)
+        except Exception:
+            pass
+    return voices
+
+def list_audio_devices(kind="output"):
+    devices = ["System default"]
+    try:
+        import sounddevice as sd
+        for dev in sd.query_devices():
+            if kind == "input" and int(dev.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            if kind == "output" and int(dev.get("max_output_channels", 0) or 0) <= 0:
+                continue
+            name = str(dev.get("name", "") or "").strip()
+            if name and name not in devices:
+                devices.append(name)
+        return devices
+    except Exception:
+        pass
+    if sys.platform == 'win32':
+        try:
+            cmd = "Get-CimInstance Win32_SoundDevice | Select-Object -ExpandProperty Name"
+            out = subprocess.check_output(["powershell", "-NoProfile", "-Command", cmd], text=True, stderr=subprocess.DEVNULL, timeout=6, creationflags=0x08000000)
+            for line in out.splitlines():
+                name = line.strip()
+                if name and name not in devices:
+                    devices.append(name)
+        except Exception:
+            pass
+    return devices
+
+def set_choice_value(choice, value, fallback="System default"):
+    wanted = str(value or fallback)
+    idx = choice.FindString(wanted)
+    if idx == wx.NOT_FOUND:
+        idx = choice.FindString(fallback)
+    if idx == wx.NOT_FOUND and choice.GetCount():
+        idx = 0
+    if idx != wx.NOT_FOUND:
+        choice.SetSelection(idx)
+
+def chat_input_shortcut_hint():
+    if sys.platform == 'darwin':
+        return "Message input. Enter sends, Command+Enter, Option+Enter, or Shift+Enter inserts a new line, Control+Enter sends a file, and Control+Shift+Enter places a call."
+    return "Message input. Enter sends, Alt+Enter or Shift+Enter inserts a new line, Control+Enter sends a file, and Control+Shift+Enter places a call."
 
 def play_tts_audio_from_message(msg):
     try:
@@ -1689,7 +1773,8 @@ class SettingsDialog(wx.Dialog):
         if self._can_admin:
             notebook.AddPage(tab_admin, "Admin")
         sound_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "&Sound Pack")
-        call_audio_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "Call Audio Levels")
+        call_audio_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "Call Audio Devices and Levels")
+        tts_box = wx.StaticBoxSizer(wx.VERTICAL, tab_audio, "Text to Speech")
         accessibility_box = wx.StaticBoxSizer(wx.VERTICAL, tab_general, "&Chat Behavior")
         advanced_box = wx.StaticBoxSizer(wx.VERTICAL, tab_advanced, "Client Connection and Updater Configuration")
         admin_box = wx.StaticBoxSizer(wx.VERTICAL, tab_admin, "Server Console Settings")
@@ -1706,6 +1791,8 @@ class SettingsDialog(wx.Dialog):
             sound_box.GetStaticBox().SetBackgroundColour(dark_color)
             call_audio_box.GetStaticBox().SetForegroundColour(light_text_color)
             call_audio_box.GetStaticBox().SetBackgroundColour(dark_color)
+            tts_box.GetStaticBox().SetForegroundColour(light_text_color)
+            tts_box.GetStaticBox().SetBackgroundColour(dark_color)
             accessibility_box.GetStaticBox().SetForegroundColour(light_text_color)
             accessibility_box.GetStaticBox().SetBackgroundColour(dark_color)
             advanced_box.GetStaticBox().SetForegroundColour(light_text_color)
@@ -1722,16 +1809,28 @@ class SettingsDialog(wx.Dialog):
             self.choice.SetStringSelection(current_pack)
         else:
             self.choice.SetStringSelection('default')
-        self.default_soundpack_label = wx.StaticText(sound_box.GetStaticBox(), label=f"Current default pack: {self.config.get('default_soundpack', 'default')}")
-        self.set_selected_default_cb = wx.CheckBox(sound_box.GetStaticBox(), label="Set selected pack as default sound pack")
+        self.default_soundpack_label = wx.StaticText(sound_box.GetStaticBox(), label=f"Default pack follows selected pack: {self.choice.GetStringSelection() or 'default'}")
         self.choice.Bind(wx.EVT_CHOICE, self.on_sound_pack_changed)
         self.sound_volume_label = wx.StaticText(sound_box.GetStaticBox(), label="Sound pack volume")
         self.sound_volume_slider = wx.Slider(sound_box.GetStaticBox(), value=int(self.config.get('sound_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
 
+        input_devices = list_audio_devices("input")
+        output_devices = list_audio_devices("output")
+        self.call_input_device_choice = wx.Choice(call_audio_box.GetStaticBox(), choices=input_devices)
+        set_choice_value(self.call_input_device_choice, self.config.get('call_input_device', 'System default'))
+        self.call_output_device_choice = wx.Choice(call_audio_box.GetStaticBox(), choices=output_devices)
+        set_choice_value(self.call_output_device_choice, self.config.get('call_output_device', 'System default'))
         self.call_in_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Call input volume")
         self.call_input_slider = wx.Slider(call_audio_box.GetStaticBox(), value=int(self.config.get('call_input_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         self.call_out_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Call output volume")
         self.call_output_slider = wx.Slider(call_audio_box.GetStaticBox(), value=int(self.config.get('call_output_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
+        self.tts_engine_choice = wx.Choice(tts_box.GetStaticBox(), choices=["Screen reader first", "Windows or system voice"])
+        self.tts_engine_choice.SetSelection(1 if str(self.config.get('tts_engine', 'screen_reader')).lower() == 'windows_voice' else 0)
+        voices = list_tts_voices()
+        self.tts_voice_choice = wx.Choice(tts_box.GetStaticBox(), choices=voices)
+        set_choice_value(self.tts_voice_choice, self.config.get('tts_voice', 'System default'))
+        self.tts_rate_label = wx.StaticText(tts_box.GetStaticBox(), label="Speech rate")
+        self.tts_rate_slider = wx.Slider(tts_box.GetStaticBox(), value=int(self.config.get('tts_rate', 0)), minValue=-10, maxValue=10, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         self.auto_open_files_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Auto-open received files after save")
         self.auto_open_files_cb.SetValue(bool(self.config.get('auto_open_received_files', True)))
         self.read_aloud_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Read incoming chat messages aloud")
@@ -1866,13 +1965,22 @@ class SettingsDialog(wx.Dialog):
         undo_window_row.Add(self.message_undo_window_txt, 1, wx.EXPAND)
         sound_box.Add(self.choice, 0, wx.EXPAND | wx.ALL, 5)
         sound_box.Add(self.default_soundpack_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-        sound_box.Add(self.set_selected_default_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         sound_box.Add(self.sound_volume_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
         sound_box.Add(self.sound_volume_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_audio_box.Add(wx.StaticText(call_audio_box.GetStaticBox(), label="Call input device:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        call_audio_box.Add(self.call_input_device_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_audio_box.Add(wx.StaticText(call_audio_box.GetStaticBox(), label="Call output device:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        call_audio_box.Add(self.call_output_device_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         call_audio_box.Add(self.call_in_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
         call_audio_box.Add(self.call_input_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         call_audio_box.Add(self.call_out_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
         call_audio_box.Add(self.call_output_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        tts_box.Add(wx.StaticText(tts_box.GetStaticBox(), label="Read-aloud engine:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        tts_box.Add(self.tts_engine_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        tts_box.Add(wx.StaticText(tts_box.GetStaticBox(), label="Voice:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        tts_box.Add(self.tts_voice_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        tts_box.Add(self.tts_rate_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        tts_box.Add(self.tts_rate_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         accessibility_box.Add(self.auto_open_files_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.read_aloud_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.interrupt_speech_cb, 0, wx.ALL, 5)
@@ -1890,6 +1998,7 @@ class SettingsDialog(wx.Dialog):
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
         audio_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 8)
         audio_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        audio_sizer.Add(tts_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         tab_audio.SetSizer(audio_sizer)
 
         general_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -1930,10 +2039,12 @@ class SettingsDialog(wx.Dialog):
         if dark_mode_on:
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
             self.default_soundpack_label.SetForegroundColour(light_text_color)
-            self.set_selected_default_cb.SetForegroundColour(light_text_color)
             self.sound_volume_label.SetForegroundColour(light_text_color)
             self.call_in_label.SetForegroundColour(light_text_color)
             self.call_out_label.SetForegroundColour(light_text_color)
+            self.tts_rate_label.SetForegroundColour(light_text_color)
+            for ctrl in [self.call_input_device_choice, self.call_output_device_choice, self.tts_engine_choice, self.tts_voice_choice]:
+                ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
             self.advanced_hint.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb]:
@@ -1956,10 +2067,26 @@ class SettingsDialog(wx.Dialog):
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
         btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+        self._bind_checkbox_state_names()
         self.on_sound_pack_changed(None)
     def on_sound_pack_changed(self, _):
         selected = self.choice.GetStringSelection().strip().lower()
-        self.set_selected_default_cb.Enable(selected not in ("none", "default"))
+        self.default_soundpack_label.SetLabel(f"Default pack follows selected pack: {selected or 'default'}")
+    def _bind_checkbox_state_names(self):
+        for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.restart_after_save_cb, self.allow_cross_server_dm_cb]:
+            self._update_checkbox_state_name(cb)
+            cb.Bind(wx.EVT_CHECKBOX, self.on_checkbox_state_changed)
+    def _update_checkbox_state_name(self, cb):
+        base = str(cb.GetLabel() or "").split(" (", 1)[0]
+        state = "enabled" if cb.IsChecked() else "disabled"
+        cb.SetLabel(f"{base} ({state})")
+        cb.SetName(f"{base}, {state}")
+        cb.SetToolTip(f"{base} is {state}.")
+    def on_checkbox_state_changed(self, event):
+        cb = event.GetEventObject()
+        if isinstance(cb, wx.CheckBox):
+            self._update_checkbox_state_name(cb)
+        event.Skip()
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("settings", self)
@@ -2730,6 +2857,12 @@ class ClientApp(wx.App):
                     elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
                     elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
                     elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
+                    elif act == "voice_call_request": wx.CallAfter(self.frame.on_voice_call_request, msg)
+                    elif act == "voice_call_event": wx.CallAfter(self.frame.on_voice_call_event, msg)
+                    elif act == "voice_call_result": wx.CallAfter(self.frame.on_voice_call_result, msg)
+                    elif act == "voice_call_signal": wx.CallAfter(self.frame.on_voice_call_signal, msg)
+                    elif act == "voice_call_signal_result": wx.CallAfter(self.frame.on_voice_call_signal_result, msg)
+                    elif act == "voice_call_voicemail": wx.CallAfter(self.frame.on_voice_call_voicemail, msg)
                     elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
                     elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
                 except Exception as dispatch_err:
@@ -4947,11 +5080,16 @@ class MainFrame(wx.Frame):
             if dlg.ShowModal() == wx.ID_OK:
                 selected_pack = dlg.choice.GetStringSelection()
                 app.user_config['soundpack'] = selected_pack
-                if dlg.set_selected_default_cb.IsChecked() and selected_pack not in ("default", "none"):
+                if selected_pack and selected_pack != "none":
                     app.user_config['default_soundpack'] = selected_pack
                 app.user_config['sound_volume'] = int(dlg.sound_volume_slider.GetValue())
                 app.user_config['call_input_volume'] = int(dlg.call_input_slider.GetValue())
                 app.user_config['call_output_volume'] = int(dlg.call_output_slider.GetValue())
+                app.user_config['call_input_device'] = dlg.call_input_device_choice.GetStringSelection() or 'System default'
+                app.user_config['call_output_device'] = dlg.call_output_device_choice.GetStringSelection() or 'System default'
+                app.user_config['tts_engine'] = 'windows_voice' if dlg.tts_engine_choice.GetSelection() == 1 else 'screen_reader'
+                app.user_config['tts_voice'] = dlg.tts_voice_choice.GetStringSelection() or 'System default'
+                app.user_config['tts_rate'] = int(dlg.tts_rate_slider.GetValue())
                 app.user_config['auto_open_received_files'] = dlg.auto_open_files_cb.IsChecked()
                 app.user_config['read_messages_aloud'] = dlg.read_aloud_cb.IsChecked()
                 app.user_config['interrupt_speech'] = dlg.interrupt_speech_cb.IsChecked()
@@ -5496,6 +5634,69 @@ class MainFrame(wx.Frame):
     def on_group_call_signal_result(self, msg):
         if self._group_call_dlg and self._group_call_dlg.IsShown():
             self._group_call_dlg.handle_signal_result(msg)
+    def _chat_for_call_peer(self, peer):
+        peer = str(peer or "").strip()
+        if not peer:
+            return None
+        app = wx.GetApp()
+        is_logging_enabled = is_chat_logging_enabled(app.user_config, peer)
+        is_contact = peer in self.contact_states
+        dlg = self.get_chat(peer)
+        if not dlg:
+            dlg = ChatDialog(
+                self,
+                peer,
+                self.sock,
+                self.user,
+                is_logging_enabled,
+                is_contact=is_contact,
+                can_call=self.can_use_voice_call(),
+                show_call=self.is_voice_call_visible(),
+            )
+        return dlg
+    def on_voice_call_request(self, msg):
+        caller = str(msg.get("from") or msg.get("caller") or "").strip()
+        dlg = self._chat_for_call_peer(caller)
+        if not dlg:
+            return
+        dlg.Show()
+        dlg.handle_voice_call_request(msg)
+        wx.GetApp().play_sound("incoming_call.wav")
+        show_notification("Incoming Call", f"{self.format_user_label(caller)} is calling.", timeout=8)
+    def on_voice_call_event(self, msg):
+        peer = str(msg.get("from") or msg.get("by") or "").strip()
+        if peer == self.user:
+            participants = [p for p in msg.get("participants", []) if p != self.user]
+            peer = participants[0] if participants else ""
+        dlg = self._chat_for_call_peer(peer)
+        if dlg:
+            dlg.handle_voice_call_event(msg)
+    def on_voice_call_result(self, msg):
+        peer = str(msg.get("to") or msg.get("callee") or msg.get("caller") or "").strip()
+        if peer == self.user:
+            participants = [p for p in msg.get("participants", []) if p != self.user]
+            peer = participants[0] if participants else ""
+        dlg = self._chat_for_call_peer(peer)
+        if dlg:
+            dlg.handle_voice_call_result(msg)
+    def on_voice_call_signal(self, msg):
+        peer = str(msg.get("from") or "").strip()
+        dlg = self._chat_for_call_peer(peer)
+        if dlg:
+            dlg.handle_voice_call_signal(msg)
+    def on_voice_call_signal_result(self, msg):
+        peer = str(msg.get("to") or "").strip()
+        dlg = self._chat_for_call_peer(peer)
+        if dlg:
+            dlg.handle_voice_call_signal_result(msg)
+    def on_voice_call_voicemail(self, msg):
+        sender = str(msg.get("from") or "").strip()
+        dlg = self._chat_for_call_peer(sender)
+        if not dlg:
+            return
+        dlg.Show()
+        dlg.append("Voicemail received. Playback from chat history will be added when recorded voicemail storage is enabled.", sender, msg.get("time", datetime.datetime.now().isoformat()))
+        wx.GetApp().play_sound("receive.wav")
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -6414,7 +6615,7 @@ class ChatDialog(wx.Dialog):
                 title_contact = parent.format_user_label(contact, include_username=True)
         except Exception:
             title_contact = contact
-        super().__init__(parent, title=f"Chat with {title_contact}", size=(450, 450))
+        super().__init__(parent, title=f"Chat with {title_contact}", size=(560, 620))
         self.contact, self.sock, self.user = contact, sock, user
         self.is_contact = bool(is_contact)
         self.remote_server_entry = remote_server_entry
@@ -6426,6 +6627,9 @@ class ChatDialog(wx.Dialog):
         self._last_deleted_message = None
         self._last_escape_ts = 0.0
         self._allow_close_once = False
+        self._active_call_id = ""
+        self._call_state = "idle"
+        self._call_is_incoming = False
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.Bind(wx.EVT_CLOSE, self.on_close)
         self.Bind(wx.EVT_SHOW, self.on_show_dialog)
@@ -6454,6 +6658,39 @@ class ChatDialog(wx.Dialog):
         self.hist.Bind(wx.EVT_CONTEXT_MENU, self.on_history_context_menu)
         self.typing_lbl = wx.StaticText(self, label="")
         self.typing_lbl.SetForegroundColour(wx.Colour(120, 180, 255))
+        call_box = wx.StaticBoxSizer(wx.VERTICAL, self, "Voice Call")
+        self.call_status_lbl = wx.StaticText(call_box.GetStaticBox(), label="No active call.")
+        self.call_status_lbl.Wrap(420)
+        call_device_row = wx.BoxSizer(wx.HORIZONTAL)
+        call_device_row.Add(wx.StaticText(call_box.GetStaticBox(), label="Input:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.call_input_choice = wx.Choice(call_box.GetStaticBox(), choices=list_audio_devices("input"))
+        set_choice_value(self.call_input_choice, wx.GetApp().user_config.get('call_input_device', 'System default'))
+        call_device_row.Add(self.call_input_choice, 1, wx.RIGHT, 6)
+        call_device_row.Add(wx.StaticText(call_box.GetStaticBox(), label="Output:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.call_output_choice = wx.Choice(call_box.GetStaticBox(), choices=list_audio_devices("output"))
+        set_choice_value(self.call_output_choice, wx.GetApp().user_config.get('call_output_device', 'System default'))
+        call_device_row.Add(self.call_output_choice, 1)
+        call_volume_row = wx.BoxSizer(wx.HORIZONTAL)
+        call_volume_row.Add(wx.StaticText(call_box.GetStaticBox(), label="Mic:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.call_input_volume_slider = wx.Slider(call_box.GetStaticBox(), value=int(wx.GetApp().user_config.get('call_input_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL)
+        call_volume_row.Add(self.call_input_volume_slider, 1, wx.RIGHT, 6)
+        call_volume_row.Add(wx.StaticText(call_box.GetStaticBox(), label="Speaker:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+        self.call_output_volume_slider = wx.Slider(call_box.GetStaticBox(), value=int(wx.GetApp().user_config.get('call_output_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL)
+        call_volume_row.Add(self.call_output_volume_slider, 1)
+        call_button_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_answer_call = wx.Button(call_box.GetStaticBox(), label="Answer Call")
+        self.btn_decline_call = wx.Button(call_box.GetStaticBox(), label="Decline Call")
+        self.btn_end_call = wx.Button(call_box.GetStaticBox(), label="End Call")
+        self.btn_answer_call.Bind(wx.EVT_BUTTON, self.on_answer_call)
+        self.btn_decline_call.Bind(wx.EVT_BUTTON, self.on_decline_call)
+        self.btn_end_call.Bind(wx.EVT_BUTTON, self.on_end_call)
+        call_button_row.Add(self.btn_answer_call, 1, wx.RIGHT, 5)
+        call_button_row.Add(self.btn_decline_call, 1, wx.LEFT | wx.RIGHT, 5)
+        call_button_row.Add(self.btn_end_call, 1, wx.LEFT, 5)
+        call_box.Add(self.call_status_lbl, 0, wx.EXPAND | wx.ALL, 5)
+        call_box.Add(call_device_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_box.Add(call_volume_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_box.Add(call_button_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "Type &message")
         self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER)
         self._consume_next_text_enter = False
@@ -6466,10 +6703,17 @@ class ChatDialog(wx.Dialog):
         apply_voiceover_hint(self.btn_call, "Place a voice call to this contact.")
         apply_voiceover_hint(btn_saved, "Show saved messages grouped by date.")
         apply_voiceover_hint(self.btn_add_contact, "Add this person to your contacts.")
-        apply_voiceover_hint(self.input_ctrl, "Message input. Enter sends, Command+Enter inserts a new line, Control+Enter sends file.")
+        apply_voiceover_hint(self.input_ctrl, chat_input_shortcut_hint())
 
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
+            call_box.GetStaticBox().SetForegroundColour(light_text_color)
+            call_box.GetStaticBox().SetBackgroundColour(dark_color)
+            self.call_status_lbl.SetForegroundColour(light_text_color)
+            for ctrl in [self.call_input_choice, self.call_output_choice]:
+                ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
+            for b in [self.btn_answer_call, self.btn_decline_call, self.btn_end_call]:
+                b.SetBackgroundColour(dark_color); b.SetForegroundColour(light_text_color)
             box_msg.GetStaticBox().SetForegroundColour(light_text_color)
             box_msg.GetStaticBox().SetBackgroundColour(dark_color)
             self.input_ctrl.SetBackgroundColour(dark_color); self.input_ctrl.SetForegroundColour(light_text_color)
@@ -6480,6 +6724,8 @@ class ChatDialog(wx.Dialog):
 
         s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5)
         s.Add(self.typing_lbl, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        self.call_box = call_box
+        s.Add(self.call_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         self.input_ctrl.Bind(wx.EVT_KEY_DOWN, self.on_input_key)
         self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_text_enter)
         self.input_ctrl.Bind(wx.EVT_TEXT, self.on_input_text)
@@ -6498,6 +6744,7 @@ class ChatDialog(wx.Dialog):
         s.Add(btn_sizer, 0, wx.EXPAND|wx.ALL, 5)
         self.SetSizer(s)
         self.apply_call_permissions(self._can_call, self._show_call)
+        self._set_call_panel_visible(False)
         self._focus_input()
     def apply_call_permissions(self, can_call, show_call):
         self._can_call = bool(can_call)
@@ -6509,6 +6756,108 @@ class ChatDialog(wx.Dialog):
             self.btn_call.Show(self._show_call)
             self.btn_call.Enable(self._can_call and self._show_call)
             self.GetSizer().Layout()
+    def _set_call_panel_visible(self, visible):
+        if hasattr(self, "call_box"):
+            self.GetSizer().Show(self.call_box, bool(visible), recursive=True)
+            self.GetSizer().Layout()
+            self.Layout()
+    def _set_call_status(self, text, speak=False):
+        self.call_status_lbl.SetLabel(str(text or ""))
+        self.call_status_lbl.Wrap(420)
+        self.call_status_lbl.SetName(str(text or ""))
+        if speak:
+            speak_text(str(text or ""), interrupt=True)
+        self.GetSizer().Layout()
+    def _sync_call_audio_preferences(self):
+        app = wx.GetApp()
+        app.user_config['call_input_device'] = self.call_input_choice.GetStringSelection() or 'System default'
+        app.user_config['call_output_device'] = self.call_output_choice.GetStringSelection() or 'System default'
+        app.user_config['call_input_volume'] = int(self.call_input_volume_slider.GetValue())
+        app.user_config['call_output_volume'] = int(self.call_output_volume_slider.GetValue())
+        save_user_config(app.user_config)
+    def _update_call_buttons(self):
+        incoming = self._call_is_incoming and self._call_state == "ringing"
+        active_or_ringing = self._call_state in ("ringing", "active")
+        self.btn_answer_call.Show(incoming)
+        self.btn_decline_call.Show(incoming)
+        self.btn_end_call.Show(active_or_ringing and not incoming)
+        self.btn_end_call.Enable(active_or_ringing)
+        self.btn_answer_call.Enable(incoming)
+        self.btn_decline_call.Enable(incoming)
+        self.GetSizer().Layout()
+    def _clear_call_state(self, status="No active call.", play_end=True):
+        self._active_call_id = ""
+        self._call_state = "idle"
+        self._call_is_incoming = False
+        self._set_call_status(status, speak=False)
+        self._set_call_panel_visible(False)
+        if play_end:
+            wx.GetApp().play_sound("end_call.wav")
+    def handle_voice_call_request(self, msg):
+        self._active_call_id = str(msg.get("call_id", "") or "")
+        self._call_state = "ringing"
+        self._call_is_incoming = True
+        self._set_call_panel_visible(True)
+        self._set_call_status(f"Incoming call from {self.contact}. Choose Answer Call or Decline Call.", speak=True)
+        self._update_call_buttons()
+    def handle_voice_call_result(self, msg):
+        if not msg.get("ok", False):
+            self._clear_call_state(f"Call failed: {msg.get('reason', 'unknown error')}", play_end=False)
+            self.append_error(msg.get("reason", "Call failed."))
+            return
+        self._active_call_id = str(msg.get("call_id", "") or self._active_call_id)
+        self._call_state = str(msg.get("state", "ringing") or "ringing")
+        self._call_is_incoming = False
+        self._set_call_panel_visible(True)
+        self._set_call_status(f"Calling {self.contact}. Waiting for an answer.", speak=False)
+        self._update_call_buttons()
+    def handle_voice_call_event(self, msg):
+        event = str(msg.get("event", "") or "")
+        by = str(msg.get("by", "") or "")
+        self._active_call_id = str(msg.get("call_id", "") or self._active_call_id)
+        if event == "accepted":
+            self._call_state = "active"
+            self._call_is_incoming = False
+            self._set_call_panel_visible(True)
+            self._set_call_status(f"Call with {self.contact} is active. Audio transport will use the selected devices when media streaming is enabled.", speak=True)
+            self._update_call_buttons()
+        elif event in ("declined", "ended"):
+            label = "declined" if event == "declined" else "ended"
+            self._clear_call_state(f"Call {label} by {by or self.contact}.", play_end=True)
+            self.append(f"Call {label}.", "System", datetime.datetime.now().isoformat())
+    def handle_voice_call_signal(self, msg):
+        self.append(f"Call signal received: {msg.get('signal_type', 'unknown')}.", "System", datetime.datetime.now().isoformat())
+    def handle_voice_call_signal_result(self, msg):
+        if not msg.get("ok", False):
+            self.append_error(msg.get("reason", "Call signal failed."))
+    def on_answer_call(self, _):
+        if not self._active_call_id:
+            return
+        self._sync_call_audio_preferences()
+        try:
+            self.sock.sendall((json.dumps({"action": "voice_call_accept", "call_id": self._active_call_id}) + "\n").encode())
+            self._call_state = "active"
+            self._call_is_incoming = False
+            self._set_call_status(f"Call with {self.contact} is active. Audio devices are ready for streaming.", speak=True)
+            self._update_call_buttons()
+        except Exception as e:
+            self.append_error(f"Could not answer call: {e}")
+    def on_decline_call(self, _):
+        if not self._active_call_id:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "voice_call_decline", "call_id": self._active_call_id}) + "\n").encode())
+        except Exception:
+            pass
+        self._clear_call_state("Call declined.", play_end=True)
+    def on_end_call(self, _):
+        if not self._active_call_id:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "voice_call_end", "call_id": self._active_call_id}) + "\n").encode())
+        except Exception:
+            pass
+        self._clear_call_state("Call ended.", play_end=True)
     def _is_logging_enabled_now(self):
         app = wx.GetApp()
         try:
@@ -6749,9 +7098,19 @@ class ChatDialog(wx.Dialog):
             return
         # Dedicated call action; kept separate from Enter so Enter behavior remains user-configurable.
         try:
-            self.sock.sendall((json.dumps({"action": "voice_call_request", "to": self.contact}) + "\n").encode())
+            self._sync_call_audio_preferences()
+            call_id = uuid.uuid4().hex
+            self._active_call_id = call_id
+            self._call_state = "ringing"
+            self._call_is_incoming = False
+            self._set_call_panel_visible(True)
+            self._set_call_status(f"Calling {self.contact}. Waiting for an answer.", speak=False)
+            self._update_call_buttons()
+            wx.GetApp().play_sound("outgoing_call.wav")
+            self.sock.sendall((json.dumps({"action": "voice_call_request", "to": self.contact, "call_id": call_id}) + "\n").encode())
             show_notification("Calling", f"Placing call to {self.contact}...", timeout=4)
         except Exception as e:
+            self._clear_call_state("Call could not be started.", play_end=False)
             wx.MessageBox(f"This server does not support voice calling yet.\n\n{e}", "Feature Not Supported", wx.OK | wx.ICON_INFORMATION)
     def _handle_enter_action(self):
         action = str(wx.GetApp().user_config.get('enter_key_action', 'send') or 'send')

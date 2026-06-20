@@ -19,6 +19,7 @@ a = Analysis(
         'keyring.backends.Windows',
         'plyer',
         'winotify',
+        'sounddevice',
         'accessible_output2',
     ],
     hookspath=[],
