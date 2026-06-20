@@ -49,6 +49,9 @@ Source: "assets\videos\*"; DestDir: "{app}\assets\videos"; Flags: ignoreversion 
 
 [InstallDelete]
 Type: files; Name: "{app}\client.conf"
+Type: filesandordirs; Name: "{app}\_internal"
+Type: filesandordirs; Name: "{app}\sounds"
+Type: filesandordirs; Name: "{app}\assets"
 Type: filesandordirs; Name: "{commonpf32}\Thrive\Thrive Messenger"
 Type: files; Name: "{commondesktop}\Thrive Messenger.lnk"
 Type: files; Name: "{userdesktop}\Thrive Messenger.lnk"
