@@ -29,6 +29,8 @@ Server-side bot voice playback may use Piper locally or ElevenLabs when the serv
 
 The same output gate applies before speech generation. If a reply contains tool JSON, provider errors, schema dumps, message metadata, or internal routing code, the server must not send it as text and must not synthesize it as audio.
 
+Generated or cloned bot voices should also be exportable for offline use where licensing allows it. The preferred fallback order is ElevenLabs when online and configured, a local cloned/offline Clawdia voice for Windows or server-side playback when available, Piper/local neural voice next, and system TTS only as the final fallback. Offline voice files must be stored outside source control unless they are explicitly redistributable assets.
+
 Useful source material for future bot improvements:
 
 - OpenAI Agents guidance: agents should combine instructions, tools, handoffs, guardrails, and state for multi-step work.
