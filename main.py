@@ -4573,6 +4573,8 @@ class MainFrame(wx.Frame):
     def _build_menu_bar(self):
         menubar = wx.MenuBar()
         file_menu = wx.Menu()
+        self.mi_file_check_updates = file_menu.Append(wx.ID_ANY, "Check for Updates\tAlt+P")
+        file_menu.AppendSeparator()
         conversations_menu = wx.Menu()
         self.mi_start_chat = conversations_menu.Append(wx.ID_ANY, "Start Chat\tReturn")
         self.mi_send_file = conversations_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
@@ -4635,6 +4637,8 @@ class MainFrame(wx.Frame):
 
         help_menu = wx.Menu()
         self.mi_help = help_menu.Append(wx.ID_ANY, "Help\tF1")
+        self.mi_help_check_updates = help_menu.Append(wx.ID_ANY, "Check for Updates")
+        help_menu.AppendSeparator()
         demo_menu = wx.Menu()
         self.mi_demo_onboarding = demo_menu.Append(wx.ID_ANY, "Watch Onboarding Demo")
         self.mi_demo_chat_files = demo_menu.Append(wx.ID_ANY, "Watch Chat and File Demo")
@@ -4669,6 +4673,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_toggle_autologin, self.mi_autologin)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
+        self.Bind(wx.EVT_MENU, self.on_check_updates, self.mi_file_check_updates)
         self.Bind(wx.EVT_MENU, self.on_check_updates, self.mi_check_updates)
         self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_block_toggle)
         self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, self.mi_toggle_chat_log)
@@ -4687,6 +4692,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("name_desc"), self.mi_sort_name_desc)
         self.Bind(wx.EVT_MENU, lambda e: self._set_sort_mode("status"), self.mi_sort_status)
         self.Bind(wx.EVT_MENU, lambda e: open_help_docs_for_context("main", self), self.mi_help)
+        self.Bind(wx.EVT_MENU, self.on_check_updates, self.mi_help_check_updates)
         self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("onboarding"), self.mi_demo_onboarding)
         self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("chat_files"), self.mi_demo_chat_files)
         self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("admin_tools"), self.mi_demo_admin_tools)
