@@ -25,8 +25,8 @@ bot_runtime_config = {}
 wordpress_config = {}
 shutdown_timeout = 5
 max_status_length = 50
-max_direct_message_length = 20000
-max_bot_reply_length = 4000
+max_direct_message_length = 100000
+max_bot_reply_length = 20000
 pending_transfers = {}
 transfer_lock = threading.Lock()
 server_port = 0
@@ -54,6 +54,8 @@ restart_lock = threading.Lock()
 restart_scheduled_for = None
 group_call_sessions = {}
 group_call_lock = threading.Lock()
+direct_call_sessions = {}
+direct_call_lock = threading.Lock()
 FEATURE_DEFAULTS = {
     "bots": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot contacts and bot chat features."},
     "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
@@ -61,6 +63,7 @@ FEATURE_DEFAULTS = {
     "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
     "group_chat": {"enabled": False, "ui_visible": False, "scope": "admin", "description": "Reserved for future group chat create/join/send features."},
     "group_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group call session and signaling features."},
+    "voice_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Direct voice call session and signaling features."},
     "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
     "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Server side admin command console."},
     "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Server manager and server tools UI."},
@@ -195,6 +198,40 @@ def _message_too_long(text, max_chars):
     except Exception:
         return False
     return max_chars > 0 and len(str(text or "")) > max_chars
+
+def _split_outgoing_text(text, max_chars):
+    text = str(text or "")
+    try:
+        max_chars = int(max_chars)
+    except Exception:
+        max_chars = 0
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        cut = max(
+            window.rfind("\n\n"),
+            window.rfind("\n"),
+            window.rfind(". "),
+            window.rfind("! "),
+            window.rfind("? "),
+            window.rfind("; "),
+            window.rfind(", "),
+            window.rfind(" "),
+        )
+        if cut < max_chars // 2:
+            cut = max_chars
+        else:
+            cut += 1
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining.strip():
+        chunks.append(remaining.strip())
+    return chunks
 
 def _normalize_identity_token(value):
     token = str(value or "").strip()
@@ -506,6 +543,71 @@ def _remove_user_from_all_group_calls(username):
                 group_call_sessions.pop(g, None)
     for g, payload in events:
         _group_call_broadcast(g, payload, exclude=username)
+
+def _direct_call_snapshot(call_id):
+    with direct_call_lock:
+        data = direct_call_sessions.get(call_id) or {}
+        participants = sorted(list(data.get("participants", set())), key=lambda x: x.lower())
+        return {
+            "call_id": call_id,
+            "participants": participants,
+            "caller": data.get("caller", ""),
+            "callee": data.get("callee", ""),
+            "state": data.get("state", "ended"),
+            "mode": data.get("mode", "voice"),
+            "started_at": data.get("started_at", ""),
+        }
+
+def _send_to_user(username, payload):
+    with lock:
+        target_sock = clients.get(username)
+    if not target_sock:
+        return False
+    try:
+        _send_json_line(target_sock, payload)
+        return True
+    except Exception:
+        return False
+
+def _direct_call_broadcast(call_id, payload, exclude=None):
+    with direct_call_lock:
+        participants = list((direct_call_sessions.get(call_id) or {}).get("participants", set()))
+    ok = False
+    for uname in participants:
+        if exclude and uname == exclude:
+            continue
+        ok = _send_to_user(uname, payload) or ok
+    return ok
+
+def _remove_user_from_all_direct_calls(username):
+    events = []
+    with direct_call_lock:
+        for call_id, data in list(direct_call_sessions.items()):
+            participants = set(data.get("participants", set()))
+            if username not in participants:
+                continue
+            data["state"] = "ended"
+            data["ended_at"] = datetime.datetime.utcnow().isoformat()
+            payload = {
+                "action": "voice_call_event",
+                "event": "ended",
+                "by": username,
+                "reason": "disconnected",
+                "call_id": call_id,
+                "participants": sorted(list(participants), key=lambda x: x.lower()),
+                "caller": data.get("caller", ""),
+                "callee": data.get("callee", ""),
+                "state": "ended",
+                "mode": data.get("mode", "voice"),
+                "started_at": data.get("started_at", ""),
+            }
+            events.append((participants, payload))
+            direct_call_sessions.pop(call_id, None)
+    for participants, payload in events:
+        for target in participants:
+            if target != username:
+                _send_to_user(target, payload)
+
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
 
@@ -1243,21 +1345,27 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         reply = _natural_blocked_reply(sender_user, to_user, reason)
         if not reply:
             return True
-    tts_payload = _build_bot_tts_payload(to_user, reply, text)
-    payload = {
-        "action": "msg",
-        "from": to_user,
-        "to": sender_user,
-        "time": datetime.datetime.now().isoformat(),
-        "msg": reply,
-    }
-    if tts_payload:
-        payload.update(tts_payload)
     _record_bot_memory(sender_user, to_user, "assistant", reply)
-    try:
-        sender_sock.sendall((json.dumps(payload) + "\n").encode())
-    except Exception:
-        pass
+    chunks = _split_outgoing_text(reply, max_bot_reply_length)
+    total = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        display_chunk = chunk if total == 1 else f"Part {idx} of {total}: {chunk}"
+        tts_payload = _build_bot_tts_payload(to_user, display_chunk, text) if idx == 1 else None
+        payload = {
+            "action": "msg",
+            "from": to_user,
+            "to": sender_user,
+            "time": datetime.datetime.now().isoformat(),
+            "msg": display_chunk,
+        }
+        if tts_payload:
+            payload.update(tts_payload)
+        try:
+            sender_sock.sendall((json.dumps(payload) + "\n").encode())
+            if total > 1:
+                time.sleep(0.15)
+        except Exception:
+            break
     return True
 
 def _ollama_bot_reply(sender_user, bot_name, text):
@@ -1383,7 +1491,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
                 "recent_context": _bot_memory_context(sender_user, bot_name, limit=6),
             })
             return None
-        return _limit_text(content, max_bot_reply_length)
+        return _limit_text(content, max_bot_reply_length * 5)
     except Exception as e:
         print(f"Ollama bot reply failed for {bot_name}: {e}")
         _append_agent_task("model_repair_needed", {
@@ -1785,8 +1893,8 @@ def load_config():
     global max_status_length
     max_status_length = config.getint('server', 'max_status_length', fallback=50)
     global max_direct_message_length, max_bot_reply_length
-    max_direct_message_length = max(1000, config.getint('server', 'max_direct_message_length', fallback=20000))
-    max_bot_reply_length = max(500, config.getint('bots', 'max_reply_length', fallback=4000))
+    max_direct_message_length = max(1000, config.getint('server', 'max_direct_message_length', fallback=100000))
+    max_bot_reply_length = max(500, config.getint('bots', 'max_reply_length', fallback=20000))
     global server_identity
     server_identity = config.get('server', 'name', fallback=config.get('server', 'host', fallback='Server'))
     global welcome_config
@@ -3688,6 +3796,123 @@ def handle_client(cs, addr):
                 except Exception:
                     sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Signal relay failed."}) + "\n").encode())
 
+            elif action == "voice_call_request":
+                if not _can_user_use_feature(user, "voice_call"):
+                    _deny_feature("voice_call", "voice_call_result")
+                    continue
+                target = str(msg.get("to", "")).strip()
+                mode = str(msg.get("mode", "voice") or "voice").strip().lower()
+                if mode not in ("voice", "video"):
+                    mode = "voice"
+                if not target or target == user:
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": False, "reason": "Choose another online contact to call."})
+                    continue
+                with lock:
+                    target_sock = clients.get(target)
+                if not target_sock:
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": False, "to": target, "reason": f"{target} is offline."})
+                    continue
+                call_id = str(msg.get("call_id", "") or uuid.uuid4().hex)
+                now = datetime.datetime.utcnow().isoformat()
+                with direct_call_lock:
+                    direct_call_sessions[call_id] = {
+                        "caller": user,
+                        "callee": target,
+                        "participants": {user, target},
+                        "state": "ringing",
+                        "mode": mode,
+                        "started_at": now,
+                    }
+                snapshot = _direct_call_snapshot(call_id)
+                _send_json_line(sock, {"action": "voice_call_result", "ok": True, "event": "ringing", **snapshot})
+                _send_to_user(target, {"action": "voice_call_request", "from": user, **snapshot})
+
+            elif action == "voice_call_accept":
+                call_id = str(msg.get("call_id", "")).strip()
+                data = None
+                with direct_call_lock:
+                    data = direct_call_sessions.get(call_id)
+                    if data and user in data.get("participants", set()):
+                        data["state"] = "active"
+                        data["accepted_by"] = user
+                        data["accepted_at"] = datetime.datetime.utcnow().isoformat()
+                    else:
+                        data = None
+                if not call_id or not data:
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": False, "reason": "Call is no longer available."})
+                    continue
+                payload = {"action": "voice_call_event", "event": "accepted", "by": user}
+                payload.update(_direct_call_snapshot(call_id))
+                _direct_call_broadcast(call_id, payload)
+
+            elif action in ("voice_call_decline", "voice_call_end"):
+                call_id = str(msg.get("call_id", "")).strip()
+                event_name = "declined" if action == "voice_call_decline" else "ended"
+                with direct_call_lock:
+                    data = direct_call_sessions.get(call_id)
+                    if data and user in data.get("participants", set()):
+                        participants = set(data.get("participants", set()))
+                        payload = {
+                            "action": "voice_call_event",
+                            "event": event_name,
+                            "by": user,
+                            "call_id": call_id,
+                            "participants": sorted(list(participants), key=lambda x: x.lower()),
+                            "caller": data.get("caller", ""),
+                            "callee": data.get("callee", ""),
+                            "state": "ended",
+                            "mode": data.get("mode", "voice"),
+                            "started_at": data.get("started_at", ""),
+                        }
+                        direct_call_sessions.pop(call_id, None)
+                    else:
+                        payload = None
+                if not payload:
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": False, "reason": "Call is no longer available."})
+                    continue
+                for target in payload.get("participants", []):
+                    _send_to_user(target, payload)
+
+            elif action == "voice_call_signal":
+                if not _can_user_use_feature(user, "voice_call"):
+                    _deny_feature("voice_call", "voice_call_signal_result")
+                    continue
+                call_id = str(msg.get("call_id", "")).strip()
+                target = str(msg.get("to", "")).strip()
+                signal_type = str(msg.get("signal_type", "")).strip()
+                signal_data = msg.get("data", {})
+                with direct_call_lock:
+                    data = direct_call_sessions.get(call_id) or {}
+                    participants = set(data.get("participants", set()))
+                if not call_id or user not in participants or target not in participants:
+                    _send_json_line(sock, {"action": "voice_call_signal_result", "ok": False, "reason": "Call participant not found."})
+                    continue
+                if _send_to_user(target, {"action": "voice_call_signal", "call_id": call_id, "from": user, "signal_type": signal_type, "data": signal_data}):
+                    _send_json_line(sock, {"action": "voice_call_signal_result", "ok": True, "call_id": call_id, "to": target})
+                else:
+                    _send_json_line(sock, {"action": "voice_call_signal_result", "ok": False, "reason": f"{target} is offline."})
+
+            elif action == "voice_call_voicemail":
+                if not _can_user_use_feature(user, "voice_call"):
+                    _deny_feature("voice_call", "voice_call_result")
+                    continue
+                target = str(msg.get("to", "")).strip()
+                if not target:
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": False, "reason": "Missing voicemail recipient."})
+                    continue
+                payload = {
+                    "action": "voice_call_voicemail",
+                    "from": user,
+                    "time": datetime.datetime.utcnow().isoformat(),
+                    "audio_b64": str(msg.get("audio_b64", "") or ""),
+                    "mime": str(msg.get("mime", "audio/wav") or "audio/wav"),
+                    "duration_seconds": msg.get("duration_seconds", 0),
+                }
+                if not _send_to_user(target, payload):
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": False, "reason": f"{target} is offline. Voicemail storage is not enabled on this server yet."})
+                else:
+                    _send_json_line(sock, {"action": "voice_call_result", "ok": True, "event": "voicemail_sent", "to": target})
+
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]
                 message_text = str(msg.get("msg", "") or "")
@@ -3905,6 +4130,7 @@ def handle_client(cs, addr):
             session_preferences.pop(sock, None)
         _cleanup_bot_session(user)
         if user:
+            _remove_user_from_all_direct_calls(user)
             _remove_user_from_all_group_calls(user)
             broadcast_contact_status(user, False)
 
