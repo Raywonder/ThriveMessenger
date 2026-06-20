@@ -6,7 +6,12 @@ try:
     import wx.html2 as wxhtml2
 except Exception:
     wxhtml2 = None
+try:
+    import wx.media as wxmedia
+except Exception:
+    wxmedia = None
 
+_active_tts_media = []
 VERSION_TAG = "v2026-alpha15.5"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
@@ -928,8 +933,10 @@ def play_tts_audio_from_message(msg):
             return False
         tts_dir = os.path.join(get_config_dir(), "tts_cache")
         os.makedirs(tts_dir, exist_ok=True)
-        voice_name = str(msg.get("tts_voice", "bot")).strip().replace("/", "_")
-        path = os.path.join(tts_dir, f"{voice_name}-{uuid.uuid4().hex}.wav")
+        voice_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(msg.get("tts_voice", "bot")).strip() or "bot")
+        mime = str(msg.get("tts_mime", "audio/wav") or "audio/wav").lower()
+        ext = ".mp3" if "mpeg" in mime or "mp3" in mime else ".wav"
+        path = os.path.join(tts_dir, f"{voice_name}-{uuid.uuid4().hex}{ext}")
         with open(path, "wb") as f:
             f.write(audio)
         sound = wx.adv.Sound(path)
@@ -937,6 +944,40 @@ def play_tts_audio_from_message(msg):
             sound.Play(wx.adv.SOUND_ASYNC)
             threading.Timer(25.0, lambda: os.path.exists(path) and os.remove(path)).start()
             return True
+        if ext != ".wav" and wxmedia is not None:
+            try:
+                frame = wx.Frame(None, title="Thrive Messenger voice playback", size=(1, 1))
+                frame.Hide()
+                media = wxmedia.MediaCtrl(frame)
+                if media.Load(path):
+                    _active_tts_media.append((frame, media, path))
+                    media.Play()
+                    def _cleanup_media():
+                        try:
+                            media.Stop()
+                        except Exception:
+                            pass
+                        try:
+                            frame.Destroy()
+                        except Exception:
+                            pass
+                        try:
+                            _active_tts_media[:] = [item for item in _active_tts_media if item[2] != path]
+                        except Exception:
+                            pass
+                        try:
+                            if os.path.exists(path):
+                                os.remove(path)
+                        except Exception:
+                            pass
+                    wx.CallLater(30000, _cleanup_media)
+                    return True
+                try:
+                    frame.Destroy()
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Bot media TTS playback failed: {e}")
         try:
             os.remove(path)
         except Exception:

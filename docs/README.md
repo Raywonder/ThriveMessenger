@@ -22,6 +22,12 @@ Good chatbot behavior is practical, warm, and context-aware:
 - Maintain guardrails. Refuse unsafe or unauthorized actions, but explain the next safe option in plain language.
 - Recover gracefully. If a model, tool, or gateway path fails, queue repair/fallback work silently where safe and continue from the latest messages once a real reply is available.
 
+## Bot Voices And TTS
+
+Server-side bot voice playback may use Piper locally or ElevenLabs when the server is configured for it. ElevenLabs must be enabled through `[bots] elevenlabs_enabled = true`, a voice id such as `elevenlabs_clawdia_voice_id`, and an environment variable named by `elevenlabs_api_key_env` such as `ELEVENLABS_API_KEY`. API keys and voice secrets must stay in private environment files or service managers, never in the repo, chat, tickets, or docs.
+
+The same output gate applies before speech generation. If a reply contains tool JSON, provider errors, schema dumps, message metadata, or internal routing code, the server must not send it as text and must not synthesize it as audio.
+
 Useful source material for future bot improvements:
 
 - OpenAI Agents guidance: agents should combine instructions, tools, handoffs, guardrails, and state for multi-step work.

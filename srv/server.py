@@ -1080,6 +1080,39 @@ def _gateway_natural_reply(sender_user, bot_name, text):
         return "Noted. I will treat that as context, not as an instruction to message anyone or change anything."
     return None
 
+def _friendly_name(username):
+    name = str(_canonical_chat_identity(username) or username or "").strip()
+    if not name:
+        return "there"
+    if name.lower() in ("dom", "dominique", "tappedinfm", "adonis", "adonis1111", "raywonder"):
+        return "Dom"
+    return name
+
+def _natural_blocked_reply(sender_user, bot_name, reason):
+    if str(bot_name or "").strip().lower() not in {"clawdia", "sapphire", "sophia", "sofia", "saphire"}:
+        return ""
+    name = _friendly_name(sender_user)
+    if str(bot_name or "").strip().lower() == "clawdia":
+        return (
+            f"That answer tried to come out as code, {name}. No thank you. "
+            "I stopped it and I am keeping this chat in normal words."
+        )
+    return "That reply tried to come out as code. I stopped it and queued cleanup so the chat stays readable."
+
+def _natural_no_model_reply(sender_user, bot_name, text):
+    lower = str(text or "").strip().lower()
+    if not lower:
+        return f"I'm here, {_friendly_name(sender_user)}."
+    if any(w in lower for w in ("hi", "hello", "hey", "you there", "what's up", "whats up")):
+        return f"Hey {_friendly_name(sender_user)}. I am here."
+    if any(w in lower for w in ("thank", "thanks")):
+        return "You are welcome."
+    if any(w in lower for w in ("joke", "funny", "dalek", "cyberman", "doctor who")):
+        return "I can do a little dramatic sci-fi flair, but I am keeping the actual work sensible."
+    if "?" in lower:
+        return "I heard you. I am checking the part that needs evidence, and I will answer when I have something real."
+    return "Got it. I have it in context."
+
 def _default_bot_contacts():
     raw = str(bot_runtime_config.get('default_bot_contacts', 'Clawdia') or '')
     names = [name.strip() for name in raw.split(',') if name.strip()]
@@ -1186,23 +1219,25 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     if not _is_virtual_bot(to_user):
         return False
     _record_bot_memory(sender_user, to_user, "user", text)
-    reply = _known_clawdia_reply(sender_user, to_user, text)
+    reply = _gateway_natural_reply(sender_user, to_user, text)
+    if not reply:
+        reply = _known_clawdia_reply(sender_user, to_user, text)
     if not reply:
         reply = _ollama_bot_reply(sender_user, to_user, text)
     if not reply:
         lower = (text or "").strip().lower()
         if not lower:
-            reply = "I'm online and ready. Ask me for help, commands, or server status."
+            reply = _natural_no_model_reply(sender_user, to_user, text)
         elif any(w in lower for w in ("hi", "hello", "hey")):
-            reply = f"Hi {sender_user}. I'm {to_user}. How can I help?"
+            reply = _natural_no_model_reply(sender_user, to_user, text)
         elif "help" in lower:
-            reply = "You can ask me about status, contacts, file transfers, or admin features."
+            reply = "Tell me what you want to do, and I will either help directly or route the heavier work quietly."
         elif "status" in lower:
-            reply = "I can report server presence and room/user status where available."
+            reply = "I can check status when the approved route is available. I will keep the answer plain and evidence-based."
         elif "file" in lower:
-            reply = "File transfers are available from chat and user menus. Check File Transfers for history."
+            reply = "File sharing is available from the chat actions and the File Transfers view."
         elif "admin" in lower:
-            reply = "Admin actions are available from Server Side Commands and admin menus, based on your role."
+            reply = "Admin tools are available from the server/admin menus when your account role allows them."
         else:
             _append_agent_task("model_followup_needed", {
                 "user": sender_user,
@@ -1211,7 +1246,7 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
                 "latest_user_message": _moderation_excerpt(text, 500),
                 "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
             })
-            return True
+            reply = _natural_no_model_reply(sender_user, to_user, text)
     original_reply = str(reply or "")
     reply, blocked, reason = _user_facing_bot_output(original_reply)
     if blocked or not reply:
@@ -1223,7 +1258,9 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
             "blocked_reply_excerpt": _moderation_excerpt(original_reply, 500),
             "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
         })
-        return True
+        reply = _natural_blocked_reply(sender_user, to_user, reason)
+        if not reply:
+            return True
     tts_payload = _build_bot_tts_payload(to_user, reply, text)
     payload = {
         "action": "msg",
@@ -1380,7 +1417,7 @@ def _ollama_bot_reply(sender_user, bot_name, text):
         return None
 
 def _build_bot_tts_payload(bot_name, reply_text, request_text):
-    if not bot_runtime_config.get('piper_enabled', False):
+    if not (bot_runtime_config.get('elevenlabs_enabled', False) or bot_runtime_config.get('piper_enabled', False)):
         return None
     reply = str(reply_text or "").strip()
     if not reply:
@@ -1388,28 +1425,99 @@ def _build_bot_tts_payload(bot_name, reply_text, request_text):
     reply, blocked, _reason = _user_facing_bot_output(reply)
     if blocked or not reply:
         return None
-    # If users ask how they sound, provide a clear voice-preview response.
     asked_preview = any(
         k in str(request_text or "").lower()
         for k in ("how i sound", "how do i sound", "hear my voice", "my voice")
     )
     if asked_preview:
         reply += " I can preview my configured voice. To hear your own real voice, send a recording and I can play it back."
-    audio = _synthesize_bot_tts(bot_name, reply)
-    if not audio:
+    synthesized = _synthesize_bot_tts(bot_name, reply)
+    if not synthesized:
         return None
+    audio, mime, engine = synthesized
     return {
         "tts_audio_b64": audio,
-        "tts_mime": "audio/wav",
-        "tts_voice": _bot_voice_name(bot_name),
-        "tts_engine": "piper",
+        "tts_mime": mime,
+        "tts_voice": f"{bot_name}-elevenlabs" if engine == "elevenlabs" else _bot_voice_name(bot_name),
+        "tts_engine": engine,
     }
 
 def _bot_voice_name(bot_name):
     voice = str(bot_voice_map.get(bot_name, "") or "").strip()
+    if voice.lower().startswith("elevenlabs:"):
+        voice = ""
     if not voice:
         voice = str(bot_runtime_config.get('piper_default_voice', '') or '').strip()
     return voice or "default"
+
+def _elevenlabs_voice_id(bot_name):
+    bot_name = str(bot_name or "").strip()
+    if not bot_name:
+        return ""
+    specific = str(bot_runtime_config.get(f"elevenlabs_voice_{bot_name.lower()}", "") or "").strip()
+    if specific:
+        return specific
+    configured = str(bot_voice_map.get(bot_name, "") or "").strip()
+    if configured.lower().startswith("elevenlabs:"):
+        return configured.split(":", 1)[1].strip()
+    if bot_name.lower() == "clawdia":
+        return str(bot_runtime_config.get('elevenlabs_clawdia_voice_id', '') or '').strip()
+    return str(bot_runtime_config.get('elevenlabs_default_voice_id', '') or '').strip()
+
+def _elevenlabs_mime_for_format(output_format):
+    fmt = str(output_format or "").strip().lower()
+    if fmt.startswith("wav"):
+        return "audio/wav"
+    if fmt.startswith("pcm"):
+        return "audio/L16"
+    if fmt.startswith("opus"):
+        return "audio/ogg"
+    if fmt.startswith("ulaw") or fmt.startswith("mulaw"):
+        return "audio/basic"
+    return "audio/mpeg"
+
+def _synthesize_elevenlabs_tts(bot_name, text):
+    if not bot_runtime_config.get('elevenlabs_enabled', False):
+        return None
+    api_key_env = str(bot_runtime_config.get('elevenlabs_api_key_env', 'ELEVENLABS_API_KEY') or 'ELEVENLABS_API_KEY').strip()
+    api_key = os.getenv(api_key_env, "").strip()
+    voice_id = _elevenlabs_voice_id(bot_name)
+    if not api_key or not voice_id:
+        return None
+    base_url = str(bot_runtime_config.get('elevenlabs_api_url', 'https://api.elevenlabs.io') or 'https://api.elevenlabs.io').rstrip("/")
+    output_format = str(bot_runtime_config.get('elevenlabs_output_format', 'mp3_44100_128') or 'mp3_44100_128').strip()
+    model_id = str(bot_runtime_config.get('elevenlabs_model_id', 'eleven_multilingual_v2') or 'eleven_multilingual_v2').strip()
+    timeout = max(5, int(bot_runtime_config.get('elevenlabs_timeout', 20) or 20))
+    query = urllib.parse.urlencode({"output_format": output_format})
+    url = f"{base_url}/v1/text-to-speech/{urllib.parse.quote(voice_id)}?{query}"
+    payload = {
+        "text": str(text or "")[: int(bot_runtime_config.get('elevenlabs_max_chars', 1200) or 1200)],
+        "model_id": model_id,
+        "voice_settings": {
+            "stability": float(bot_runtime_config.get('elevenlabs_stability', 0.55) or 0.55),
+            "similarity_boost": float(bot_runtime_config.get('elevenlabs_similarity_boost', 0.75) or 0.75),
+        },
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": _elevenlabs_mime_for_format(output_format),
+            "xi-api-key": api_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            audio = resp.read()
+            mime = resp.headers.get_content_type() or _elevenlabs_mime_for_format(output_format)
+        if not audio:
+            return None
+        return base64.b64encode(audio).decode("ascii"), mime, "elevenlabs"
+    except Exception as e:
+        print(f"ElevenLabs synthesis failed for {bot_name}: {_moderation_excerpt(str(e), 300)}")
+        return None
 
 def _resolve_piper_model(bot_name):
     voice_model = _bot_voice_name(bot_name)
@@ -1423,6 +1531,11 @@ def _resolve_piper_model(bot_name):
     return os.path.join(models_dir, f"{voice_model}.onnx")
 
 def _synthesize_bot_tts(bot_name, text):
+    elevenlabs_audio = _synthesize_elevenlabs_tts(bot_name, text)
+    if elevenlabs_audio:
+        return elevenlabs_audio
+    if not bot_runtime_config.get('piper_enabled', False):
+        return None
     piper_bin = str(bot_runtime_config.get('piper_bin', '/usr/local/bin/piper') or '/usr/local/bin/piper').strip()
     model_path = _resolve_piper_model(bot_name)
     if not os.path.isfile(model_path):
@@ -1445,7 +1558,7 @@ def _synthesize_bot_tts(bot_name, text):
             return None
         with open(out_path, "rb") as f:
             audio = base64.b64encode(f.read()).decode("ascii")
-        return audio
+        return audio, "audio/wav", "piper"
     except Exception as e:
         print(f"Piper synthesis error for {bot_name}: {e}")
         return None
