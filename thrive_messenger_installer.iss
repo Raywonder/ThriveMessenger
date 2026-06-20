@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.7"
+#define MyAppVersion "2026 Alpha 15.8"
 #define MyAppPublisher "G4p Studios"
 #define MyAppURL "https://im.tappedin.fm"
 #define MyAppExeName "thrive_messenger.exe"
