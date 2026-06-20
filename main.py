@@ -8,9 +8,14 @@ try:
     import wx.html2 as wxhtml2
 except Exception:
     wxhtml2 = None
+try:
+    import wx.media as wxmedia
+except Exception:
+    wxmedia = None
 
 VERSION_TAG = "v2026-alpha15.7"
 _nvda_controller = None
+_active_tts_media = []
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -441,7 +446,7 @@ def load_user_config():
         'sound_volume': 80,
         'call_input_volume': 80,
         'call_output_volume': 80,
-        'show_main_action_buttons': True,
+        'show_main_action_buttons': False,
         'chat_logging': {},
         'server_entries': file_entries,
         'last_server_name': DEFAULT_SERVER_NAME if any(e.get('name') == DEFAULT_SERVER_NAME for e in file_entries) else file_entries[0]['name'],
@@ -1054,8 +1059,10 @@ def play_tts_audio_from_message(msg):
             return False
         tts_dir = os.path.join(get_config_dir(), "tts_cache")
         os.makedirs(tts_dir, exist_ok=True)
-        voice_name = str(msg.get("tts_voice", "bot")).strip().replace("/", "_")
-        path = os.path.join(tts_dir, f"{voice_name}-{uuid.uuid4().hex}.wav")
+        voice_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(msg.get("tts_voice", "bot")).strip() or "bot")
+        mime = str(msg.get("tts_mime", "audio/wav") or "audio/wav").lower()
+        ext = ".mp3" if "mpeg" in mime or "mp3" in mime else ".wav"
+        path = os.path.join(tts_dir, f"{voice_name}-{uuid.uuid4().hex}{ext}")
         with open(path, "wb") as f:
             f.write(audio)
         sound = wx.adv.Sound(path)
@@ -1063,6 +1070,40 @@ def play_tts_audio_from_message(msg):
             sound.Play(wx.adv.SOUND_ASYNC)
             threading.Timer(25.0, lambda: os.path.exists(path) and os.remove(path)).start()
             return True
+        if ext != ".wav" and wxmedia is not None:
+            try:
+                frame = wx.Frame(None, title="Thrive Messenger voice playback", size=(1, 1))
+                frame.Hide()
+                media = wxmedia.MediaCtrl(frame)
+                if media.Load(path):
+                    _active_tts_media.append((frame, media, path))
+                    media.Play()
+                    def _cleanup_media():
+                        try:
+                            media.Stop()
+                        except Exception:
+                            pass
+                        try:
+                            frame.Destroy()
+                        except Exception:
+                            pass
+                        try:
+                            _active_tts_media[:] = [item for item in _active_tts_media if item[2] != path]
+                        except Exception:
+                            pass
+                        try:
+                            if os.path.exists(path):
+                                os.remove(path)
+                        except Exception:
+                            pass
+                    wx.CallLater(30000, _cleanup_media)
+                    return True
+                try:
+                    frame.Destroy()
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Bot media TTS playback failed: {e}")
         try:
             os.remove(path)
         except Exception:
@@ -1836,7 +1877,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.read_aloud_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.interrupt_speech_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.global_chat_logging_cb, 0, wx.ALL, 5)
-        accessibility_box.Add(self.show_main_actions_cb, 0, wx.ALL, 5)
+        self.show_main_actions_cb.Hide()
         accessibility_box.Add(self.typing_indicator_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.prefer_display_names_cb, 0, wx.ALL, 5)
@@ -2677,6 +2718,8 @@ class ClientApp(wx.App):
                     elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
                     elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                     elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
+                    elif act in ("passkey_register_result", "passkey_list", "passkey_revoke_result"):
+                        self.frame.on_passkey_response(msg)
                     elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
                     elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
                     elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
@@ -4306,6 +4349,9 @@ class MainFrame(wx.Frame):
         self._sort_mode = "name_asc"
         self._unread_counts = {}
         self._pending_display_names = {}
+        self._passkey_response_lock = threading.Lock()
+        self._passkey_response_events = {}
+        self._passkey_responses = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
 
         dark_mode_on = is_windows_dark_mode()
@@ -4365,9 +4411,9 @@ class MainFrame(wx.Frame):
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
         accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
-        self.gs_main = wx.GridSizer(1, 5, 5, 5); self.gs_main.Add(self.btn_block, 0, wx.EXPAND); self.gs_main.Add(self.btn_add, 0, wx.EXPAND); self.gs_main.Add(self.btn_send, 0, wx.EXPAND); self.gs_main.Add(self.btn_send_file, 0, wx.EXPAND); self.gs_main.Add(self.btn_delete, 0, wx.EXPAND)
-        self.gs_util = wx.GridSizer(1, 8, 5, 5); self.gs_util.Add(self.btn_info, 0, wx.EXPAND); self.gs_util.Add(self.btn_status, 0, wx.EXPAND); self.gs_util.Add(self.btn_directory, 0, wx.EXPAND); self.gs_util.Add(self.btn_admin, 0, wx.EXPAND); self.gs_util.Add(self.btn_settings, 0, wx.EXPAND); self.gs_util.Add(self.btn_update, 0, wx.EXPAND); self.gs_util.Add(self.btn_logout, 0, wx.EXPAND); self.gs_util.Add(self.btn_exit, 0, wx.EXPAND)
-        s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(self.gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(self.gs_util, 0, wx.CENTER|wx.ALL, 5); s.Add(self.autologin_main_cb, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8); panel.SetSizer(s)
+        for hidden_button in [self.btn_block, self.btn_add, self.btn_send, self.btn_delete, self.btn_send_file, self.btn_info, self.btn_status, self.btn_directory, self.btn_admin, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit, self.autologin_main_cb]:
+            hidden_button.Hide()
+        s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); panel.SetSizer(s)
         self._root_sizer = s
         self._build_menu_bar()
         self._apply_voiceover_hints(search_label)
@@ -4404,11 +4450,17 @@ class MainFrame(wx.Frame):
         enabled = bool(wx.GetApp().user_config.get("autologin", False)) and can_autologin
         self.autologin_main_cb.SetValue(enabled)
         self.autologin_main_cb.Enable(can_autologin)
+        if hasattr(self, "mi_autologin"):
+            self.mi_autologin.Check(enabled)
+            self.mi_autologin.Enable(can_autologin)
 
     def on_toggle_autologin(self, event):
         app = wx.GetApp()
-        if self.autologin_main_cb.IsChecked() and not self._has_saved_login_method():
+        requested = bool(event.IsChecked()) if event and hasattr(event, "IsChecked") else bool(self.autologin_main_cb.IsChecked())
+        if requested and not self._has_saved_login_method():
             self.autologin_main_cb.SetValue(False)
+            if hasattr(self, "mi_autologin"):
+                self.mi_autologin.Check(False)
             app.user_config["autologin"] = False
             save_user_config(app.user_config)
             wx.MessageBox(
@@ -4418,7 +4470,10 @@ class MainFrame(wx.Frame):
                 self,
             )
             return
-        app.user_config["autologin"] = bool(self.autologin_main_cb.IsChecked())
+        self.autologin_main_cb.SetValue(requested)
+        if hasattr(self, "mi_autologin"):
+            self.mi_autologin.Check(requested)
+        app.user_config["autologin"] = requested
         if app.user_config["autologin"] and not app.user_config.get("autologin_mode"):
             app.user_config["autologin_mode"] = "password"
         save_user_config(app.user_config)
@@ -4493,7 +4548,9 @@ class MainFrame(wx.Frame):
         admin_visible = self._feature_ui_visible("admin_console")
         admin_enabled = self._feature_can_use("admin_console")
         self.mi_admin_visible = admin_visible
-        self.btn_admin.Show(admin_visible)
+        if hasattr(self, "mi_admin_console"):
+            self.mi_admin_console.Enable(admin_enabled and admin_visible)
+        self.btn_admin.Hide()
         self.btn_admin.Enable(admin_enabled and admin_visible)
         if hasattr(self, "btn_settings"):
             self.btn_settings.Refresh()
@@ -4507,12 +4564,8 @@ class MainFrame(wx.Frame):
                 child.apply_call_permissions(can_call, show_call)
 
     def apply_action_button_layout(self):
-        show_actions = bool(wx.GetApp().user_config.get('show_main_action_buttons', True))
-        for btn in [self.btn_block, self.btn_send, self.btn_send_file, self.btn_delete, self.btn_info, self.btn_status, self.btn_directory, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit]:
-            btn.Show(show_actions)
-        # Keep add contact visible for keyboard/tab workflow.
-        self.btn_add.Show(True)
-        self.btn_admin.Show(bool(show_actions and getattr(self, "mi_admin_visible", False)))
+        for btn in [self.btn_block, self.btn_send, self.btn_send_file, self.btn_delete, self.btn_info, self.btn_status, self.btn_directory, self.btn_settings, self.btn_update, self.btn_logout, self.btn_exit, self.btn_add, self.btn_admin]:
+            btn.Hide()
         self.btn_admin.Enable(bool(getattr(self, "mi_admin_visible", False) and self._feature_can_use("admin_console")))
         if self._root_sizer:
             self._root_sizer.Layout()
@@ -4520,24 +4573,46 @@ class MainFrame(wx.Frame):
     def _build_menu_bar(self):
         menubar = wx.MenuBar()
         file_menu = wx.Menu()
-        self.mi_start_chat = file_menu.Append(wx.ID_ANY, "Start Chat\tReturn")
-        self.mi_add_contact = file_menu.Append(wx.ID_ANY, "Add Contact\tAlt+A")
-        self.mi_delete_contact = file_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
-        self.mi_send_file = file_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
-        self.mi_file_transfers = file_menu.Append(wx.ID_ANY, "File Transfers")
-        self.mi_group_calls = file_menu.Append(wx.ID_ANY, "Group Calls")
-        file_menu.AppendSeparator()
-        self.mi_user_directory = file_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
-        self.mi_server_info = file_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
-        self.mi_server_manager = file_menu.Append(wx.ID_ANY, "Server Manager")
-        self.mi_bot_rules = file_menu.Append(wx.ID_ANY, "Manage Bot Rules")
-        self.mi_group_policy = file_menu.Append(wx.ID_ANY, "Manage Group Policy")
-        self.mi_settings = file_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
-        self.mi_register_passkey = file_menu.Append(wx.ID_ANY, "Register Passkey For This Device")
-        self.mi_manage_devices = file_menu.Append(wx.ID_ANY, "Manage Signed-In Devices")
-        file_menu.AppendSeparator()
-        self.mi_logout = file_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
-        self.mi_exit = file_menu.Append(wx.ID_ANY, "Exit\tAlt+X")
+        conversations_menu = wx.Menu()
+        self.mi_start_chat = conversations_menu.Append(wx.ID_ANY, "Start Chat\tReturn")
+        self.mi_send_file = conversations_menu.Append(wx.ID_ANY, "Send File\tAlt+F")
+        self.mi_file_transfers = conversations_menu.Append(wx.ID_ANY, "File Transfers")
+        self.mi_group_calls = conversations_menu.Append(wx.ID_ANY, "Group Calls")
+        file_menu.AppendSubMenu(conversations_menu, "Conversations")
+
+        contacts_actions_menu = wx.Menu()
+        self.mi_add_contact = contacts_actions_menu.Append(wx.ID_ANY, "Add Contact\tAlt+A")
+        self.mi_delete_contact = contacts_actions_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
+        self.mi_file_block_toggle = contacts_actions_menu.Append(wx.ID_ANY, "Block/Unblock\tAlt+B")
+        self.mi_file_toggle_chat_log = contacts_actions_menu.Append(wx.ID_ANY, "Toggle Chat History For Selected Contact")
+        self.mi_user_directory = contacts_actions_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
+        self.mi_file_refresh_directory = contacts_actions_menu.Append(wx.ID_ANY, "Refresh Directory")
+        file_menu.AppendSubMenu(contacts_actions_menu, "Contacts")
+
+        server_menu = wx.Menu()
+        self.mi_server_info = server_menu.Append(wx.ID_ANY, "Server Info\tAlt+I")
+        self.mi_admin_console = server_menu.Append(wx.ID_ANY, "Use Server Side Commands\tAlt+V")
+        self.mi_server_manager = server_menu.Append(wx.ID_ANY, "Server Manager")
+        self.mi_bot_rules = server_menu.Append(wx.ID_ANY, "Manage Bot Rules")
+        self.mi_group_policy = server_menu.Append(wx.ID_ANY, "Manage Group Policy")
+        file_menu.AppendSubMenu(server_menu, "Server and Admin")
+
+        account_menu = wx.Menu()
+        self.mi_status = account_menu.Append(wx.ID_ANY, "Set Status\tAlt+U")
+        self.mi_settings = account_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
+        self.mi_register_passkey = account_menu.Append(wx.ID_ANY, "Register Passkey For This Device")
+        self.mi_manage_devices = account_menu.Append(wx.ID_ANY, "Manage Signed-In Devices")
+        self.mi_autologin = account_menu.AppendCheckItem(wx.ID_ANY, "Log in automatically next time")
+        account_menu.AppendSeparator()
+        self.mi_logout = account_menu.Append(wx.ID_ANY, "Logout\tAlt+O")
+        file_menu.AppendSubMenu(account_menu, "Account and Security")
+
+        app_menu = wx.Menu()
+        self.mi_check_updates = app_menu.Append(wx.ID_ANY, "Check for Updates\tAlt+P")
+        self.mi_submit_logs = app_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
+        app_menu.AppendSeparator()
+        self.mi_exit = app_menu.Append(wx.ID_ANY, "Exit\tAlt+X")
+        file_menu.AppendSubMenu(app_menu, "App")
 
         contacts_menu = wx.Menu()
         self.mi_block_toggle = contacts_menu.Append(wx.ID_ANY, "Block/Unblock\tAlt+B")
@@ -4567,7 +4642,6 @@ class MainFrame(wx.Frame):
         demo_menu.AppendSeparator()
         self.mi_demo_videos = demo_menu.Append(wx.ID_ANY, "Open Demo Videos Folder")
         help_menu.AppendSubMenu(demo_menu, "Watch Demo Videos")
-        self.mi_submit_logs = help_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
 
         menubar.Append(file_menu, "&File")
         menubar.Append(contacts_menu, "&Contacts")
@@ -4585,16 +4659,23 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_user_directory)
         self.Bind(wx.EVT_MENU, self.on_server_info, self.mi_server_info)
         self.Bind(wx.EVT_MENU, self.on_server_manager, self.mi_server_manager)
+        self.Bind(wx.EVT_MENU, self.on_admin, self.mi_admin_console)
         self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
         self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
+        self.Bind(wx.EVT_MENU, self.on_set_status, self.mi_status)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_register_passkey, self.mi_register_passkey)
         self.Bind(wx.EVT_MENU, self.on_manage_devices, self.mi_manage_devices)
+        self.Bind(wx.EVT_MENU, self.on_toggle_autologin, self.mi_autologin)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
+        self.Bind(wx.EVT_MENU, self.on_check_updates, self.mi_check_updates)
         self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_block_toggle)
         self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, self.mi_toggle_chat_log)
         self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_refresh_directory)
+        self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_file_block_toggle)
+        self.Bind(wx.EVT_MENU, self.on_toggle_selected_chat_logging, self.mi_file_toggle_chat_log)
+        self.Bind(wx.EVT_MENU, self.on_user_directory, self.mi_file_refresh_directory)
         self.Bind(wx.EVT_MENU, self.on_send, self.mi_user_start_chat)
         self.Bind(wx.EVT_MENU, self.on_send_file, self.mi_user_send_file)
         self.Bind(wx.EVT_MENU, self.on_file_transfers, self.mi_user_transfers)
@@ -4719,14 +4800,51 @@ class MainFrame(wx.Frame):
         active = normalize_server_entry(getattr(app, "active_server_entry", SERVER_CONFIG))
         return _passkey_account_for(self.user, settings=app.user_config, server_entry=active)
 
-    def _list_passkeys(self):
+    def on_passkey_response(self, msg):
+        action = str(msg.get("action", "") or "")
+        if not action:
+            return
+        with self._passkey_response_lock:
+            event = self._passkey_response_events.get(action)
+            if not event:
+                return
+            self._passkey_responses[action] = msg
+            event.set()
+
+    def _send_passkey_request(self, payload, expected_action, timeout=12):
+        expected_action = str(expected_action or "")
+        if not expected_action:
+            return None, "Internal passkey request error."
+        event = threading.Event()
+        with self._passkey_response_lock:
+            self._passkey_response_events[expected_action] = event
+            self._passkey_responses.pop(expected_action, None)
         try:
-            self.sock.sendall((json.dumps({"action": "list_passkeys"}) + "\n").encode())
-            resp = json.loads(wx.GetApp().sockfile.readline() or "{}")
-            if resp.get("action") == "passkey_list":
-                return resp.get("passkeys", [])
-        except Exception:
-            pass
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+        except OSError as e:
+            with self._passkey_response_lock:
+                self._passkey_response_events.pop(expected_action, None)
+                self._passkey_responses.pop(expected_action, None)
+            return None, "The connection closed while sending the passkey request. Thrive will reconnect in the background; try again after the contact list is back online."
+        except Exception as e:
+            with self._passkey_response_lock:
+                self._passkey_response_events.pop(expected_action, None)
+                self._passkey_responses.pop(expected_action, None)
+            return None, f"Could not send the passkey request: {e}"
+        if not event.wait(timeout):
+            with self._passkey_response_lock:
+                self._passkey_response_events.pop(expected_action, None)
+                self._passkey_responses.pop(expected_action, None)
+            return None, "The server did not answer the passkey request in time. The connection may be reconnecting; try again in a moment."
+        with self._passkey_response_lock:
+            self._passkey_response_events.pop(expected_action, None)
+            response = self._passkey_responses.pop(expected_action, None)
+        return response, ""
+
+    def _list_passkeys(self):
+        resp, _ = self._send_passkey_request({"action": "list_passkeys"}, "passkey_list")
+        if resp and resp.get("action") == "passkey_list":
+            return resp.get("passkeys", [])
         return []
 
     def on_register_passkey(self, _):
@@ -4742,15 +4860,16 @@ class MainFrame(wx.Frame):
                 return
             label = dlg.GetValue().strip() or default_label
         token = secrets.token_urlsafe(48)
-        try:
-            self.sock.sendall((json.dumps({
-                "action": "register_passkey",
-                "label": label,
-                "passkey_token": token,
-            }) + "\n").encode())
-            resp = json.loads(app.sockfile.readline() or "{}")
-        except Exception as e:
-            wx.MessageBox(f"Could not register passkey: {e}", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
+        resp, error = self._send_passkey_request({
+            "action": "register_passkey",
+            "label": label,
+            "passkey_token": token,
+        }, "passkey_register_result")
+        if error:
+            wx.MessageBox(f"Could not register passkey. {error}", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not resp:
+            wx.MessageBox("Could not register passkey. The server response was empty.", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
             return
         if not resp.get("ok"):
             wx.MessageBox(resp.get("reason", "Unknown error"), "Passkey Error", wx.OK | wx.ICON_ERROR, self)
@@ -4795,21 +4914,24 @@ class MainFrame(wx.Frame):
             for entry in entries:
                 if entry.get("revoked"):
                     continue
-                try:
-                    self.sock.sendall((json.dumps({"action": "revoke_passkey", "passkey_id": entry.get("id", "")}) + "\n").encode())
-                    _ = json.loads(app.sockfile.readline() or "{}")
-                except Exception:
-                    pass
+                self._send_passkey_request(
+                    {"action": "revoke_passkey", "passkey_id": entry.get("id", "")},
+                    "passkey_revoke_result",
+                )
             _delete_passkey_from_keyring(self.user, settings=app.user_config, server_entry=app.active_server_entry)
             show_notification("Devices Updated", "Signed out all devices.", timeout=5)
             wx.MessageBox("All devices were signed out.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
             return
         target = [e for e in entries if not e.get("revoked")][choice]
-        try:
-            self.sock.sendall((json.dumps({"action": "revoke_passkey", "passkey_id": target.get("id", "")}) + "\n").encode())
-            resp = json.loads(app.sockfile.readline() or "{}")
-        except Exception as e:
-            wx.MessageBox(f"Could not revoke selected device: {e}", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
+        resp, error = self._send_passkey_request(
+            {"action": "revoke_passkey", "passkey_id": target.get("id", "")},
+            "passkey_revoke_result",
+        )
+        if error:
+            wx.MessageBox(f"Could not revoke selected device. {error}", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not resp:
+            wx.MessageBox("Could not revoke selected device. The server response was empty.", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
             return
         if not resp.get("ok"):
             wx.MessageBox(resp.get("reason", "Unknown revoke error"), "Manage Devices", wx.OK | wx.ICON_ERROR, self)
