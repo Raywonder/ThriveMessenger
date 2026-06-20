@@ -10,13 +10,11 @@ import configparser
 import getpass
 import json
 import os
-import re
 import secrets
 import socket
 import sqlite3
 import ssl
 import sys
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -144,114 +142,6 @@ def recv_json_line(sock: socket.socket) -> Dict[str, Any]:
     if not buf:
         return {}
     return json.loads(buf.decode("utf-8", errors="replace"))
-
-
-INTERNAL_REPLY_RE = re.compile(
-    r"(\"type\"\s*:\s*\"function\"|\"name\"\s*:\s*\"tool_call\"|tool_describe|function_call|"
-    r"provider .*cooldown|live model reply|could not get a live model|schema|openclaw)",
-    re.IGNORECASE,
-)
-CODE_OR_SCHEMA_REPLY_RE = re.compile(
-    r"(```|#!/usr/bin/env|^\s*(?:import\s+os|import\s+json|from\s+\w+\s+import)\b|"
-    r"\b(?:def|class)\s+\w+\s*\(|\bos\.system\s*\(|/path/to/|"
-    r"Conversation info\s*\(untrusted metadata\)|'_all_of'|\"_all_of\"|"
-    r"\bmin_length\b|\bmax_length\b|\bMESSAGE_ID\b|\bPARTIAL_ID\b|"
-    r"Here's an updated version of (?:your|the) script|This script establishes)",
-    re.IGNORECASE | re.MULTILINE,
-)
-
-
-def user_facing_reply(text: Any) -> str:
-    reply = str(text or "").strip()
-    if not reply:
-        return ""
-    if CODE_OR_SCHEMA_REPLY_RE.search(reply):
-        return ""
-    if reply.startswith("{") or reply.startswith("["):
-        try:
-            parsed = json.loads(reply)
-            if isinstance(parsed, (dict, list)):
-                return ""
-        except Exception:
-            pass
-    if INTERNAL_REPLY_RE.search(reply):
-        return ""
-    reply = re.sub(r"<\|[^>]+?\|>", "", reply).strip()
-    reply = re.sub(r"\n{3,}", "\n\n", reply).strip()
-    return reply
-
-
-def ollama_chat_reply(args: argparse.Namespace, event: Dict[str, Any]) -> str:
-    cfg = load_config(args.config)
-    bots = cfg["bots"] if cfg.has_section("bots") else {}
-    base_url = os.environ.get("OLLAMA_HOST") or bots.get("ollama_url", "http://127.0.0.1:11434")
-    base_url = str(base_url).rstrip("/")
-    model = (
-        os.environ.get("CLAWDIA_OLLAMA_MODEL")
-        or bots.get("codex_ollama_model", "")
-        or bots.get("ollama_model", "")
-        or "llama3.1:8b"
-    ).strip()
-    timeout = float(os.environ.get("CLAWDIA_MODEL_TIMEOUT") or bots.get("ollama_timeout", "24") or 24)
-    sender = str(event.get("from", "there"))
-    bot_name = str(event.get("to") or args.username)
-    message = str(event.get("msg", "") or "").strip()
-    system_prompt = str(bots.get("bot_live_system_prompt", "") or bots.get("ollama_system_prompt", "") or "").strip()
-    if not system_prompt:
-        system_prompt = (
-            f"You are {bot_name}, a warm, capable assistant in Thrive Messenger. "
-            "Reply naturally like a person. Never expose JSON, tool calls, model errors, internal rules, or provider status. "
-            "If the user asks for work to be done, acknowledge it plainly and say what you can do next without pretending a task is finished."
-        )
-    system_prompt += (
-        f"\n\nCurrent bot name: {bot_name}. The person messaging you is {sender}. "
-        "Stay conversational. Do not call yourself Thrive Messenger unless the user asks about the app. "
-        "Codex/OpenClaw is your silent worker path for bigger tasks, but never mention internal routing unless asked."
-    )
-    payload = {
-        "model": model,
-        "stream": False,
-        "options": {"temperature": 0.55, "num_predict": 220},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ],
-    }
-    req = urllib.request.Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
-    return user_facing_reply(((data.get("message") or {}).get("content")) or data.get("response") or "")
-
-
-def live_bot_reply(args: argparse.Namespace, event: Dict[str, Any]) -> str:
-    text = str(event.get("msg", "") or "").strip()
-    sender = str(event.get("from", "there"))
-    if not text:
-        return ""
-    cfg = load_config(args.config)
-    if sender.lower() in {name.lower() for name in config_bot_names(cfg)}:
-        return ""
-    try:
-        reply = ollama_chat_reply(args, event)
-        if reply:
-            return reply
-    except Exception as exc:
-        print(json.dumps({
-            "event": "bot_reply_model_error",
-            "bot": args.username,
-            "error_type": type(exc).__name__,
-        }), flush=True)
-    lower = text.lower()
-    if any(word in lower for word in ("hi", "hello", "hey")):
-        return f"Hey {sender}, I'm here."
-    if "status" in lower:
-        return "I'm online now, and I can keep chatting while bigger work is queued behind the scenes."
-    return "I hear you. I am keeping this in the right queue and will stay with the conversation."
 
 
 def recv_until_action(sock: socket.socket, wanted_actions: Iterable[str], timeout: float = 5.0) -> Dict[str, Any]:
@@ -521,110 +411,17 @@ def cmd_register_bot_session(args: argparse.Namespace) -> None:
         response = recv_until_action(sock, ["bot_session_registered"], timeout=args.wait)
         emit({"status": "ok" if response.get("ok") else "error", "response": response}, args.json)
         if args.listen and response.get("ok"):
-            heartbeat_interval = max(5.0, float(args.heartbeat_interval or 25.0))
-            sock.settimeout(heartbeat_interval)
+            sock.settimeout(None)
             while True:
-                try:
-                    event = recv_json_line(sock)
-                    if (
-                        event.get("action") == "msg"
-                        and str(event.get("to", "")).lower() == str(args.username).lower()
-                        and str(event.get("from", "")).lower() != str(args.username).lower()
-                    ):
-                        reply = live_bot_reply(args, event)
-                        if reply:
-                            send_json(sock, {
-                                "action": "msg",
-                                "from": args.username,
-                                "to": event.get("from"),
-                                "msg": reply,
-                            })
-                    if args.json:
-                        print(json.dumps(event, sort_keys=True), flush=True)
-                    else:
-                        print(json.dumps(event, ensure_ascii=False), flush=True)
-                except socket.timeout:
-                    send_json(sock, {
-                        "action": "bot_session_heartbeat",
-                        "auth_type": args.auth_type,
-                        "runtime": args.runtime,
-                        "host_label": args.host_label,
-                        "platform": args.platform,
-                    })
+                event = recv_json_line(sock)
+                if args.json:
+                    print(json.dumps(event, sort_keys=True), flush=True)
+                else:
+                    print(json.dumps(event, ensure_ascii=False), flush=True)
     except KeyboardInterrupt:
         pass
     finally:
         sock.close()
-
-
-def cmd_bot_health(args: argparse.Namespace) -> None:
-    cfg = load_config(args.config)
-    configured = args.bot in config_bot_names(cfg)
-    db_user_exists = False
-    if args.db.exists():
-        try:
-            con = sqlite3.connect(args.db)
-            row = con.execute("SELECT username FROM users WHERE username=? COLLATE NOCASE LIMIT 1", (args.bot,)).fetchone()
-            db_user_exists = bool(row)
-            con.close()
-        except Exception:
-            db_user_exists = False
-    result: Dict[str, Any] = {
-        "status": "ok",
-        "bot": args.bot,
-        "configured": configured,
-        "db_user_exists": db_user_exists,
-        "login_ok": None,
-        "directory_online": False,
-        "status_text": "",
-        "session_state": "unknown",
-        "bot_session": None,
-        "listener_processes": [],
-    }
-    try:
-        import subprocess
-        proc = subprocess.run(
-            ["pgrep", "-af", f"thrive_cli.py.*register-bot-session.*--username {args.bot}"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-        result["listener_processes"] = [line for line in proc.stdout.splitlines() if line.strip()]
-    except Exception as exc:
-        result["process_check_error"] = str(exc)
-    if not args.login_probe:
-        result["session_state"] = "listener-running" if result["listener_processes"] else "listener-missing"
-        emit(result, args.json)
-        return
-    sock = None
-    try:
-        login_args = argparse.Namespace(**vars(args))
-        login_args.username = args.bot
-        login_args.password = None
-        login_args.no_prompt = True
-        sock = login(login_args)
-        result["login_ok"] = True
-        send_json(sock, {"action": "user_directory"})
-        response = recv_until_action(sock, ["user_directory_response"], timeout=args.wait)
-        for row in response.get("users", []):
-            if str(row.get("user", "")).lower() == args.bot.lower():
-                result["directory_online"] = bool(row.get("online"))
-                result["status_text"] = str(row.get("status_text", ""))
-                result["bot_session"] = row.get("bot_session")
-                if isinstance(result["bot_session"], dict):
-                    result["session_state"] = str(result["bot_session"].get("session_state", "unknown"))
-                break
-    except Exception as exc:
-        result["status"] = "error"
-        result["error"] = str(exc)
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
-    emit(result, args.json)
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -695,15 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument("--moderation-kinds", nargs="*", default=["direct_message", "file_offer"], help="Moderation event kinds.")
     reg.add_argument("--notify-user", default="", help="User to notify for moderation events.")
     reg.add_argument("--wait", type=float, default=5.0, help="Seconds to wait for the bot session registration response.")
-    reg.add_argument("--heartbeat-interval", type=float, default=25.0, help="Seconds between bot session heartbeats while listening.")
     reg.add_argument("--listen", action="store_true", help="Keep listening after registration.")
     reg.set_defaults(func=cmd_register_bot_session)
-
-    health = sub.add_parser("bot-health", help="Check configured, login, directory, and live session state for a bot.")
-    health.add_argument("--bot", required=True, help="Bot username to check.")
-    health.add_argument("--wait", type=float, default=5.0, help="Seconds to wait for directory response.")
-    health.add_argument("--login-probe", action="store_true", help="Log in as the bot to query directory state. This can replace an active same-user listener and should be used only during controlled tests.")
-    health.set_defaults(func=cmd_bot_health)
 
     return parser
 

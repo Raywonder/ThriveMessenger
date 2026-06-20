@@ -15,6 +15,7 @@ exec /home/linuxbrew/.linuxbrew/bin/python3 srv/scripts/thrive_cli.py \
   --platform linux \
   --capabilities chat gateway-delegation codex-routing openclaw-status support \
   --transports thrive \
+  --background \
   --accepts-files \
   --wait 10 \
   --listen

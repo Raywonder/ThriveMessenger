@@ -2,9 +2,9 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.5"
+#define MyAppVersion "2026 Alpha 15.7"
 #define MyAppPublisher "G4p Studios"
-#define MyAppURL "https://github.com/G4p-Studios/ThriveMessenger"
+#define MyAppURL "https://im.tappedin.fm"
 #define MyAppExeName "thrive_messenger.exe"
 
 [Setup]
@@ -20,19 +20,22 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={commonpf}\Thrive\Thrive Messenger
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+PrivilegesRequired=admin
+UsePreviousAppDir=no
 DefaultGroupName=Thrive\Thrive Messenger
-AllowNoIcons=yes
-InfoAfterFile=README.md
-OutputDir=dist\installer
+DisableDirPage=yes
+DisableProgramGroupPage=yes
+DisableReadyPage=yes
+AllowNoIcons=no
+OutputDir=dist-installer
 OutputBaseFilename=thrive_messenger_installer
 Compression=lzma
 SolidCompression=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-
-[Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
 Source: "dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -44,11 +47,17 @@ Source: "assets\help\*"; DestDir: "{app}\assets\help"; Flags: ignoreversion recu
 Source: "assets\videos\*"; DestDir: "{app}\assets\videos"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
+[InstallDelete]
+Type: files; Name: "{app}\client.conf"
+Type: filesandordirs; Name: "{commonpf32}\Thrive\Thrive Messenger"
+Type: files; Name: "{commondesktop}\Thrive Messenger.lnk"
+Type: files; Name: "{userdesktop}\Thrive Messenger.lnk"
+
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 Name: "{group}\{cm:ProgramOnTheWeb,{#MyAppName}}"; Filename: "{#MyAppURL}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
