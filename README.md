@@ -160,7 +160,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 
 ### Message length
 
-Server owners can configure direct message length with `max_direct_message_length` in `srv/srv.conf`. The default is 20,000 characters. If a message is too long, the sender receives a clear delivery error instead of a silent failure. Bot replies can be capped with `max_reply_length` under `[bots]`; the default is 4,000 characters so agent replies have room to be useful without flooding clients.
+Server owners can configure direct message length with `max_direct_message_length` in `srv/srv.conf`. The default is 100,000 characters. If a message is too long, the sender receives a clear delivery error instead of a silent failure. Bot replies can be capped with `max_reply_length` under `[bots]`; the default is 20,000 characters, and longer bot replies are split into clean sequential parts instead of being cut off mid-thought.
 
 ### Sending and receiving messages
 
