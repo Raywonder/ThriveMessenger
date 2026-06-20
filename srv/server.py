@@ -1066,6 +1066,34 @@ def _natural_no_model_reply(sender_user, bot_name, text):
         return "I heard you. I am checking the part that needs evidence, and I will answer when I have something real."
     return "Got it. I have it in context."
 
+_DIRECT_BOT_LEADING_MENTION_RE = re.compile(r"^\s*@([A-Za-z0-9_-]{1,64})(?:[:,]|\s+|$)")
+
+def _normalize_direct_bot_chat_text(text, bot_name):
+    """Treat leading @handles as ordinary direct-chat addressing in Thrive DMs."""
+    body = str(text or "")
+    known_direct_handles = {
+        "cd",
+        "clawdia",
+        "codex",
+        "macmini",
+    }
+    bot_handle = str(bot_name or "").strip().lower()
+    if bot_handle:
+        known_direct_handles.add(bot_handle)
+    changed = False
+    while True:
+        match = _DIRECT_BOT_LEADING_MENTION_RE.match(body)
+        if not match:
+            break
+        handle = match.group(1).strip().lower()
+        if handle not in known_direct_handles:
+            break
+        body = body[match.end():]
+        changed = True
+    if changed:
+        return body.lstrip() or str(text or "")
+    return body
+
 def _default_bot_contacts():
     raw = str(bot_runtime_config.get('default_bot_contacts', 'Clawdia') or '')
     names = [name.strip() for name in raw.split(',') if name.strip()]
@@ -1171,6 +1199,7 @@ def _known_clawdia_reply(sender_user, bot_name, text):
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     if not _is_virtual_bot(to_user):
         return False
+    text = _normalize_direct_bot_chat_text(text, to_user)
     _record_bot_memory(sender_user, to_user, "user", text)
     reply = _gateway_natural_reply(sender_user, to_user, text)
     if not reply:
