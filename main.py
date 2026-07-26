@@ -4,6 +4,7 @@ import traceback, platform
 import keyring
 import concurrent.futures
 import hashlib
+from update_relaunch import resolve_windows_relaunch_executable
 try:
     import wx.html2 as wxhtml2
 except Exception:
@@ -1684,12 +1685,25 @@ def download_update(urls, dest, progress_dlg, callback, expected_sha256=None):
 
 def apply_installer_update(installer_path):
     program_dir = get_program_dir()
-    exe_path = os.path.join(program_dir, 'thrive_messenger.exe')
+    exe_path = resolve_windows_relaunch_executable(
+        program_dir,
+        sys.executable,
+        bool(getattr(sys, "frozen", False)),
+    )
+    pid = os.getpid()
     batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
     with open(batch_path, 'w') as f:
         f.write(f'@echo off\r\n')
+        f.write(f':waitloop\r\n')
+        f.write(f'tasklist /fi "PID eq {pid}" 2>NUL | find /i "{pid}" >NUL\r\n')
+        f.write(f'if not errorlevel 1 (\r\n')
+        f.write(f'    timeout /t 1 /nobreak >NUL\r\n')
+        f.write(f'    goto waitloop\r\n')
+        f.write(f')\r\n')
         f.write(f'start /wait "" "{installer_path}" /VERYSILENT /CLOSEAPPLICATIONS /NORESTART\r\n')
-        f.write(f'start "" "{exe_path}"\r\n')
+        f.write(f'if errorlevel 1 goto cleanup\r\n')
+        f.write(f'start "" "{exe_path}" --after-update\r\n')
+        f.write(f':cleanup\r\n')
         f.write(f'del "{installer_path}"\r\n')
         f.write(f'del "%~f0"\r\n')
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
@@ -1728,7 +1742,11 @@ def apply_zip_update(zip_path):
         return
 
     program_dir = get_program_dir()
-    exe_path = os.path.join(program_dir, 'thrive_messenger.exe')
+    exe_path = resolve_windows_relaunch_executable(
+        program_dir,
+        sys.executable,
+        bool(getattr(sys, "frozen", False)),
+    )
     pid = os.getpid()
     temp_extract = os.path.join(tempfile.gettempdir(), 'thrive_update_extract')
     batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
@@ -1745,7 +1763,7 @@ def apply_zip_update(zip_path):
         f.write(f'xcopy /s /e /y /q "{temp_extract}\\thrive_messenger\\*" "{program_dir}\\"\r\n')
         f.write(f'rmdir /s /q "{temp_extract}"\r\n')
         f.write(f'del "{zip_path}"\r\n')
-        f.write(f'start "" "{exe_path}"\r\n')
+        f.write(f'start "" "{exe_path}" --after-update\r\n')
         f.write(f'del "%~f0"\r\n')
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
 
@@ -2453,6 +2471,22 @@ class ClientApp(wx.App):
             else:
                 self.frame.Raise()
                 self.frame.SetFocus()
+            self.resume_saved_session_if_needed()
+
+    def resume_saved_session_if_needed(self):
+        """Resume a saved account when a restored tray instance is disconnected."""
+        sock = getattr(self, "sock", None)
+        try:
+            socket_is_open = sock is not None and sock.fileno() >= 0
+        except (AttributeError, OSError):
+            socket_is_open = False
+        if socket_is_open or self.reconnect_in_progress:
+            return
+        if not (self.user_config.get("autologin") and self.user_config.get("username")):
+            return
+        self.intentional_disconnect = False
+        self.reconnect_stop_event.clear()
+        self._start_reconnect_loop()
 
     def show_login_dialog(self):
         while True:
@@ -5894,6 +5928,7 @@ class MainFrame(wx.Frame):
             if isinstance(child, ChatDialog) and getattr(child, '_restore_from_tray', False):
                 child._restore_from_tray = False; child.Show()
             if isinstance(child, (ChatDialog, AdminDialog)) and child.IsShown(): child.Raise()
+        wx.GetApp().resume_saved_session_if_needed()
     def on_exit(self, _):
         print("Exiting application...");
         app = wx.GetApp(); app.intentional_disconnect = True
