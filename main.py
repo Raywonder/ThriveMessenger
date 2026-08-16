@@ -54,7 +54,7 @@ DEMO_VIDEOS = {
 LEGACY_SAFE_FEATURE_CAPS = {
     "bots": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "bot_rules": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
-    "group_chat": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
+    "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "can_use": True},
     "group_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "group_policy": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
     "admin_console": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
@@ -1971,6 +1971,10 @@ class SettingsDialog(wx.Dialog):
         self.btn_open_bot_rules.Bind(wx.EVT_BUTTON, self.on_open_bot_rules)
         self.btn_open_group_policy = wx.Button(admin_box.GetStaticBox(), label="Open Group Policy Manager")
         self.btn_open_group_policy.Bind(wx.EVT_BUTTON, self.on_open_group_policy)
+        frame = self.GetParent()
+        if frame and hasattr(frame, "_feature_can_use"):
+            self.btn_open_bot_rules.Enable(bool(frame._feature_can_use("bot_rules")))
+            self.btn_open_group_policy.Enable(bool(frame._feature_can_use("group_policy")))
         self.allow_cross_server_dm_cb = wx.CheckBox(admin_box.GetStaticBox(), label="Allow direct messaging from Directory to users on other configured servers")
         self.allow_cross_server_dm_cb.SetValue(bool(self.config.get('allow_cross_server_directory_message', True)))
         edit_window_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -4435,21 +4439,26 @@ class GroupListDialog(wx.Dialog):
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
         self.list_box = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.list_box.SetName("Group chats list. Rows include group name, join state, topic, and member count.")
         self.list_box.Bind(wx.EVT_LISTBOX_DCLICK, self.on_open)
         self.info = wx.StaticText(panel, label="Use Create, Join, Leave, or Open to manage group chats.")
+        self.info.SetName("Group chat instructions")
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_create = wx.Button(panel, label="Create")
         self.btn_join = wx.Button(panel, label="Join")
         self.btn_leave = wx.Button(panel, label="Leave")
         self.btn_open = wx.Button(panel, label="Open")
         self.btn_refresh = wx.Button(panel, label="Refresh")
-        for b in [self.btn_create, self.btn_join, self.btn_leave, self.btn_open, self.btn_refresh]:
+        self.btn_policy = wx.Button(panel, label="Manage Group Policy")
+        self.btn_policy.Enable(bool(parent_frame._feature_can_use("group_policy")))
+        for b in [self.btn_create, self.btn_join, self.btn_leave, self.btn_open, self.btn_refresh, self.btn_policy]:
             btn_row.Add(b, 1, wx.EXPAND | wx.ALL, 3)
         self.btn_create.Bind(wx.EVT_BUTTON, self.on_create)
         self.btn_join.Bind(wx.EVT_BUTTON, self.on_join)
         self.btn_leave.Bind(wx.EVT_BUTTON, self.on_leave)
         self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
         self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
+        self.btn_policy.Bind(wx.EVT_BUTTON, lambda _: parent_frame.on_manage_group_policy(None))
         s.Add(self.info, 0, wx.EXPAND | wx.ALL, 8)
         s.Add(self.list_box, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -4554,7 +4563,9 @@ class GroupChatDialog(wx.Dialog):
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
         self.members_lbl = wx.StaticText(panel, label="Members: loading...")
+        self.members_lbl.SetName("Group members and roles")
         self.hist = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.hist.SetName("Group chat messages")
         self.input = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_PROCESS_ENTER)
         self.btn_send = wx.Button(panel, label="Send")
         self.btn_members = wx.Button(panel, label="Refresh Members")
@@ -5927,6 +5938,9 @@ class MainFrame(wx.Frame):
         wx.GetApp().play_sound("receive.wav")
 
     def on_group_chats(self, _):
+        if not self._feature_can_use("group_chat"):
+            wx.MessageBox("Group chats are disabled for your account on this server.", "Feature Disabled", wx.OK | wx.ICON_INFORMATION)
+            return
         if self._group_list_dlg and self._group_list_dlg.IsShown():
             self._group_list_dlg.Raise()
             self._group_list_dlg.SetFocus()
@@ -6417,6 +6431,10 @@ class AdminDialog(wx.Dialog):
         btn = wx.Button(self, label="&Send Command")
         btn_rules = wx.Button(self, label="Manage Bot Rules")
         btn_group_policy = wx.Button(self, label="Manage Group Policy")
+        parent_frame = self.GetParent()
+        if parent_frame and hasattr(parent_frame, "_feature_can_use"):
+            btn_rules.Enable(bool(parent_frame._feature_can_use("bot_rules")))
+            btn_group_policy.Enable(bool(parent_frame._feature_can_use("group_policy")))
         
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)
@@ -6638,7 +6656,9 @@ class GroupPolicyDialog(wx.Dialog):
         self.info.Wrap(740)
         splitter = wx.SplitterWindow(panel, style=wx.SP_LIVE_UPDATE)
         self.schema_list = wx.ListBox(splitter, style=wx.LB_SINGLE)
+        self.schema_list.SetName("Policy keys and descriptions")
         self.policy_txt = wx.TextCtrl(splitter, style=wx.TE_MULTILINE)
+        self.policy_txt.SetName("Editable policy JSON")
         splitter.SplitVertically(self.schema_list, self.policy_txt, 320)
         splitter.SetMinimumPaneSize(220)
 
@@ -6649,6 +6669,8 @@ class GroupPolicyDialog(wx.Dialog):
 
         s.Add(top, 0, wx.EXPAND | wx.ALL, 8)
         s.Add(self.info, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Policy keys and descriptions:"), 0, wx.LEFT | wx.RIGHT, 8)
+        s.Add(wx.StaticText(panel, label="Policy JSON (editable):"), 0, wx.LEFT | wx.RIGHT, 8)
         s.Add(splitter, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         s.Add(close_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         panel.SetSizer(s)

@@ -227,6 +227,16 @@ Admin command shortcuts:
 * `/gpolicy set <key> <value> [group_name]`
 * `/gpolicy reset [group_name]`
 
+### Group Chats
+
+Use File -> Conversations -> Group Chats to view every server group by name,
+topic, join state, and member count. Users can create groups, join or leave
+rooms, open a group conversation, refresh the member list, and send group text
+subject to the room policy.
+
+Bots are not added to new users' contacts automatically. They remain available
+in User Directory so a user can choose Add to Contacts when they want one.
+
 ### In-app F1 webview documentation generation
 
 This repo includes an Ollama-based generator for contextual in-app help pages used by F1 dialogs/webviews.

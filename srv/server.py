@@ -61,7 +61,7 @@ FEATURE_DEFAULTS = {
     "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
     "bot_moderation": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot-powered moderation watch, spam scoring, and guest activity feeds."},
     "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
-    "group_chat": {"enabled": False, "ui_visible": False, "scope": "admin", "description": "Reserved for future group chat create/join/send features."},
+    "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group chat creation, membership, room listing, and messaging."},
     "group_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group call session and signaling features."},
     "voice_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Direct voice call session and signaling features."},
     "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
@@ -403,17 +403,16 @@ def _seed_feature_defaults():
                 datetime.datetime.utcnow().isoformat(),
             ),
         )
-    con.commit()
-    # Do not advertise group chat until create/join/send message handlers exist.
+    # Upgrade installations that were seeded while group chat was still a
+    # placeholder; preserve any deliberate admin policy changes otherwise.
     con.execute(
         """
         UPDATE feature_policies
-        SET enabled=0, ui_visible=0, scope='admin',
-            description='Reserved for future group chat create/join/send features.',
-            updated_by='system', updated_at=?
-        WHERE feature_key='group_chat'
+        SET enabled=1, ui_visible=1, scope='all',
+            description=?, updated_by='system', updated_at=?
+        WHERE feature_key='group_chat' AND description LIKE 'Reserved for future%'
         """,
-        (datetime.datetime.utcnow().isoformat(),),
+        (FEATURE_DEFAULTS['group_chat']['description'], datetime.datetime.utcnow().isoformat()),
     )
     con.commit()
     con.close()
@@ -1343,7 +1342,7 @@ def _normalize_direct_bot_chat_text(text, bot_name):
     return body
 
 def _default_bot_contacts():
-    raw = str(bot_runtime_config.get('default_bot_contacts', 'Clawdia') or '')
+    raw = str(bot_runtime_config.get('default_bot_contacts', '') or '')
     names = [name.strip() for name in raw.split(',') if name.strip()]
     return [name for name in names if _is_registered_bot(name)]
 
@@ -2282,7 +2281,7 @@ def load_config():
         'moderation_watch_guest_logins': config.getboolean('bots', 'moderation_watch_guest_logins', fallback=True),
         'moderation_excerpt_limit': config.getint('bots', 'moderation_excerpt_limit', fallback=280),
         'memory_messages_per_user': config.getint('bots', 'memory_messages_per_user', fallback=80),
-        'default_bot_contacts': config.get('bots', 'default_bot_contacts', fallback='Clawdia'),
+        'default_bot_contacts': config.get('bots', 'default_bot_contacts', fallback=''),
         'identity_aliases': _parse_identity_aliases(config.get('bots', 'identity_aliases', fallback='Dominique:Dominique,Tappedinfm,tappedinfm,Adonis,Adonis1111')),
     }
     return {
@@ -3807,6 +3806,9 @@ def handle_client(cs, addr):
                         except Exception:
                             pass
             elif action == "group_list":
+                if not _can_user_use_feature(user, "group_chat"):
+                    _deny_feature("group_chat", "group_list_response")
+                    continue
                 groups = _list_groups_for_user(user)
                 try:
                     sock.sendall((json.dumps({"action": "group_list_response", "groups": groups}) + "\n").encode())
@@ -3814,6 +3816,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_create":
+                if not _can_user_use_feature(user, "group_chat"):
+                    _deny_feature("group_chat", "group_create_result")
+                    continue
                 group_name = str(msg.get("group", "")).strip()
                 topic = str(msg.get("topic", "") or "").strip()
                 ok, reason = _create_group(user, group_name, topic=topic)
@@ -3826,6 +3831,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_join":
+                if not _can_user_use_feature(user, "group_chat"):
+                    _deny_feature("group_chat", "group_join_result")
+                    continue
                 group_name = str(msg.get("group", "")).strip()
                 ok, reason = _join_group(user, group_name)
                 payload = {"action": "group_join_result", "ok": bool(ok), "group": group_name}
@@ -3837,6 +3845,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_leave":
+                if not _can_user_use_feature(user, "group_chat"):
+                    _deny_feature("group_chat", "group_leave_result")
+                    continue
                 group_name = str(msg.get("group", "")).strip()
                 ok, reason = _leave_group(user, group_name)
                 payload = {"action": "group_leave_result", "ok": bool(ok), "group": group_name}
@@ -3848,6 +3859,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_members":
+                if not _can_user_use_feature(user, "group_chat"):
+                    _deny_feature("group_chat", "group_members_response")
+                    continue
                 group_name = str(msg.get("group", "")).strip()
                 members = _group_members(group_name) if _group_exists(group_name) else []
                 try:
@@ -3856,6 +3870,9 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "group_msg":
+                if not _can_user_use_feature(user, "group_chat"):
+                    _deny_feature("group_chat", "group_msg_failed")
+                    continue
                 group_name = str(msg.get("group", "")).strip()
                 text = str(msg.get("msg", "") or "").strip()
                 if not group_name or not _group_exists(group_name):
