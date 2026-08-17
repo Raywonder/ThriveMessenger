@@ -17,6 +17,7 @@ targets:
       - path: ThriveMessenger
     settings:
       PRODUCT_BUNDLE_IDENTIFIER: fm.tappedin.thrive-messenger
+      INFOPLIST_FILE: ThriveMessenger/Info.plist
       INFOPLIST_KEY_CFBundleDisplayName: Thrive Messenger
       INFOPLIST_KEY_NSMicrophoneUsageDescription: Thrive Messenger uses the microphone for voice calls.
       INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: Thrive Messenger uses speech recognition only when you enable an accessibility feature that needs it.
