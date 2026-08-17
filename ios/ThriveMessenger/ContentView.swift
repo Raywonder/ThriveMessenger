@@ -9,47 +9,83 @@ struct ContentView: View {
     @State private var showingCreate = false
 
     var body: some View {
-        NavigationSplitView {
-            List(selection: $selectedGroup) {
-                Section("Group Chats") {
-                    ForEach(model.client.groups) { group in
-                        VStack(alignment: .leading) {
-                            Text(group.name).font(.headline)
-                            Text("\(group.memberCount) members" + (group.topic.isEmpty ? "" : " · \(group.topic)"))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }.tag(group)
-                    }
-                }
-                Section("Contacts") {
-                    ForEach(model.client.contacts) { contact in
-                        Label(contact.user, systemImage: contact.online ? "circle.fill" : "circle")
-                    }
-                }
+        GroupNavigationView(selectedGroup: $selectedGroup, draft: $newMessage, showCreate: $showingCreate)
+            .environmentObject(model)
+            .alert("Create Group", isPresented: $showingCreate) {
+                Button("Cancel", role: .cancel) {}
+                Button("Create") { model.client.createGroup(name: "New Group", topic: "") }
+            } message: {
+                Text("The first iOS slice is connected to the existing Thrive group-chat protocol.")
             }
-            .navigationTitle("Thrive Messenger")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("Sign In") { signIn() } }
-                ToolbarItem(placement: .topBarTrailing) { Button("New Group", systemImage: "person.3.fill") { showingCreate = true } }
-            }
-        } detail: {
-            if let group = selectedGroup {
-                GroupChatView(group: group, client: model.client, draft: $newMessage)
-            } else {
-                ContentUnavailableView("Choose a group chat", systemImage: "bubble.left.and.bubble.right", description: Text("Group chats appear here with their names and member counts."))
-            }
-        }
-        .alert("Create Group", isPresented: $showingCreate) {
-            Button("Cancel", role: .cancel) {}
-            Button("Create") { model.client.createGroup(name: "New Group", topic: "") }
-        } message: { Text("Use the group controls to create a named room. The first iOS slice is connected to the existing Thrive group-chat protocol.") }
-        .alert("Connection", isPresented: Binding(get: { model.client.errorMessage != nil }, set: { if !$0 { model.client.errorMessage = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: { Text(model.client.errorMessage ?? "") }
+            .alert("Connection", isPresented: Binding(get: { model.client.errorMessage != nil }, set: { if !$0 { model.client.errorMessage = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(model.client.errorMessage ?? "") }
     }
 
     private func signIn() {
         guard !user.isEmpty else { return }
         model.client.connect(user: user, password: password)
+    }
+}
+
+private struct GroupNavigationView: View {
+    @EnvironmentObject private var model: MessengerModel
+    @Binding var selectedGroup: Group?
+    @Binding var draft: String
+    @Binding var showCreate: Bool
+
+    var body: some View {
+        NavigationSplitView {
+            GroupSidebar(groups: model.client.groups, contacts: model.client.contacts, selection: $selectedGroup)
+                .navigationTitle("Thrive Messenger")
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) { Button("Sign In") { model.client.connect(user: "", password: "") } }
+                    ToolbarItem(placement: .topBarTrailing) { Button("New Group", systemImage: "person.3.fill") { showCreate = true } }
+                }
+        } detail: {
+            if let group = selectedGroup {
+                GroupChatView(group: group, client: model.client, draft: $draft)
+            } else {
+                ContentUnavailableView("Choose a group chat", systemImage: "bubble.left.and.bubble.right", description: Text("Group chats appear here with their names and member counts."))
+            }
+        }
+    }
+}
+
+private struct GroupSidebar: View {
+    let groups: [Group]
+    let contacts: [Contact]
+    @Binding var selection: Group?
+
+    var body: some View {
+        List(selection: $selection) {
+            Section("Group Chats") {
+                ForEach(groups) { group in
+                    GroupRow(group: group).tag(group)
+                }
+            }
+            Section("Contacts") {
+                ForEach(contacts) { contact in
+                    Label(contact.user, systemImage: contact.online ? "circle.fill" : "circle")
+                }
+            }
+        }
+    }
+}
+
+private struct GroupRow: View {
+    let group: Group
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            Text(group.name).font(.headline)
+            Text(memberSummary).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var memberSummary: String {
+        let topic = group.topic.isEmpty ? "" : " · \(group.topic)"
+        return "\(group.memberCount) members\(topic)"
     }
 }
 
