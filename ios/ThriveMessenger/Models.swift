@@ -17,7 +17,7 @@ struct Contact: Codable, Identifiable {
     }
 }
 
-struct Group: Codable, Identifiable {
+struct Group: Codable, Identifiable, Hashable {
     var name: String
     var topic: String = ""
     var memberCount: Int = 0

@@ -7,9 +7,10 @@ struct ContentView: View {
     @State private var selectedGroup: Group?
     @State private var newMessage = ""
     @State private var showingCreate = false
+    @State private var showingSignIn = false
 
     var body: some View {
-        GroupNavigationView(selectedGroup: $selectedGroup, draft: $newMessage, showCreate: $showingCreate)
+        GroupNavigationView(selectedGroup: $selectedGroup, draft: $newMessage, showCreate: $showingCreate, showSignIn: $showingSignIn)
             .environmentObject(model)
             .alert("Create Group", isPresented: $showingCreate) {
                 Button("Cancel", role: .cancel) {}
@@ -20,6 +21,9 @@ struct ContentView: View {
             .alert("Connection", isPresented: Binding(get: { model.client.errorMessage != nil }, set: { if !$0 { model.client.errorMessage = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: { Text(model.client.errorMessage ?? "") }
+            .sheet(isPresented: $showingSignIn) {
+                SignInView(client: model.client)
+            }
     }
 
     private func signIn() {
@@ -33,13 +37,14 @@ private struct GroupNavigationView: View {
     @Binding var selectedGroup: Group?
     @Binding var draft: String
     @Binding var showCreate: Bool
+    @Binding var showSignIn: Bool
 
     var body: some View {
         NavigationSplitView {
             GroupSidebar(groups: model.client.groups, contacts: model.client.contacts, selection: $selectedGroup)
                 .navigationTitle("Thrive Messenger")
                 .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { Button("Sign In") { model.client.connect(user: "", password: "") } }
+                    ToolbarItem(placement: .topBarLeading) { Button("Sign In") { showSignIn = true } }
                     ToolbarItem(placement: .topBarTrailing) { Button("New Group", systemImage: "person.3.fill") { showCreate = true } }
                 }
         } detail: {
@@ -48,6 +53,28 @@ private struct GroupNavigationView: View {
             } else {
                 ContentUnavailableView("Choose a group chat", systemImage: "bubble.left.and.bubble.right", description: Text("Group chats appear here with their names and member counts."))
             }
+        }
+    }
+}
+
+private struct SignInView: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var client: ThriveClient
+    @State private var user = ""
+    @State private var password = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Username", text: $user).textInputAutocapitalization(.never).autocorrectionDisabled()
+                SecureField("Password", text: $password)
+                Button("Connect") {
+                    client.connect(user: user, password: password)
+                    dismiss()
+                }.disabled(user.isEmpty || password.isEmpty)
+            }
+            .navigationTitle("Sign In")
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Cancel") { dismiss() } } }
         }
     }
 }
