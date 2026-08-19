@@ -19,7 +19,8 @@ python -m pip install \
   "pyinstaller>=6.18.0" \
   "keyring>=25.7.0" \
   "plyer>=2.1.0" \
-  "wxPython>=4.2.5"
+  "wxPython>=4.2.5" \
+  "sounddevice>=0.5.1"
 
 rm -rf build dist "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
@@ -34,8 +35,6 @@ pyinstaller \
   --add-data "assets/help:assets/help" \
   --add-data "assets/videos:assets/videos" \
   --add-data "sounds:sounds" \
-  --add-data "scripts/thrive_bot_mesh_agent.py:scripts" \
-  --add-data "scripts/BOT_MESH_AGENT.md:scripts" \
   --add-data "README.md:." \
   main.py
 
