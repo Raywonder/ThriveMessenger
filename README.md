@@ -188,7 +188,7 @@ Shift Tabbing once from the command input field will show a list of outputs for 
 
 ### Bot rules and agent rulesets
 
-Thrive bots can follow a shared agent ruleset loaded from an agent ZIP (for example `/home/<current-user>/shared/agents/*.zip`), and server admins can override rules per bot for their own admin account/server workflow.
+Bots are an **experimental optional server module** and are disabled and hidden by default. Bot operators host their own bot process, authenticate it as a bot identity, and may connect that identity to one or several Thrive servers. Ordinary Thrive clients and Windows installers do not bundle or launch a bot runtime. When the experimental module is installed, bots can follow a server-hosted ruleset and administrators can override rules for their server workflow.
 
 Key behavior:
 
@@ -201,6 +201,18 @@ Key behavior:
 ### Advanced group chat policy controls
 
 Server admins can define advanced group chat/call policies globally and per group.
+
+### Group rooms and voice
+
+The **Groups** tab provides persistent rooms hosted entirely by the connected Thrive server. Room owners can create public or private rooms, invite members, assign owner/admin/moderator/user/guest roles, and configure which roles may view, message, transfer files, join voice, invite, moderate, or manage the room. Room messages are stored in the server database and room files are delivered to online room members.
+
+Rooms can expire after one day, one week, one month, one year, never, or immediately after their final member leaves. Server-level group policy remains authoritative and can disable text, files, or voice even when a room role would otherwise allow it.
+
+Group and direct voice calls are relayed by the Thrive server over the existing encrypted connection. No external voice provider is required. The Audio settings page includes microphone and speaker selection, input/output levels, and calls provide mute and deafen controls. Headphones are recommended because the lightweight built-in relay does not perform acoustic echo cancellation.
+
+### Server modules
+
+Administrators can open **Settings → Administration → Manage Server Modules** to enable or disable bundled Groups, Voice, Server Manager, and Advanced Administration modules. Optional modules such as experimental Bots are installed on the connected Thrive server—not in the client—from administrator-configured HTTPS catalogs hosted on a Thrive site, GitHub, or Gitea. Catalog archives require an allowlisted host when configured, a catalog-provided SHA-256 digest, a matching `module.json` identity, and safe archive paths. Dependencies are enforced automatically: enabling Voice also enables Groups, and disabling Groups also disables Voice.
 
 Managed in client UI:
 

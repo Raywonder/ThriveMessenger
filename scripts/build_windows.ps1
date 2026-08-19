@@ -22,9 +22,6 @@ if (Test-Path "assets") {
     Copy-Item -Recurse -Force "assets" (Join-Path $AppDir "assets")
 }
 
-New-Item -ItemType Directory -Force -Path (Join-Path $AppDir "scripts") | Out-Null
-Copy-Item -Force "scripts\thrive_bot_mesh_agent.py" (Join-Path $AppDir "scripts\thrive_bot_mesh_agent.py")
-Copy-Item -Force "scripts\BOT_MESH_AGENT.md" (Join-Path $AppDir "scripts\BOT_MESH_AGENT.md")
 Copy-Item -Force "README.md" (Join-Path $AppDir "README.md")
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null

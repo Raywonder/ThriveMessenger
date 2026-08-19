@@ -2,6 +2,10 @@ import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, u
 import smtplib, secrets
 import urllib.request, urllib.parse
 from email.mime.text import MIMEText
+try:
+    from . import feature_modules, group_rooms, module_installer
+except ImportError:
+    import feature_modules, group_rooms, module_installer
 
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
@@ -15,6 +19,7 @@ code_expires_label = "5m"
 flexpbx_config = {}
 file_config = {}
 bot_runtime_config = {}
+module_runtime_config = {}
 shutdown_timeout = 5
 max_status_length = 50
 pending_transfers = {}
@@ -46,12 +51,13 @@ group_call_sessions = {}
 # locked. A re-entrant lock keeps those operations atomic without deadlocking.
 group_call_lock = threading.RLock()
 FEATURE_DEFAULTS = {
-    "bots": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot contacts and bot chat features."},
-    "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
-    "bot_moderation": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot-powered moderation watch, spam scoring, and guest activity feeds."},
-    "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
+    "bots": {"enabled": False, "ui_visible": False, "scope": "all", "description": "Experimental externally hosted bot identities."},
+    "bot_mesh": {"enabled": False, "ui_visible": False, "scope": "all", "description": "Experimental multi-server bot relay."},
+    "bot_moderation": {"enabled": False, "ui_visible": False, "scope": "admin", "description": "Experimental bot-powered moderation."},
+    "bot_rules": {"enabled": False, "ui_visible": False, "scope": "admin", "description": "Experimental bot rules management."},
     "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group chat create/join/send features."},
     "group_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Group call session and signaling features."},
+    "voice_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Self-contained direct voice calls."},
     "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
     "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Server side admin command console."},
     "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Server manager and server tools UI."},
@@ -114,7 +120,7 @@ def _normalize_group_name(group_name):
 def _fetch_group_policy(scope="global", group_name=None):
     scope = "group" if str(scope).lower() == "group" else "global"
     group_name = _normalize_group_name(group_name)
-    defaults = _group_policy_defaults()
+    defaults = _fetch_group_policy("global", "__global__") if scope == "group" else _group_policy_defaults()
     try:
         con = sqlite3.connect(DB)
         row = con.execute(
@@ -232,13 +238,19 @@ def _feature_policy_row(feature_key):
             "scope": str(meta.get("scope", "all")),
             "description": str(meta.get("description", "")),
         }
-    return {
+    result = {
         "feature_key": fk,
         "enabled": bool(int(row[0] or 0)),
         "ui_visible": bool(int(row[1] or 0)),
         "scope": str(row[2] or "all"),
         "description": str(row[3] or ""),
     }
+    if fk in feature_modules.MODULES["bots"]["features"]:
+        modules_dir = module_runtime_config.get('modules_dir') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modules')
+        if "bots" not in module_installer.installed_module_ids(modules_dir):
+            result["enabled"] = False
+            result["ui_visible"] = False
+    return result
 
 def _feature_user_allowed(feature_key, username):
     con = sqlite3.connect(DB)
@@ -324,11 +336,33 @@ def _group_call_broadcast(group_name, payload, exclude=None):
         except Exception:
             pass
 
+def _room_broadcast(room_id, payload, exclude=None):
+    """Send a room event to each currently connected room member."""
+    try:
+        members = [item["username"] for item in group_rooms.list_members(DB, room_id)]
+    except Exception:
+        members = []
+    with lock:
+        targets = [clients[name] for name in members if name != exclude and name in clients]
+    wire = (json.dumps(payload) + "\n").encode()
+    for target in targets:
+        try:
+            target.sendall(wire)
+        except Exception:
+            pass
+
 def _remove_user_from_all_group_calls(username):
     events = []
+    direct_events = []
     with group_call_lock:
         for g, data in list(group_call_sessions.items()):
             participants = data.get("participants", set())
+            pending = data.get("pending")
+            if data.get("direct") and (username in participants or pending == username):
+                others = (set(participants) | ({pending} if pending else set())) - {username}
+                direct_events.extend((other, g.removeprefix("direct:")) for other in others)
+                group_call_sessions.pop(g, None)
+                continue
             if username in participants:
                 participants.discard(username)
                 snapshot = {"action": "group_call_event", "event": "leave", "by": username}
@@ -338,6 +372,36 @@ def _remove_user_from_all_group_calls(username):
                 group_call_sessions.pop(g, None)
     for g, payload in events:
         _group_call_broadcast(g, payload, exclude=username)
+    for target, call_id in direct_events:
+        with lock:
+            target_sock = clients.get(target)
+        if target_sock:
+            try: target_sock.sendall((json.dumps({"action": "voice_call_event", "event": "ended", "call_id": call_id, "with": username}) + "\n").encode())
+            except Exception: pass
+
+def _user_has_direct_call(username):
+    with group_call_lock:
+        for data in group_call_sessions.values():
+            if not data.get("direct"):
+                continue
+            if username in data.get("participants", set()) or username == data.get("pending"):
+                return True
+    return False
+
+def _expire_direct_call(call_id):
+    group_key = f"direct:{call_id}"
+    with group_call_lock:
+        data = group_call_sessions.get(group_key)
+        if not data or not data.get("pending"):
+            return
+        group_call_sessions.pop(group_key, None)
+    names = set(data.get("participants", set())) | {data.get("pending")}
+    with lock:
+        targets = [clients.get(name) for name in names]
+    for target in targets:
+        if target:
+            try: target.sendall((json.dumps({"action": "voice_call_event", "event": "failed", "call_id": call_id, "reason": "The call was not answered."}) + "\n").encode())
+            except Exception: pass
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
 
@@ -1207,10 +1271,8 @@ def load_config():
         'post_login': config.get('welcome', 'post_login', fallback=''),
     }
     global bot_usernames
-    raw_bots = config.get('bots', 'names', fallback='assistant-bot,helper-bot')
+    raw_bots = config.get('bots', 'names', fallback='')
     bot_usernames = {name.strip() for name in raw_bots.split(',') if name.strip()}
-    if not bot_usernames:
-        bot_usernames = {"assistant-bot", "helper-bot"}
     global bot_status_map
     bot_status_map = _parse_bot_map(config.get('bots', 'status_map', fallback=''))
     global bot_purpose_map
@@ -1242,7 +1304,7 @@ def load_config():
     _refresh_bot_rules()
     global bot_runtime_config
     bot_runtime_config = {
-        'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=True),
+        'ollama_enabled': config.getboolean('bots', 'ollama_enabled', fallback=False),
         'ollama_url': config.get('bots', 'ollama_url', fallback='http://127.0.0.1:11434'),
         'ollama_model': config.get('bots', 'ollama_model', fallback='llama3.2'),
         'ollama_timeout': config.getint('bots', 'ollama_timeout', fallback=20),
@@ -1258,6 +1320,14 @@ def load_config():
         'moderation_watch_file_offers': config.getboolean('bots', 'moderation_watch_file_offers', fallback=True),
         'moderation_watch_guest_logins': config.getboolean('bots', 'moderation_watch_guest_logins', fallback=True),
         'moderation_excerpt_limit': config.getint('bots', 'moderation_excerpt_limit', fallback=280),
+    }
+    global module_runtime_config
+    catalog_urls = [item.strip() for item in config.get('modules', 'catalog_urls', fallback='').split(',') if item.strip()]
+    allowed_hosts = {item.strip().lower() for item in config.get('modules', 'allowed_hosts', fallback='').split(',') if item.strip()}
+    module_runtime_config = {
+        'catalog_urls': catalog_urls,
+        'allowed_hosts': allowed_hosts,
+        'modules_dir': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'modules'),
     }
     return {
         'port': config.getint('server', 'port', fallback=5005),
@@ -1302,6 +1372,7 @@ def init_db():
     conn.commit()
     _seed_feature_defaults()
     conn.close()
+    group_rooms.init_group_schema(DB)
 
 def broadcast_contact_status(user, online):
     with lock:
@@ -1734,6 +1805,52 @@ def handle_client(cs, addr):
             
             if action == "get_feature_caps":
                 _send_feature_caps(sock, user)
+
+            elif action == "module_list":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "module_list_response")
+                    continue
+                installed = module_installer.installed_module_ids(module_runtime_config.get('modules_dir', ''))
+                catalog = feature_modules.module_catalog(_feature_policy_row, installed)
+                sock.sendall((json.dumps({"action": "module_list_response", "ok": True, "modules": catalog}) + "\n").encode())
+
+            elif action == "module_install":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "module_result"); continue
+                module_id = str(msg.get("module_id", ""))
+                metadata = feature_modules.MODULES.get(module_id)
+                if not metadata or metadata.get("bundled"):
+                    sock.sendall((json.dumps({"action": "module_result", "ok": False, "reason": "This module is bundled or unknown."}) + "\n").encode()); continue
+                try:
+                    manifest = module_installer.install_from_catalog(
+                        module_id, module_runtime_config.get('catalog_urls', []), module_runtime_config.get('modules_dir', ''), module_runtime_config.get('allowed_hosts') or None,
+                    )
+                    sock.sendall((json.dumps({"action": "module_result", "ok": True, "event": "installed", "module_id": module_id, "manifest": manifest, "restart_required": True}) + "\n").encode())
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "module_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "module_set_enabled":
+                if not _is_admin(user):
+                    _deny_feature("admin_console", "module_result")
+                    continue
+                module_id = str(msg.get("module_id", ""))
+                metadata = feature_modules.MODULES.get(module_id)
+                if not metadata:
+                    sock.sendall((json.dumps({"action": "module_result", "ok": False, "reason": "Unknown module."}) + "\n").encode())
+                    continue
+                enabled = bool(msg.get("enabled", True))
+                affected = feature_modules.modules_for_state_change(module_id, enabled)
+                con = sqlite3.connect(DB)
+                for affected_id in affected:
+                    for feature_key in feature_modules.MODULES[affected_id]["features"]:
+                        prior = _feature_policy_row(feature_key) or FEATURE_DEFAULTS[feature_key]
+                        con.execute(
+                            """INSERT OR REPLACE INTO feature_policies(feature_key, enabled, ui_visible, scope, description, updated_by, updated_at)
+                               VALUES(?,?,?,?,?,?,?)""",
+                            (feature_key, int(enabled), int(enabled), prior.get("scope", "all"), prior.get("description", ""), user, datetime.datetime.utcnow().isoformat()),
+                        )
+                con.commit(); con.close(); _broadcast_feature_caps()
+                sock.sendall((json.dumps({"action": "module_result", "ok": True, "module_id": module_id, "enabled": enabled}) + "\n").encode())
 
             elif action == "set_session_pref":
                 with lock:
@@ -2753,6 +2870,106 @@ def handle_client(cs, addr):
                 except Exception:
                     pass
 
+            elif action == "group_room_list":
+                try:
+                    rooms = group_rooms.list_rooms(DB, user)
+                    sock.sendall((json.dumps({"action": "group_room_list_response", "ok": True, "rooms": rooms}) + "\n").encode())
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_list_response", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_create":
+                try:
+                    room = group_rooms.create_room(
+                        DB, user, msg.get("name", ""), msg.get("description", ""),
+                        msg.get("visibility", "public"), msg.get("expiration", "never"),
+                    )
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": True, "event": "created", "room": room}) + "\n").encode())
+                    _room_broadcast(room["room_id"], {"action": "group_room_event", "event": "created", "room": room})
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_join":
+                try:
+                    room = group_rooms.join_room(DB, str(msg.get("room_id", "")), user)
+                    payload = {"action": "group_room_event", "event": "joined", "room": room, "username": user}
+                    _room_broadcast(room["room_id"], payload)
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": True, "event": "joined", "room": room}) + "\n").encode())
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_leave":
+                room_id = str(msg.get("room_id", ""))
+                try:
+                    deleted = group_rooms.leave_room(DB, room_id, user)
+                    _room_broadcast(room_id, {"action": "group_room_event", "event": "left", "room_id": room_id, "username": user})
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": True, "event": "left", "room_id": room_id, "deleted": deleted}) + "\n").encode())
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_open":
+                room_id = str(msg.get("room_id", ""))
+                try:
+                    room = group_rooms.get_room(DB, room_id, user)
+                    members = group_rooms.list_members(DB, room_id)
+                    messages = group_rooms.history(DB, room_id, user, msg.get("limit", 100))
+                    sock.sendall((json.dumps({"action": "group_room_open_response", "ok": True, "room": room, "members": members, "messages": messages}) + "\n").encode())
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_open_response", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_message":
+                room_id = str(msg.get("room_id", ""))
+                try:
+                    room = group_rooms.get_room(DB, room_id, user)
+                    if not _fetch_group_policy("group", room["name"]).get("allow_group_text", True):
+                        raise group_rooms.GroupRoomError("Room messages are disabled by server policy.")
+                    item = group_rooms.add_message(DB, room_id, user, msg.get("body", ""))
+                    _room_broadcast(room_id, {"action": "group_room_message", "message": item})
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_file":
+                room_id = str(msg.get("room_id", ""))
+                filename = os.path.basename(str(msg.get("filename", "")))
+                encoded = str(msg.get("data", ""))
+                try:
+                    raw_size = len(base64.b64decode(encoded, validate=True))
+                    policy = _fetch_group_policy("group", msg.get("room_name", ""))
+                    if not policy.get("allow_group_files", True):
+                        raise group_rooms.GroupRoomError("Room files are disabled by server policy.")
+                    if raw_size > int(policy.get("max_group_file_size_bytes", 52428800)):
+                        raise group_rooms.GroupRoomError("The file exceeds this room's size limit.")
+                    item = group_rooms.add_message(DB, room_id, user, "", "file", filename)
+                    _room_broadcast(room_id, {"action": "group_room_file", "message": item, "data": encoded})
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_set_role":
+                room_id = str(msg.get("room_id", ""))
+                try:
+                    group_rooms.set_member_role(DB, room_id, user, str(msg.get("username", "")), str(msg.get("role", "")))
+                    members = group_rooms.list_members(DB, room_id)
+                    _room_broadcast(room_id, {"action": "group_room_members", "room_id": room_id, "members": members})
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_add_member":
+                room_id = str(msg.get("room_id", ""))
+                try:
+                    group_rooms.add_member(DB, room_id, user, str(msg.get("username", "")), str(msg.get("role", "user")))
+                    members = group_rooms.list_members(DB, room_id)
+                    _room_broadcast(room_id, {"action": "group_room_members", "room_id": room_id, "members": members})
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
+            elif action == "group_room_update":
+                room_id = str(msg.get("room_id", ""))
+                try:
+                    room = group_rooms.update_room(DB, room_id, user, msg.get("changes", {}))
+                    _room_broadcast(room_id, {"action": "group_room_event", "event": "updated", "room": room})
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": True, "event": "updated", "room": room}) + "\n").encode())
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_room_result", "ok": False, "reason": str(exc)}) + "\n").encode())
+
             elif action == "group_call_list":
                 if not _can_user_use_feature(user, "group_call"):
                     _deny_feature("group_call", "group_call_list_response")
@@ -2767,13 +2984,54 @@ def handle_client(cs, addr):
                 except Exception:
                     pass
 
+            elif action == "voice_call_request":
+                if not _can_user_use_feature(user, "voice_call"):
+                    _deny_feature("voice_call", "voice_call_event"); continue
+                target = str(msg.get("to", "")).strip()
+                with lock: target_sock = clients.get(target)
+                blocked = False
+                if target:
+                    con = sqlite3.connect(DB); blocked_row = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (target, user)).fetchone(); con.close()
+                    blocked = bool(blocked_row and blocked_row[0])
+                if not target_sock or target == user or blocked or _user_has_direct_call(user) or _user_has_direct_call(target):
+                    sock.sendall((json.dumps({"action": "voice_call_event", "event": "failed", "reason": "The user is unavailable."}) + "\n").encode()); continue
+                call_id = str(uuid.uuid4()); group_key = f"direct:{call_id}"
+                with group_call_lock: group_call_sessions[group_key] = {"mode": "voice", "participants": {user}, "pending": target, "direct": True}
+                target_sock.sendall((json.dumps({"action": "voice_call_incoming", "call_id": call_id, "from": user}) + "\n").encode())
+                sock.sendall((json.dumps({"action": "voice_call_event", "event": "ringing", "call_id": call_id, "with": target}) + "\n").encode())
+                expiry = threading.Timer(60, _expire_direct_call, args=(call_id,)); expiry.daemon = True; expiry.start()
+
+            elif action == "voice_call_accept":
+                call_id = str(msg.get("call_id", "")); group_key = f"direct:{call_id}"
+                with group_call_lock:
+                    data = group_call_sessions.get(group_key)
+                    if not data or data.get("pending") != user: data = None
+                    else: data["participants"].add(user); data.pop("pending", None); participants = set(data["participants"])
+                if not data: continue
+                for participant in participants:
+                    with lock: target_sock = clients.get(participant)
+                    if target_sock: target_sock.sendall((json.dumps({"action": "voice_call_event", "event": "accepted", "call_id": call_id, "with": next((name for name in participants if name != participant), "")}) + "\n").encode())
+
+            elif action in ("voice_call_decline", "voice_call_end"):
+                call_id = str(msg.get("call_id", "")); group_key = f"direct:{call_id}"
+                with group_call_lock:
+                    data = group_call_sessions.get(group_key)
+                    participants = set((data or {}).get("participants", set())); pending = (data or {}).get("pending")
+                    if pending: participants.add(pending)
+                    if not data or user not in participants: continue
+                    group_call_sessions.pop(group_key, None)
+                for participant in participants:
+                    if participant == user: continue
+                    with lock: target_sock = clients.get(participant)
+                    if target_sock: target_sock.sendall((json.dumps({"action": "voice_call_event", "event": "declined" if action.endswith("decline") else "ended", "call_id": call_id, "with": user}) + "\n").encode())
+
             elif action == "group_call_join":
                 if not _can_user_use_feature(user, "group_call"):
                     _deny_feature("group_call", "group_call_result")
                     continue
                 group = str(msg.get("group", "")).strip()
                 mode = str(msg.get("mode", "voice") or "voice").strip().lower()
-                if mode not in ("voice", "video"):
+                if mode != "voice":
                     mode = "voice"
                 if not group:
                     try:
@@ -2782,12 +3040,9 @@ def handle_client(cs, addr):
                         pass
                     continue
                 # Enforce global/group call policy when configured.
-                policy = _fetch_group_policy(scope="global", group_name="__global__")
+                policy = _fetch_group_policy(scope="group", group_name=group)
                 if mode == "voice" and not policy.get("allow_group_voice", True):
                     sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": "Group voice calls are disabled."}) + "\n").encode())
-                    continue
-                if mode == "video" and not policy.get("allow_group_video", True):
-                    sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": "Group video calls are disabled."}) + "\n").encode())
                     continue
                 with group_call_lock:
                     data = group_call_sessions.setdefault(group, {"mode": mode, "participants": set()})
@@ -2803,7 +3058,7 @@ def handle_client(cs, addr):
                 payload.update(_group_call_snapshot(group))
                 _group_call_broadcast(group, payload)
                 try:
-                    sock.sendall((json.dumps({"action": "group_call_result", "ok": True, "group": group}) + "\n").encode())
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": True, "event": "joined", "group": group, "mode": mode}) + "\n").encode())
                 except Exception:
                     pass
 
@@ -2826,7 +3081,7 @@ def handle_client(cs, addr):
                 payload.update(_group_call_snapshot(group))
                 _group_call_broadcast(group, payload, exclude=user)
                 try:
-                    sock.sendall((json.dumps({"action": "group_call_result", "ok": True, "group": group}) + "\n").encode())
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": True, "event": "left", "group": group}) + "\n").encode())
                 except Exception:
                     pass
 
@@ -2840,6 +3095,20 @@ def handle_client(cs, addr):
                 signal_data = msg.get("data", {})
                 if not group or not target:
                     sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Group and target are required."}) + "\n").encode())
+                    continue
+                try:
+                    room = group_rooms.get_room_by_name(DB, group, user)
+                    if not room.get("role") or not group_rooms.can(DB, room["room_id"], user, "join_voice"):
+                        raise group_rooms.GroupRoomError("Your room role cannot join voice.")
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": str(exc)}) + "\n").encode())
+                    continue
+                try:
+                    room = group_rooms.get_room_by_name(DB, group, user)
+                    if not room.get("role") or not group_rooms.can(DB, room["room_id"], user, "join_voice"):
+                        raise group_rooms.GroupRoomError("Your room role cannot join voice.")
+                except Exception as exc:
+                    sock.sendall((json.dumps({"action": "group_call_result", "ok": False, "group": group, "reason": str(exc)}) + "\n").encode())
                     continue
                 if not signal_type or len(signal_type) > 64 or not isinstance(signal_data, dict):
                     sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Invalid signaling payload."}) + "\n").encode())
@@ -2872,6 +3141,24 @@ def handle_client(cs, addr):
                     sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": True, "group": group, "to": target}) + "\n").encode())
                 except Exception:
                     sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Signal relay failed."}) + "\n").encode())
+
+            elif action == "group_call_audio":
+                group = str(msg.get("group", "")).strip()
+                feature_key = "voice_call" if group.startswith("direct:") else "group_call"
+                if not _can_user_use_feature(user, feature_key):
+                    continue
+                encoded = str(msg.get("data", ""))
+                try:
+                    raw = base64.b64decode(encoded, validate=True)
+                except Exception:
+                    continue
+                if not group or not raw or len(raw) > 32768:
+                    continue
+                with group_call_lock:
+                    participants = set((group_call_sessions.get(group) or {}).get("participants", set()))
+                if user not in participants:
+                    continue
+                _group_call_broadcast(group, {"action": "group_call_audio", "group": group, "from": user, "data": encoded}, exclude=user)
 
             elif action == "msg":
                 to, frm = msg["to"], msg["from"]

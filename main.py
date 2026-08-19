@@ -1,7 +1,11 @@
-import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time, secrets
+import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time, secrets, queue, array
 import urllib.request, urllib.parse
 import traceback, platform
 import keyring
+try:
+    import sounddevice
+except Exception:
+    sounddevice = None
 try:
     import wx.html2 as wxhtml2
 except Exception:
@@ -57,6 +61,16 @@ _SOUND_DOWNLOAD_NOTICE_CACHE = set()
 _SOUND_DOWNLOAD_FAILURE_CACHE = set()
 UPDATE_CONTEXT = {}
 
+def scale_pcm16(data, gain):
+    """Scale little-endian signed 16-bit PCM without deprecated audioop."""
+    if gain == 1.0:
+        return data
+    samples = array.array("h")
+    samples.frombytes(data)
+    for index, sample in enumerate(samples):
+        samples[index] = max(-32768, min(32767, int(sample * gain)))
+    return samples.tobytes()
+
 def _use_keyring_runtime():
     # macOS Intel systems can hang during keychain calls before any UI is shown.
     # Use the existing fallback credential storage path on macOS for responsiveness.
@@ -90,6 +104,11 @@ def apply_voiceover_hint(control, hint):
         control.SetToolTip(str(hint))
     except Exception:
         pass
+
+class F3SearchTextCtrl(wx.TextCtrl):
+    """A search field reached explicitly with F3 instead of normal Tab order."""
+    def AcceptsFocusFromKeyboard(self):
+        return False
     try:
         control.SetHelpText(str(hint))
     except Exception:
@@ -548,8 +567,6 @@ def save_user_config(settings):
                 # Password might not exist, ignore
                 pass
 
-SERVER_CONFIG = load_server_config()
-ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
 _IPC_PORT = 48951
 _LOG_FILE_NAME = "thrive_client.log"
 
@@ -1057,6 +1074,9 @@ def load_client_config():
     config.read(get_client_conf_read_paths())
     return config
 
+SERVER_CONFIG = load_server_config()
+ADDR = (SERVER_CONFIG['host'], SERVER_CONFIG['port'])
+
 def get_macos_app_bundle_path():
     if sys.platform != 'darwin':
         return None
@@ -1445,6 +1465,23 @@ class SettingsDialog(wx.Dialog):
         self.call_input_slider = wx.Slider(call_audio_box.GetStaticBox(), value=int(self.config.get('call_input_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         self.call_out_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Call output volume")
         self.call_output_slider = wx.Slider(call_audio_box.GetStaticBox(), value=int(self.config.get('call_output_volume', 80)), minValue=0, maxValue=100, style=wx.SL_HORIZONTAL | wx.SL_LABELS)
+        self.call_input_devices = [(None, "System default microphone")]
+        self.call_output_devices = [(None, "System default speakers")]
+        if sounddevice is not None:
+            try:
+                for index, device in enumerate(sounddevice.query_devices()):
+                    if int(device.get("max_input_channels", 0)) > 0: self.call_input_devices.append((index, str(device.get("name", index))))
+                    if int(device.get("max_output_channels", 0)) > 0: self.call_output_devices.append((index, str(device.get("name", index))))
+            except Exception:
+                pass
+        self.call_input_device_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Microphone device:")
+        self.call_input_device_choice = wx.Choice(call_audio_box.GetStaticBox(), choices=[item[1] for item in self.call_input_devices])
+        self.call_output_device_label = wx.StaticText(call_audio_box.GetStaticBox(), label="Speaker device:")
+        self.call_output_device_choice = wx.Choice(call_audio_box.GetStaticBox(), choices=[item[1] for item in self.call_output_devices])
+        input_id = self.config.get("call_input_device")
+        output_id = self.config.get("call_output_device")
+        self.call_input_device_choice.SetSelection(next((i for i, item in enumerate(self.call_input_devices) if item[0] == input_id), 0))
+        self.call_output_device_choice.SetSelection(next((i for i, item in enumerate(self.call_output_devices) if item[0] == output_id), 0))
         self.auto_open_files_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Auto-open received files after save")
         self.auto_open_files_cb.SetValue(bool(self.config.get('auto_open_received_files', True)))
         self.read_aloud_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Read incoming chat messages aloud")
@@ -1568,6 +1605,8 @@ class SettingsDialog(wx.Dialog):
         self.btn_open_bot_rules.Bind(wx.EVT_BUTTON, self.on_open_bot_rules)
         self.btn_open_group_policy = wx.Button(admin_box.GetStaticBox(), label="Open Group Policy Manager")
         self.btn_open_group_policy.Bind(wx.EVT_BUTTON, self.on_open_group_policy)
+        self.btn_open_modules = wx.Button(admin_box.GetStaticBox(), label="Manage Server Modules")
+        self.btn_open_modules.Bind(wx.EVT_BUTTON, self.on_open_modules)
         self.bot_mesh_hint = wx.StaticText(admin_box.GetStaticBox(), label="Bot mesh lets local or remote bot accounts delegate work, monitor moderation events, and relay temp files through the server.")
         self.bot_mesh_hint.Wrap(500)
         bot_agent_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -1635,6 +1674,10 @@ class SettingsDialog(wx.Dialog):
         call_audio_box.Add(self.call_input_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         call_audio_box.Add(self.call_out_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
         call_audio_box.Add(self.call_output_slider, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_audio_box.Add(self.call_input_device_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        call_audio_box.Add(self.call_input_device_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        call_audio_box.Add(self.call_output_device_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        call_audio_box.Add(self.call_output_device_choice, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         accessibility_box.Add(self.auto_open_files_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.read_aloud_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.interrupt_speech_cb, 0, wx.ALL, 5)
@@ -1688,6 +1731,7 @@ class SettingsDialog(wx.Dialog):
         admin_box.Add(self.btn_open_admin_console, 0, wx.EXPAND | wx.ALL, 5)
         admin_box.Add(self.btn_open_bot_rules, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_box.Add(self.btn_open_group_policy, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        admin_box.Add(self.btn_open_modules, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
         admin_sizer = wx.BoxSizer(wx.VERTICAL)
         admin_sizer.Add(admin_box, 1, wx.EXPAND | wx.ALL, 8)
         tab_admin.SetSizer(admin_sizer)
@@ -1759,6 +1803,10 @@ class SettingsDialog(wx.Dialog):
         frame = self.GetParent()
         if frame and hasattr(frame, "on_manage_group_policy"):
             frame.on_manage_group_policy(None)
+    def on_open_modules(self, _):
+        frame = self.GetParent()
+        if frame and hasattr(frame, "on_manage_modules"):
+            frame.on_manage_modules(None)
     def build_bot_agent_command(self):
         script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", "thrive_bot_mesh_agent.py")
         host = self.admin_host_txt.GetValue().strip() or "msg.thecubed.cc"
@@ -2586,11 +2634,19 @@ class ClientApp(wx.App):
                     elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
                     elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
                     elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
+                    elif act in ("group_room_list_response", "group_room_open_response", "group_room_result", "group_room_event", "group_room_message", "group_room_file", "group_room_members"):
+                        wx.CallAfter(self.frame.on_group_room_action, msg)
+                    elif act in ("module_list_response", "module_result"):
+                        wx.CallAfter(self.frame.on_module_action, msg)
                     elif act == "group_call_list_response": wx.CallAfter(self.frame.on_group_call_list_response, msg)
                     elif act == "group_call_event": wx.CallAfter(self.frame.on_group_call_event, msg)
                     elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
                     elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
                     elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
+                    elif act == "group_call_audio":
+                        wx.CallAfter(self.frame.on_group_call_audio, msg)
+                    elif act == "voice_call_incoming": wx.CallAfter(self.frame.on_voice_call_incoming, msg)
+                    elif act == "voice_call_event": wx.CallAfter(self.frame.on_voice_call_event, msg)
                     elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
                     elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
                 except Exception as dispatch_err:
@@ -4092,7 +4148,7 @@ class MainFrame(wx.Frame):
             show_notification("Contact offline", f"{self.format_user_label(user)} has gone offline.")
 
     def __init__(self, user, sock):
-        super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
+        super().__init__(None, title="", size=(1000,650)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None; self._module_dialog = None
         self.refresh_connection_title(connected=True)
         self.current_status = wx.GetApp().user_config.get('status', 'online')
         self.feature_caps = {}
@@ -4102,7 +4158,9 @@ class MainFrame(wx.Frame):
         self._sort_mode = "name_asc"
         self._unread_counts = {}
         self._pending_display_names = {}
-        self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
+        self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window)
+        self.main_notebook = wx.Notebook(self)
+        panel = wx.Panel(self.main_notebook)
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -4110,10 +4168,11 @@ class MainFrame(wx.Frame):
             WxMswDarkMode().enable(self); self.SetBackgroundColour(dark_color); panel.SetBackgroundColour(dark_color)
 
         self._all_contacts = []
+        self.contact_states = {}
         self._contact_display_map = []
         box_contacts = wx.StaticBoxSizer(wx.VERTICAL, panel, "&Contacts")
         search_label = wx.StaticText(box_contacts.GetStaticBox(), label="Searc&h contacts:")
-        self.search_box = wx.TextCtrl(box_contacts.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
+        self.search_box = F3SearchTextCtrl(box_contacts.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         self.search_box.Bind(wx.EVT_TEXT, self.on_search)
         self.lv = wx.ListBox(box_contacts.GetStaticBox(), style=wx.LB_SINGLE)
         self.lv.Bind(wx.EVT_CHAR_HOOK, self.on_key)
@@ -4155,11 +4214,19 @@ class MainFrame(wx.Frame):
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
         self.btn_update.Bind(wx.EVT_BUTTON, self.on_check_updates)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
-        accel_entries = [(wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        self.search_command_id = wx.NewIdRef()
+        accel_entries = [(wx.ACCEL_NORMAL, wx.WXK_F3, int(self.search_command_id)), (wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
+        self.Bind(wx.EVT_MENU, self.on_focus_contact_search, id=int(self.search_command_id))
         self.gs_main = wx.GridSizer(1, 5, 5, 5); self.gs_main.Add(self.btn_block, 0, wx.EXPAND); self.gs_main.Add(self.btn_add, 0, wx.EXPAND); self.gs_main.Add(self.btn_send, 0, wx.EXPAND); self.gs_main.Add(self.btn_send_file, 0, wx.EXPAND); self.gs_main.Add(self.btn_delete, 0, wx.EXPAND)
         self.gs_util = wx.GridSizer(1, 8, 5, 5); self.gs_util.Add(self.btn_info, 0, wx.EXPAND); self.gs_util.Add(self.btn_status, 0, wx.EXPAND); self.gs_util.Add(self.btn_directory, 0, wx.EXPAND); self.gs_util.Add(self.btn_admin, 0, wx.EXPAND); self.gs_util.Add(self.btn_settings, 0, wx.EXPAND); self.gs_util.Add(self.btn_update, 0, wx.EXPAND); self.gs_util.Add(self.btn_logout, 0, wx.EXPAND); self.gs_util.Add(self.btn_exit, 0, wx.EXPAND)
         s = wx.BoxSizer(wx.VERTICAL); s.Add(box_contacts, 1, wx.EXPAND|wx.ALL, 5); s.Add(self.gs_main, 0, wx.CENTER|wx.ALL, 5); s.Add(self.gs_util, 0, wx.CENTER|wx.ALL, 5); panel.SetSizer(s)
+        self.groups_panel = GroupRoomsPanel(self.main_notebook, self, self.sock, self.user)
+        self.main_notebook.AddPage(panel, "Contacts")
+        self.main_notebook.AddPage(self.groups_panel, "Groups")
+        frame_sizer = wx.BoxSizer(wx.VERTICAL)
+        frame_sizer.Add(self.main_notebook, 1, wx.EXPAND)
+        self.SetSizer(frame_sizer)
         self._root_sizer = s
         self._build_menu_bar()
         self._apply_voiceover_hints(search_label)
@@ -4167,6 +4234,35 @@ class MainFrame(wx.Frame):
         self.apply_action_button_layout()
         self.update_button_states()
         self.apply_feature_visibility()
+        wx.CallAfter(self.groups_panel.refresh_rooms)
+
+    def on_group_room_action(self, msg):
+        if self.groups_panel:
+            self.groups_panel.handle_server_action(msg)
+    def on_manage_modules(self, _):
+        if self._module_dialog and self._module_dialog.IsShown():
+            self._module_dialog.Raise(); return
+        self._module_dialog = ModuleManagerDialog(self, self.sock)
+        self._module_dialog.Show()
+        self.sock.sendall((json.dumps({"action": "module_list"}) + "\n").encode())
+    def on_module_action(self, msg):
+        if self._module_dialog and self._module_dialog.IsShown():
+            self._module_dialog.handle_server_action(msg)
+
+    def open_direct_chat(self, username):
+        username = str(username or "").strip()
+        if not username or username == self.user:
+            return
+        app = wx.GetApp()
+        dlg = self.get_chat(username) or ChatDialog(
+            self, username, self.sock, self.user,
+            is_chat_logging_enabled(app.user_config, username),
+            is_contact=username in getattr(self, "contact_states", {}),
+            can_call=self.can_use_voice_call(), show_call=self.is_voice_call_visible(),
+        )
+        dlg.Show()
+        dlg.Raise()
+        wx.CallAfter(dlg.input_ctrl.SetFocus)
 
     def _feature(self, key):
         if self.feature_caps_supported:
@@ -4358,8 +4454,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
 
     def _apply_voiceover_hints(self, search_label):
-        apply_voiceover_hint(search_label, "Type a username to filter your contact list.")
-        apply_voiceover_hint(self.search_box, "Search contacts. Press Return to start chat with selected contact.")
+        apply_voiceover_hint(search_label, "Press F3 to search contacts.")
+        apply_voiceover_hint(self.search_box, "Contact search. Use plain text or filters such as status:online, role:admin, type:bot, and name:text. Escape returns to the contact list.")
         apply_voiceover_hint(self.lv, "Contacts list. Use arrow keys to select a contact, then press Return to chat.")
         apply_voiceover_hint(self.btn_add, "Add a contact by username.")
         apply_voiceover_hint(self.btn_send, "Start chat with selected contact.")
@@ -4576,6 +4672,8 @@ class MainFrame(wx.Frame):
                 app.user_config['sound_volume'] = int(dlg.sound_volume_slider.GetValue())
                 app.user_config['call_input_volume'] = int(dlg.call_input_slider.GetValue())
                 app.user_config['call_output_volume'] = int(dlg.call_output_slider.GetValue())
+                app.user_config['call_input_device'] = dlg.call_input_devices[dlg.call_input_device_choice.GetSelection()][0]
+                app.user_config['call_output_device'] = dlg.call_output_devices[dlg.call_output_device_choice.GetSelection()][0]
                 app.user_config['auto_open_received_files'] = dlg.auto_open_files_cb.IsChecked()
                 app.user_config['read_messages_aloud'] = dlg.read_aloud_cb.IsChecked()
                 app.user_config['interrupt_speech'] = dlg.interrupt_speech_cb.IsChecked()
@@ -5130,6 +5228,26 @@ class MainFrame(wx.Frame):
     def on_group_call_signal_result(self, msg):
         if self._group_call_dlg and self._group_call_dlg.IsShown():
             self._group_call_dlg.handle_signal_result(msg)
+    def on_group_call_audio(self, msg):
+        if self._group_call_dlg and self._group_call_dlg.IsShown():
+            self._group_call_dlg.handle_audio(msg)
+    def on_voice_call_incoming(self, msg):
+        caller = str(msg.get("from", "")); call_id = str(msg.get("call_id", ""))
+        answer = wx.MessageBox(f"{caller} is calling. Answer this voice call?", "Incoming Voice Call", wx.YES_NO | wx.ICON_QUESTION, self)
+        action = "voice_call_accept" if answer == wx.YES else "voice_call_decline"
+        self.sock.sendall((json.dumps({"action": action, "call_id": call_id}) + "\n").encode())
+    def on_voice_call_event(self, msg):
+        event = msg.get("event", ""); call_id = str(msg.get("call_id", "")); other = str(msg.get("with", ""))
+        if event == "ringing": show_notification("Voice call", f"Calling {other}...", timeout=5); return
+        if event == "failed": wx.MessageBox(msg.get("reason", "Call failed."), "Voice Call", wx.OK | wx.ICON_WARNING, self); return
+        if event == "accepted":
+            if self._group_call_dlg and self._group_call_dlg.IsShown(): self._group_call_dlg.Close()
+            self._group_call_dlg = GroupCallDialog(self, self.sock, self.user)
+            self._group_call_dlg.configure_direct_call(call_id, other)
+            self._group_call_dlg.Show(); self._group_call_dlg.start_audio(); return
+        if event in ("declined", "ended"):
+            if self._group_call_dlg and self._group_call_dlg.direct_call_id == call_id: self._group_call_dlg.Close()
+            show_notification("Voice call", "Call declined." if event == "declined" else "Call ended.", timeout=4)
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -5161,6 +5279,13 @@ class MainFrame(wx.Frame):
             wx.CallLater(500, self.on_user_directory, None)
     def _apply_search_filter(self):
         query = self.search_box.GetValue().strip().lower()
+        tokens = query.split()
+        filters = {"status": [], "role": [], "type": [], "name": []}
+        plain = []
+        for token in tokens:
+            key, separator, value = token.partition(":")
+            if separator and key in filters and value: filters[key].append(value)
+            else: plain.append(token)
         self.lv.Clear()
         self._contact_display_map = []
         first_real_idx = -1
@@ -5173,7 +5298,19 @@ class MainFrame(wx.Frame):
             contacts = sorted(contacts, key=lambda c: c["user"].lower())
         for c in contacts:
             display_name = str(c.get("display_name", "") or self.get_contact_display_name(c["user"]) or "").strip()
-            if query and query not in c["user"].lower() and query not in display_name.lower():
+            searchable_name = f"{c['user']} {display_name}".lower()
+            status = c["status"].lower()
+            is_admin = "(admin)" in status
+            is_bot = c["user"].lower().endswith("-bot")
+            if plain and not all(term in searchable_name or term in status for term in plain):
+                continue
+            if filters["name"] and not all(term in searchable_name for term in filters["name"]):
+                continue
+            if filters["status"] and not all((term == "online" and not status.startswith("offline")) or (term == "offline" and status.startswith("offline")) or term in status for term in filters["status"]):
+                continue
+            if filters["role"] and not all((term == "admin" and is_admin) or (term == "user" and not is_admin) for term in filters["role"]):
+                continue
+            if filters["type"] and not all((term == "bot" and is_bot) or (term == "user" and not is_bot) for term in filters["type"]):
                 continue
             unread = int(self._unread_counts.get(c["user"], 0) or 0)
             user_label = self.format_user_label(c["user"], include_username=True)
@@ -5273,6 +5410,10 @@ class MainFrame(wx.Frame):
         self._apply_search_filter()
     def on_search(self, event):
         self._apply_search_filter()
+    def on_focus_contact_search(self, _):
+        self.main_notebook.SetSelection(0)
+        self.search_box.SetFocus()
+        self.search_box.SelectAll()
     def on_admin_status_change(self, user, is_admin):
         for c in self._all_contacts:
             if c["user"] == user:
@@ -5361,6 +5502,9 @@ class MainFrame(wx.Frame):
             self.on_settings(None)
             return
         elif evt.GetKeyCode() == wx.WXK_ESCAPE:
+            if wx.Window.FindFocus() is self.search_box:
+                self.lv.SetFocus()
+                return
             action = str(wx.GetApp().user_config.get('escape_main_action', 'none') or 'none')
             if action == 'quit':
                 self.on_exit(None)
@@ -5532,6 +5676,52 @@ def pick_user_display_name(entry):
         if val:
             return val
     return ""
+
+class ModuleManagerDialog(wx.Dialog):
+    def __init__(self, parent, sock):
+        super().__init__(parent, title="Server Modules", size=(720, 430))
+        self.sock, self.modules = sock, []
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(wx.StaticText(panel, label="Bundled modules are already installed. Enable or disable the selected module for this server:"), 0, wx.EXPAND | wx.ALL, 8)
+        self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.list.InsertColumn(0, "Module", width=170); self.list.InsertColumn(1, "State", width=90); self.list.InsertColumn(2, "Description", width=410)
+        self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_toggle)
+        s.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        toggle = wx.Button(panel, label="&Enable or disable"); toggle.Bind(wx.EVT_BUTTON, self.on_toggle)
+        refresh = wx.Button(panel, label="&Refresh"); refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
+        close = wx.Button(panel, wx.ID_CLOSE); close.Bind(wx.EVT_BUTTON, lambda event: self.Close())
+        for button in (toggle, refresh, close): row.Add(button, 1, wx.RIGHT, 5)
+        s.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8); panel.SetSizer(s)
+    def on_close(self, event):
+        parent = self.GetParent()
+        if parent: parent._module_dialog = None
+        event.Skip()
+    def on_refresh(self, _): self.sock.sendall((json.dumps({"action": "module_list"}) + "\n").encode())
+    def on_toggle(self, _):
+        index = self.list.GetFirstSelected()
+        if index < 0 or index >= len(self.modules): return
+        module = self.modules[index]
+        if not module.get("installed", False):
+            show_notification("Server modules", f"Installing {module.get('name', module['module_id'])} on the connected Thrive server...", timeout=6)
+            self.sock.sendall((json.dumps({"action": "module_install", "module_id": module["module_id"]}) + "\n").encode())
+        else:
+            self.sock.sendall((json.dumps({"action": "module_set_enabled", "module_id": module["module_id"], "enabled": not module.get("enabled", False)}) + "\n").encode())
+    def handle_server_action(self, msg):
+        if msg.get("action") == "module_result":
+            if not msg.get("ok"): wx.MessageBox(msg.get("reason", "Module update failed."), "Server Modules", wx.OK | wx.ICON_WARNING, self)
+            elif msg.get("event") == "installed": show_notification("Server modules", "Module installed. Restart the Thrive server to load it.", timeout=7)
+            self.on_refresh(None); return
+        if not msg.get("ok"): return
+        self.modules = list(msg.get("modules", [])); self.list.DeleteAllItems()
+        for module in self.modules:
+            index = self.list.InsertItem(self.list.GetItemCount(), module.get("name", module.get("module_id", "")))
+            state = "not installed" if not module.get("installed") else ("enabled" if module.get("enabled") else "disabled")
+            if module.get("experimental"): state += ", experimental"
+            self.list.SetItem(index, 1, state)
+            self.list.SetItem(index, 2, module.get("description", ""))
+
 
 class AdminDialog(wx.Dialog):
     def __init__(self, parent, sock):
@@ -5920,20 +6110,253 @@ class GroupPolicyDialog(wx.Dialog):
         self.info.SetLabel("Policy updated. Reloading...")
         self.on_load(None)
 
+class CreateGroupRoomDialog(wx.Dialog):
+    def __init__(self, parent):
+        super().__init__(parent, title="Create Group Room")
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        for label, ctrl in (
+            ("Room name:", wx.TextCtrl(panel)),
+            ("Description:", wx.TextCtrl(panel)),
+        ):
+            s.Add(wx.StaticText(panel, label=label), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+            s.Add(ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+            if label.startswith("Room"):
+                self.name_ctrl = ctrl
+            else:
+                self.description_ctrl = ctrl
+        s.Add(wx.StaticText(panel, label="Visibility:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.visibility = wx.Choice(panel, choices=["public", "private"])
+        self.visibility.SetSelection(0)
+        s.Add(self.visibility, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Expiration:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.expiration = wx.Choice(panel, choices=["never", "day", "week", "month", "year", "empty"])
+        self.expiration.SetSelection(0)
+        self.expiration.SetToolTip("Empty deletes the room immediately after its last member leaves.")
+        s.Add(self.expiration, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        s.Add(buttons, 0, wx.EXPAND | wx.ALL, 8)
+        panel.SetSizer(s)
+        outer = wx.BoxSizer(wx.VERTICAL); outer.Add(panel, 1, wx.EXPAND); self.SetSizerAndFit(outer)
+        self.name_ctrl.SetFocus()
+
+    def values(self):
+        return {
+            "name": self.name_ctrl.GetValue().strip(),
+            "description": self.description_ctrl.GetValue().strip(),
+            "visibility": self.visibility.GetStringSelection(),
+            "expiration": self.expiration.GetStringSelection(),
+        }
+
+
+class GroupRoomSettingsDialog(wx.Dialog):
+    ACTIONS = ("view", "send_messages", "send_files", "join_voice", "invite", "moderate_messages", "manage_members", "manage_room")
+    ROLES = ("guest", "user", "moderator", "admin", "owner")
+    def __init__(self, parent, room):
+        super().__init__(parent, title=f"Room Settings — {room.get('name', '')}", size=(620, 600))
+        self.room = room; panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(wx.StaticText(panel, label="Description:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.description = wx.TextCtrl(panel, value=room.get("description", ""))
+        s.Add(self.description, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Visibility:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.visibility = wx.Choice(panel, choices=["public", "private"]); self.visibility.SetStringSelection(room.get("visibility", "public"))
+        s.Add(self.visibility, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="New expiration policy:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.expiration = wx.Choice(panel, choices=["unchanged", "never", "day", "week", "month", "year", "empty"]); self.expiration.SetSelection(0)
+        s.Add(self.expiration, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="Allowed room actions by role. Space toggles a selected permission:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        choices = [f"{action.replace('_', ' ')} — {role}" for action in self.ACTIONS for role in self.ROLES]
+        self.permission_list = wx.CheckListBox(panel, choices=choices)
+        permissions = room.get("permissions", {})
+        for index, (action, role) in enumerate((a, r) for a in self.ACTIONS for r in self.ROLES): self.permission_list.Check(index, role in permissions.get(action, []))
+        s.Add(self.permission_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL), 0, wx.EXPAND | wx.ALL, 8)
+        panel.SetSizer(s); outer = wx.BoxSizer(wx.VERTICAL); outer.Add(panel, 1, wx.EXPAND); self.SetSizer(outer)
+    def changes(self):
+        permissions = {action: [] for action in self.ACTIONS}
+        index = 0
+        for action in self.ACTIONS:
+            for role in self.ROLES:
+                if self.permission_list.IsChecked(index): permissions[action].append(role)
+                index += 1
+        return {"description": self.description.GetValue(), "visibility": self.visibility.GetStringSelection(), "expiration": self.expiration.GetStringSelection(), "permissions": permissions}
+
+
+class GroupRoomsPanel(wx.Panel):
+    def __init__(self, parent, frame, sock, username):
+        super().__init__(parent)
+        self.frame, self.sock, self.username = frame, sock, username
+        self.rooms, self.members, self.current_room = [], [], None
+        root = wx.BoxSizer(wx.HORIZONTAL)
+        left = wx.BoxSizer(wx.VERTICAL)
+        left.Add(wx.StaticText(self, label="Group rooms:"), 0, wx.BOTTOM, 4)
+        self.room_list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.room_list.InsertColumn(0, "Room", width=180); self.room_list.InsertColumn(1, "Role", width=90); self.room_list.InsertColumn(2, "Members", width=75)
+        self.room_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_open_room)
+        self.room_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_room_selected)
+        left.Add(self.room_list, 1, wx.EXPAND | wx.BOTTOM, 6)
+        room_buttons = wx.BoxSizer(wx.HORIZONTAL)
+        for label, handler in (("&Create", self.on_create), ("&Join", self.on_join), ("&Leave", self.on_leave), ("&Refresh", self.refresh_rooms), ("Room se&ttings", self.on_room_settings)):
+            button = wx.Button(self, label=label); button.Bind(wx.EVT_BUTTON, handler); room_buttons.Add(button, 1, wx.RIGHT, 4)
+        left.Add(room_buttons, 0, wx.EXPAND)
+
+        center = wx.BoxSizer(wx.VERTICAL)
+        self.room_heading = wx.StaticText(self, label="No room selected")
+        center.Add(self.room_heading, 0, wx.BOTTOM, 4)
+        self.messages = wx.ListBox(self, style=wx.LB_SINGLE)
+        self.messages.SetToolTip("Room message history. Use arrow keys to review messages.")
+        center.Add(self.messages, 1, wx.EXPAND | wx.BOTTOM, 6)
+        center.Add(wx.StaticText(self, label="Message:"), 0, wx.BOTTOM, 3)
+        self.message_ctrl = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
+        self.message_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send_message)
+        center.Add(self.message_ctrl, 0, wx.EXPAND | wx.BOTTOM, 5)
+        send_row = wx.BoxSizer(wx.HORIZONTAL)
+        send_btn = wx.Button(self, label="&Send message"); send_btn.Bind(wx.EVT_BUTTON, self.on_send_message)
+        file_btn = wx.Button(self, label="Send &file"); file_btn.Bind(wx.EVT_BUTTON, self.on_send_file)
+        call_btn = wx.Button(self, label="Join &voice"); call_btn.Bind(wx.EVT_BUTTON, self.on_join_voice)
+        for button in (send_btn, file_btn, call_btn): send_row.Add(button, 1, wx.RIGHT, 5)
+        center.Add(send_row, 0, wx.EXPAND)
+
+        right = wx.BoxSizer(wx.VERTICAL)
+        right.Add(wx.StaticText(self, label="Room members:"), 0, wx.BOTTOM, 4)
+        self.member_list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.member_list.InsertColumn(0, "User", width=140); self.member_list.InsertColumn(1, "Role", width=90)
+        self.member_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_direct_message)
+        self.member_list.Bind(wx.EVT_CONTEXT_MENU, self.on_member_menu)
+        right.Add(self.member_list, 1, wx.EXPAND)
+        invite_btn = wx.Button(self, label="&Invite member"); invite_btn.Bind(wx.EVT_BUTTON, self.on_invite_member); right.Add(invite_btn, 0, wx.EXPAND | wx.TOP, 6)
+        right.Add(wx.StaticText(self, label="Activate a member or use the context menu to send a direct message."), 0, wx.TOP, 6)
+        root.Add(left, 1, wx.EXPAND | wx.ALL, 8); root.Add(center, 2, wx.EXPAND | wx.ALL, 8); root.Add(right, 1, wx.EXPAND | wx.ALL, 8)
+        self.SetSizer(root)
+
+    def _send(self, payload):
+        try: self.sock.sendall((json.dumps(payload) + "\n").encode())
+        except Exception as exc: wx.MessageBox(str(exc), "Group Rooms", wx.OK | wx.ICON_ERROR, self)
+
+    def refresh_rooms(self, _=None): self._send({"action": "group_room_list"})
+    def _selected_room(self):
+        index = self.room_list.GetFirstSelected()
+        return self.rooms[index] if 0 <= index < len(self.rooms) else None
+    def on_room_selected(self, _):
+        room = self._selected_room()
+        if room and room.get("role"): self._send({"action": "group_room_open", "room_id": room["room_id"]})
+    def on_open_room(self, _): self.on_room_selected(None)
+    def on_create(self, _):
+        with CreateGroupRoomDialog(self) as dlg:
+            if dlg.ShowModal() == wx.ID_OK: self._send({"action": "group_room_create", **dlg.values()})
+    def on_join(self, _):
+        room = self._selected_room()
+        if room: self._send({"action": "group_room_join", "room_id": room["room_id"]})
+    def on_leave(self, _):
+        if self.current_room: self._send({"action": "group_room_leave", "room_id": self.current_room["room_id"]})
+    def on_room_settings(self, _):
+        if not self.current_room: return
+        with GroupRoomSettingsDialog(self, self.current_room) as dlg:
+            if dlg.ShowModal() == wx.ID_OK: self._send({"action": "group_room_update", "room_id": self.current_room["room_id"], "changes": dlg.changes()})
+    def on_invite_member(self, _):
+        if not self.current_room: return
+        with wx.TextEntryDialog(self, "Username to add:", "Invite Room Member") as dlg:
+            if dlg.ShowModal() != wx.ID_OK: return
+            username = dlg.GetValue().strip()
+        if username: self._send({"action": "group_room_add_member", "room_id": self.current_room["room_id"], "username": username, "role": "user"})
+    def on_send_message(self, _):
+        body = self.message_ctrl.GetValue().strip()
+        if self.current_room and body:
+            self._send({"action": "group_room_message", "room_id": self.current_room["room_id"], "body": body}); self.message_ctrl.Clear(); self.message_ctrl.SetFocus()
+    def on_send_file(self, _):
+        if not self.current_room: return
+        with wx.FileDialog(self, "Send file to room", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() != wx.ID_OK: return
+            path = dlg.GetPath()
+        try:
+            with open(path, "rb") as stream: encoded = base64.b64encode(stream.read()).decode("ascii")
+            self._send({"action": "group_room_file", "room_id": self.current_room["room_id"], "room_name": self.current_room["name"], "filename": os.path.basename(path), "data": encoded})
+        except Exception as exc: wx.MessageBox(str(exc), "Room File", wx.OK | wx.ICON_ERROR, self)
+    def on_join_voice(self, _):
+        if not self.current_room: return
+        self.frame.on_group_calls(None)
+        if self.frame._group_call_dlg:
+            self.frame._group_call_dlg.group_txt.SetValue(self.current_room["name"]); self.frame._group_call_dlg.on_join(None)
+    def _selected_member(self):
+        index = self.member_list.GetFirstSelected(); return self.members[index] if 0 <= index < len(self.members) else None
+    def on_direct_message(self, _):
+        member = self._selected_member()
+        if member: self.frame.open_direct_chat(member["username"])
+    def on_member_menu(self, _):
+        member = self._selected_member()
+        if not member: return
+        menu = wx.Menu(); dm = menu.Append(wx.ID_ANY, "Direct message")
+        self.Bind(wx.EVT_MENU, self.on_direct_message, dm)
+        role_menu = wx.Menu()
+        for role in ("guest", "user", "moderator", "admin"):
+            item = role_menu.Append(wx.ID_ANY, f"Set role: {role}")
+            self.Bind(wx.EVT_MENU, lambda event, value=role, target=member["username"]: self._send({"action": "group_room_set_role", "room_id": self.current_room["room_id"], "username": target, "role": value}), item)
+        menu.AppendSubMenu(role_menu, "Change role")
+        self.PopupMenu(menu); menu.Destroy()
+    def _show_rooms(self, rooms):
+        self.rooms = list(rooms or []); self.room_list.DeleteAllItems()
+        for room in self.rooms:
+            index = self.room_list.InsertItem(self.room_list.GetItemCount(), room.get("name", "")); self.room_list.SetItem(index, 1, room.get("role") or "not joined"); self.room_list.SetItem(index, 2, str(room.get("member_count", 0)))
+    def _show_open_room(self, msg):
+        self.current_room = msg["room"]; self.members = list(msg.get("members", [])); self.room_heading.SetLabel(f"{self.current_room['name']} — role: {self.current_room.get('role', '')}")
+        self.messages.Clear()
+        for item in msg.get("messages", []): self._append_message(item)
+        self.member_list.DeleteAllItems()
+        for member in self.members:
+            index = self.member_list.InsertItem(self.member_list.GetItemCount(), member["username"]); self.member_list.SetItem(index, 1, member["role"])
+        self.message_ctrl.SetFocus()
+    def _append_message(self, item):
+        label = f"{item.get('sender', '')}: " + (f"sent file {item.get('filename', '')}" if item.get("kind") == "file" else item.get("body", "")); self.messages.Append(label); self.messages.SetSelection(self.messages.GetCount() - 1)
+    def handle_server_action(self, msg):
+        action = msg.get("action")
+        if action == "group_room_list_response" and msg.get("ok"): self._show_rooms(msg.get("rooms", []))
+        elif action == "group_room_open_response" and msg.get("ok"): self._show_open_room(msg)
+        elif action == "group_room_message": self._append_message(msg.get("message", {}))
+        elif action == "group_room_file":
+            item = msg.get("message", {}); self._append_message(item)
+            try:
+                save_dir = os.path.join(os.path.expanduser("~"), "Documents", "ThriveMessenger", "group-files"); os.makedirs(save_dir, exist_ok=True)
+                path = os.path.join(save_dir, os.path.basename(item.get("filename", "room-file")))
+                if os.path.exists(path):
+                    stem, extension = os.path.splitext(path)
+                    counter = 1
+                    while os.path.exists(f"{stem}_{counter}{extension}"):
+                        counter += 1
+                    path = f"{stem}_{counter}{extension}"
+                with open(path, "wb") as stream: stream.write(base64.b64decode(msg.get("data", "")))
+            except Exception as exc: wx.MessageBox(str(exc), "Room File", wx.OK | wx.ICON_ERROR, self)
+        elif action == "group_room_members" and self.current_room and msg.get("room_id") == self.current_room.get("room_id"):
+            self._send({"action": "group_room_open", "room_id": self.current_room["room_id"]})
+        elif action in ("group_room_result", "group_room_event"):
+            if action == "group_room_result" and not msg.get("ok"): wx.MessageBox(msg.get("reason", "Room action failed."), "Group Rooms", wx.OK | wx.ICON_WARNING, self)
+            self.refresh_rooms()
+            room = msg.get("room")
+            if room and room.get("role"): self._send({"action": "group_room_open", "room_id": room["room_id"]})
+
+
 class GroupCallDialog(wx.Dialog):
     def __init__(self, parent, sock, username):
-        super().__init__(parent, title="Group Call Signaling Preview", size=(720, 500))
+        super().__init__(parent, title="Group Voice", size=(820, 540))
         self.parent_frame = parent
         self.sock = sock
         self.username = username
         self.calls = []
         self.current_group = ""
+        self.audio_active = False
+        self.audio_stop = threading.Event()
+        self.capture_queue = queue.Queue(maxsize=32)
+        self.playback_queue = queue.Queue(maxsize=64)
+        self.input_stream = None
+        self.output_stream = None
+        self.direct_call_id = None
+        self.muted = False
+        self.deafened = False
         self.Bind(wx.EVT_CLOSE, self.on_close)
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
         preview_notice = wx.StaticText(
             panel,
-            label="Preview: this coordinates call participants and signaling only; live microphone audio is not included yet.",
+            label="Live voice is relayed securely through this Thrive server. Headphones are recommended to prevent echo.",
         )
         preview_notice.Wrap(680)
         s.Add(preview_notice, 0, wx.EXPAND | wx.ALL, 8)
@@ -5943,7 +6366,7 @@ class GroupCallDialog(wx.Dialog):
         self.group_txt = wx.TextCtrl(panel)
         top.Add(self.group_txt, 1, wx.EXPAND | wx.RIGHT, 8)
         top.Add(wx.StaticText(panel, label="Mode:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.mode_choice = wx.Choice(panel, choices=["voice", "video"])
+        self.mode_choice = wx.Choice(panel, choices=["voice"])
         self.mode_choice.SetSelection(0)
         top.Add(self.mode_choice, 0)
 
@@ -5952,12 +6375,16 @@ class GroupCallDialog(wx.Dialog):
         self.btn_leave = wx.Button(panel, label="Leave")
         self.btn_refresh = wx.Button(panel, label="Refresh")
         self.btn_ping = wx.Button(panel, label="Send Test Signal")
-        for b in [self.btn_join, self.btn_leave, self.btn_refresh, self.btn_ping]:
+        self.btn_mute = wx.Button(panel, label="&Mute microphone")
+        self.btn_deafen = wx.Button(panel, label="&Deafen speakers")
+        for b in [self.btn_join, self.btn_leave, self.btn_refresh, self.btn_ping, self.btn_mute, self.btn_deafen]:
             btn_row.Add(b, 1, wx.EXPAND | wx.ALL, 3)
         self.btn_join.Bind(wx.EVT_BUTTON, self.on_join)
         self.btn_leave.Bind(wx.EVT_BUTTON, self.on_leave)
         self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
         self.btn_ping.Bind(wx.EVT_BUTTON, self.on_ping)
+        self.btn_mute.Bind(wx.EVT_BUTTON, self.on_toggle_mute)
+        self.btn_deafen.Bind(wx.EVT_BUTTON, self.on_toggle_deafen)
 
         self.calls_list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self.calls_list.Bind(wx.EVT_LISTBOX, self.on_select_call)
@@ -5972,8 +6399,12 @@ class GroupCallDialog(wx.Dialog):
         panel.SetSizer(s)
 
     def on_close(self, event):
+        self.stop_audio()
         group = self.current_group or self.group_txt.GetValue().strip()
-        if group:
+        if self.direct_call_id:
+            try: self.sock.sendall((json.dumps({"action": "voice_call_end", "call_id": self.direct_call_id}) + "\n").encode())
+            except Exception: pass
+        elif group:
             try:
                 self.sock.sendall((json.dumps({"action": "group_call_leave", "group": group}) + "\n").encode())
             except Exception:
@@ -6005,7 +6436,7 @@ class GroupCallDialog(wx.Dialog):
         self.current_group = str(call.get("group", "") or "")
         self.group_txt.SetValue(self.current_group)
         mode = str(call.get("mode", "voice"))
-        self.mode_choice.SetStringSelection(mode if mode in ("voice", "video") else "voice")
+        self.mode_choice.SetStringSelection("voice")
 
     def on_refresh(self, _):
         try:
@@ -6026,13 +6457,26 @@ class GroupCallDialog(wx.Dialog):
             self._append_log(f"Join failed: {e}")
 
     def on_leave(self, _):
+        if self.direct_call_id:
+            try: self.sock.sendall((json.dumps({"action": "voice_call_end", "call_id": self.direct_call_id}) + "\n").encode())
+            except Exception as exc: self._append_log(f"Leave failed: {exc}")
+            self.stop_audio(); self.Close(); return
         group = self.group_txt.GetValue().strip() or self.current_group
         if not group:
             return
         try:
             self.sock.sendall((json.dumps({"action": "group_call_leave", "group": group}) + "\n").encode())
+            self.stop_audio()
         except Exception as e:
             self._append_log(f"Leave failed: {e}")
+
+    def configure_direct_call(self, call_id, other_user):
+        self.direct_call_id = call_id
+        self.current_group = f"direct:{call_id}"
+        self.SetTitle(f"Voice Call with {other_user}")
+        self.group_txt.SetValue(f"Direct call with {other_user}"); self.group_txt.Disable(); self.mode_choice.Disable()
+        self.btn_join.Hide(); self.btn_refresh.Hide(); self.btn_ping.Hide(); self.Layout()
+        self._append_log(f"Connected with {other_user}.")
 
     def on_ping(self, _):
         group = self.group_txt.GetValue().strip() or self.current_group
@@ -6061,6 +6505,16 @@ class GroupCallDialog(wx.Dialog):
         except Exception as e:
             self._append_log(f"Signal failed: {e}")
 
+    def on_toggle_mute(self, _):
+        self.muted = not self.muted
+        self.btn_mute.SetLabel("&Unmute microphone" if self.muted else "&Mute microphone")
+        self._append_log("Microphone muted." if self.muted else "Microphone unmuted.")
+
+    def on_toggle_deafen(self, _):
+        self.deafened = not self.deafened
+        self.btn_deafen.SetLabel("&Undeafen speakers" if self.deafened else "&Deafen speakers")
+        self._append_log("Speakers deafened." if self.deafened else "Speakers enabled.")
+
     def handle_call_event(self, msg):
         group = msg.get("group", "")
         event = msg.get("event", "")
@@ -6072,6 +6526,10 @@ class GroupCallDialog(wx.Dialog):
     def handle_call_result(self, msg):
         if msg.get("ok"):
             self._append_log(f"Call action OK for group {msg.get('group', '')}.")
+            if msg.get("event") == "joined" and msg.get("mode", "voice") == "voice":
+                self.start_audio()
+            elif msg.get("event") == "left":
+                self.stop_audio()
             self.on_refresh(None)
         else:
             self._append_log(f"Call action failed: {msg.get('reason', 'unknown error')}")
@@ -6084,6 +6542,71 @@ class GroupCallDialog(wx.Dialog):
             self._append_log(f"Signal sent to {msg.get('to', '')}.")
         else:
             self._append_log(f"Signal failed: {msg.get('reason', 'unknown error')}")
+
+    def start_audio(self):
+        if self.audio_active:
+            return
+        if sounddevice is None:
+            self._append_log("Live voice is unavailable because the audio module could not load.")
+            return
+        self.audio_stop.clear()
+        self.audio_active = True
+        input_gain = max(0.0, min(float(wx.GetApp().user_config.get("call_input_volume", 80)) / 100.0, 1.0))
+        output_gain = max(0.0, min(float(wx.GetApp().user_config.get("call_output_volume", 80)) / 100.0, 1.0))
+        def input_callback(indata, frames, callback_time, status):
+            if self.muted:
+                return
+            data = bytes(indata)
+            data = scale_pcm16(data, input_gain)
+            try: self.capture_queue.put_nowait(data)
+            except queue.Full: pass
+        def output_callback(outdata, frames, callback_time, status):
+            if self.deafened:
+                outdata[:] = b"\0" * len(outdata)
+                return
+            try: data = self.playback_queue.get_nowait()
+            except queue.Empty: data = b""
+            expected = len(outdata)
+            data = data[:expected].ljust(expected, b"\0")
+            data = scale_pcm16(data, output_gain)
+            outdata[:] = data
+        try:
+            input_device = wx.GetApp().user_config.get("call_input_device")
+            output_device = wx.GetApp().user_config.get("call_output_device")
+            self.input_stream = sounddevice.RawInputStream(device=input_device, samplerate=16000, blocksize=320, channels=1, dtype="int16", callback=input_callback)
+            self.output_stream = sounddevice.RawOutputStream(device=output_device, samplerate=16000, blocksize=320, channels=1, dtype="int16", callback=output_callback)
+            self.input_stream.start(); self.output_stream.start()
+            threading.Thread(target=self._audio_sender, daemon=True).start()
+            self._append_log("Microphone and speaker audio started.")
+        except Exception as exc:
+            self.audio_active = False
+            self._append_log(f"Audio device could not start: {exc}")
+
+    def _audio_sender(self):
+        while not self.audio_stop.is_set():
+            try: data = self.capture_queue.get(timeout=0.2)
+            except queue.Empty: continue
+            try:
+                self.sock.sendall((json.dumps({"action": "group_call_audio", "group": self.current_group, "data": base64.b64encode(data).decode("ascii")}) + "\n").encode())
+            except Exception:
+                break
+
+    def handle_audio(self, msg):
+        if not self.audio_active or msg.get("group") != self.current_group:
+            return
+        try:
+            data = base64.b64decode(msg.get("data", ""), validate=True)
+            self.playback_queue.put_nowait(data)
+        except (ValueError, queue.Full):
+            pass
+
+    def stop_audio(self):
+        self.audio_stop.set(); self.audio_active = False
+        for stream in (self.input_stream, self.output_stream):
+            if stream:
+                try: stream.stop(); stream.close()
+                except Exception: pass
+        self.input_stream = self.output_stream = None
 
 class ChatDialog(wx.Dialog):
     def __init__(self, parent, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None, can_call=False, show_call=False):

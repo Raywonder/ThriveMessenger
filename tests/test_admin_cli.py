@@ -53,6 +53,15 @@ class GroupCallRegistryTests(unittest.TestCase):
         self.assertFalse(worker.is_alive(), "group call cleanup deadlocked")
         self.assertEqual(server._group_call_snapshot("team")["participants"], ["bob"])
 
+    def test_direct_call_busy_state_includes_ringing_target(self):
+        with server.group_call_lock:
+            server.group_call_sessions["direct:test"] = {
+                "mode": "voice", "direct": True, "participants": {"alice"}, "pending": "bob",
+            }
+        self.assertTrue(server._user_has_direct_call("alice"))
+        self.assertTrue(server._user_has_direct_call("bob"))
+        self.assertFalse(server._user_has_direct_call("carol"))
+
 
 if __name__ == "__main__":
     unittest.main()
