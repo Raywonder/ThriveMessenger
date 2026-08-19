@@ -4,15 +4,25 @@ import Observation
 
 @MainActor @Observable
 final class ThriveSession {
-    var host = "im.tappedin.fm", username = "", password = ""
+    var host = "im.tappedin.fm"
+    var username = ""
+    var password = ""
     var port = 2005
-    var isSignedIn = false, isBusy = false, isMuted = false, isDeafened = false
+    var isSignedIn = false
+    var isBusy = false
+    var isMuted = false
+    var isDeafened = false
     var errorMessage: String?
-    var contacts: [Contact] = [], rooms: [Room] = []
-    var openRoom: Room?, roomMembers: [RoomMember] = [], roomMessages: [ChatMessage] = []
+    var contacts: [Contact] = []
+    var rooms: [Room] = []
+    var openRoom: Room?
+    var roomMembers: [RoomMember] = []
+    var roomMessages: [ChatMessage] = []
     var directMessages: [String: [ChatMessage]] = [:]
-    var incomingCall: IncomingCall?, activeCall: ActiveCall?
-    private var connection: NWConnection?, buffer = Data()
+    var incomingCall: IncomingCall?
+    var activeCall: ActiveCall?
+    private var connection: NWConnection?
+    private var buffer = Data()
     private let audio = VoiceAudioService()
 
     func signIn() async {
