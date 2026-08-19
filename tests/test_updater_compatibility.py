@@ -1,6 +1,6 @@
 import unittest
 
-from main import parse_github_tag, parse_update_feed
+from main import build_windows_zip_update_batch, parse_github_tag, parse_update_feed
 
 
 class UpdaterCompatibilityTests(unittest.TestCase):
@@ -41,6 +41,19 @@ class UpdaterCompatibilityTests(unittest.TestCase):
     def test_current_or_newer_install_does_not_offer_downgrade(self):
         self.assertIsNone(parse_update_feed(self.feed, "v2026-alpha15.10", "win32"))
         self.assertIsNone(parse_update_feed(self.feed, "v2026-alpha15.11", "win32"))
+
+    def test_new_windows_updater_accepts_nested_and_flat_portable_archives(self):
+        batch = build_windows_zip_update_batch(
+            r"C:\Temp\thrive_update.zip",
+            r"C:\Apps\Thrive",
+            r"C:\Apps\Thrive\thrive_messenger.exe",
+            1234,
+            r"C:\Temp\thrive_update_extract",
+        )
+        self.assertIn(r"thrive_update_extract\thrive_messenger\thrive_messenger.exe", batch)
+        self.assertIn(r'set "SOURCE_DIR=C:\Temp\thrive_update_extract"', batch)
+        self.assertIn(r'if not exist "%SOURCE_DIR%\thrive_messenger.exe" goto failed', batch)
+        self.assertIn("if errorlevel 1 goto failed", batch)
 
 
 if __name__ == "__main__":

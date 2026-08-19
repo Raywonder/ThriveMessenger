@@ -29,6 +29,21 @@ $PortableZip = Join-Path $OutputDir "thrive_messenger.zip"
 if (Test-Path $PortableZip) {
     Remove-Item -Force $PortableZip
 }
-Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $PortableZip -Force
+Compress-Archive -Path $AppDir -DestinationPath $PortableZip -Force
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$Archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $PortableZip))
+try {
+    $RequiredEntry = "thrive_messenger/thrive_messenger.exe"
+    $HasRequiredEntry = $Archive.Entries | Where-Object {
+        $_.FullName.Replace("\", "/") -eq $RequiredEntry
+    }
+    if (!$HasRequiredEntry) {
+        throw "Portable ZIP is incompatible with older updaters: missing $RequiredEntry"
+    }
+}
+finally {
+    $Archive.Dispose()
+}
 
 Write-Host "Portable package created: $PortableZip"

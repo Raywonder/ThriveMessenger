@@ -264,7 +264,7 @@ Thrive Messenger ships with 3 sound packs by default.
 
 #### Creating sound packs
 
-Structurally, a sound pack is simply a folder with a collection of wave files inside it. To create a sound pack, you will need the following 9 files:
+Structurally, a sound pack is simply a folder with a collection of wave files inside it. A complete pack contains these message, presence, file-transfer, and call-state WAV files:
 
 * contact_online
 * contact_offline
@@ -275,6 +275,12 @@ Structurally, a sound pack is simply a folder with a collection of wave files in
 * file_receive
 * file_send
 * file_error
+* incoming_call
+* outgoing_call
+* call_connected
+* call_ended
+* group_call_join
+* group_call_leave
 
 Make a folder inside Thrive Messenger's sounds folder and paste these files into that folder to create your custom sound pack.
 
@@ -306,6 +312,7 @@ fallback_repos =
 - `feed_url` is optional. If set, the client checks your hosted feed first.
 - If feed lookup fails, the client falls back to GitHub repos in order.
 - This allows your custom channel and upstream compatibility at the same time.
+- Portable Windows release ZIPs retain a top-level `thrive_messenger` directory so older installed clients can finish applying the update. New clients accept both nested and flat ZIP layouts and verify hosted SHA-256 values when the feed provides them.
 
 ### Cron-ready update feed sync
 

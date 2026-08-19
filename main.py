@@ -1,6 +1,7 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time, secrets, queue, array
 import urllib.request, urllib.parse
 import traceback, platform
+import hashlib
 import keyring
 try:
     import sounddevice
@@ -1045,6 +1046,7 @@ def parse_update_feed(feed_data, local_tag, platform):
         preferred_zip = win_zip or generic_zip or mac_zip
     else:
         preferred_zip = generic_zip or win_zip or mac_zip
+    hashes = feed_data.get("sha256") if isinstance(feed_data.get("sha256"), dict) else {}
     return {
         "source": "feed",
         "tag": tag,
@@ -1053,6 +1055,9 @@ def parse_update_feed(feed_data, local_tag, platform):
         "mac_zip_url": mac_zip,
         "win_zip_url": win_zip,
         "installer_url": feed_data.get("installer_url") or feed_data.get("win_installer_url"),
+        "win_zip_sha256": hashes.get("win_zip") or hashes.get("zip"),
+        "installer_sha256": hashes.get("installer"),
+        "mac_zip_sha256": hashes.get("mac_x86_64") or hashes.get("mac"),
         "repo": feed_data.get("repo"),
     }
 
@@ -1329,7 +1334,7 @@ def check_for_update(callback):
             wx.CallAfter(callback, None, None, str(e))
     threading.Thread(target=_check, daemon=True).start()
 
-def download_update(url, dest, progress_dlg, callback):
+def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
     def _download():
         import urllib.request
         try:
@@ -1337,17 +1342,27 @@ def download_update(url, dest, progress_dlg, callback):
             with urllib.request.urlopen(req, timeout=120) as resp:
                 total = int(resp.headers.get('Content-Length', 0))
                 downloaded = 0
+                digest = hashlib.sha256()
                 with open(dest, 'wb') as f:
                     while True:
                         chunk = resp.read(65536)
                         if not chunk: break
                         f.write(chunk)
+                        digest.update(chunk)
                         downloaded += len(chunk)
                         if total > 0:
                             pct = min(int(downloaded * 100 / total), 100)
                             wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
+                if total > 0 and downloaded != total:
+                    raise RuntimeError(f"Update download was incomplete: received {downloaded} of {total} bytes.")
+                if expected_sha256 and digest.hexdigest().lower() != str(expected_sha256).lower():
+                    raise RuntimeError("Update download failed SHA-256 verification.")
             wx.CallAfter(callback, True, None)
         except Exception as e:
+            try:
+                if os.path.exists(dest): os.remove(dest)
+            except OSError:
+                pass
             wx.CallAfter(callback, False, str(e))
     threading.Thread(target=_download, daemon=True).start()
 
@@ -1362,6 +1377,35 @@ def apply_installer_update(installer_path):
         f.write(f'del "{installer_path}"\r\n')
         f.write(f'del "%~f0"\r\n')
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
+
+def build_windows_zip_update_batch(zip_path, program_dir, exe_path, pid, temp_extract):
+    return (
+        "@echo off\r\n"
+        "setlocal\r\n"
+        f'set "UPDATE_LOG={os.path.join(tempfile.gettempdir(), "thrive_update.log")}"\r\n'
+        f':waitloop\r\n'
+        f'tasklist /fi "PID eq {pid}" 2>NUL | find /i "{pid}" >NUL\r\n'
+        "if not errorlevel 1 (\r\n"
+        "    timeout /t 1 /nobreak >NUL\r\n"
+        "    goto waitloop\r\n"
+        ")\r\n"
+        f'if exist "{temp_extract}" rmdir /s /q "{temp_extract}"\r\n'
+        f'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'{zip_path}\' -DestinationPath \'{temp_extract}\' -Force" >> "%UPDATE_LOG%" 2>&1\r\n'
+        "if errorlevel 1 goto failed\r\n"
+        f'set "SOURCE_DIR={temp_extract}"\r\n'
+        f'if exist "{temp_extract}\\thrive_messenger\\thrive_messenger.exe" set "SOURCE_DIR={temp_extract}\\thrive_messenger"\r\n'
+        'if not exist "%SOURCE_DIR%\\thrive_messenger.exe" goto failed\r\n'
+        f'xcopy /s /e /y /q "%SOURCE_DIR%\\*" "{program_dir}\\" >> "%UPDATE_LOG%" 2>&1\r\n'
+        "if errorlevel 1 goto failed\r\n"
+        f'rmdir /s /q "{temp_extract}"\r\n'
+        f'del "{zip_path}"\r\n'
+        f'start "" "{exe_path}"\r\n'
+        'del "%~f0"\r\n'
+        "exit /b 0\r\n"
+        ":failed\r\n"
+        'echo Update failed. See "%UPDATE_LOG%". >> "%UPDATE_LOG%"\r\n'
+        "exit /b 1\r\n"
+    )
 
 def apply_zip_update(zip_path):
     if sys.platform == 'darwin':
@@ -1402,20 +1446,7 @@ def apply_zip_update(zip_path):
     temp_extract = os.path.join(tempfile.gettempdir(), 'thrive_update_extract')
     batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
     with open(batch_path, 'w') as f:
-        f.write(f'@echo off\r\n')
-        f.write(f':waitloop\r\n')
-        f.write(f'tasklist /fi "PID eq {pid}" 2>NUL | find /i "{pid}" >NUL\r\n')
-        f.write(f'if not errorlevel 1 (\r\n')
-        f.write(f'    timeout /t 1 /nobreak >NUL\r\n')
-        f.write(f'    goto waitloop\r\n')
-        f.write(f')\r\n')
-        f.write(f'if exist "{temp_extract}" rmdir /s /q "{temp_extract}"\r\n')
-        f.write(f'powershell -Command "Expand-Archive -Path \'{zip_path}\' -DestinationPath \'{temp_extract}\' -Force"\r\n')
-        f.write(f'xcopy /s /e /y /q "{temp_extract}\\thrive_messenger\\*" "{program_dir}\\"\r\n')
-        f.write(f'rmdir /s /q "{temp_extract}"\r\n')
-        f.write(f'del "{zip_path}"\r\n')
-        f.write(f'start "" "{exe_path}"\r\n')
-        f.write(f'del "%~f0"\r\n')
+        f.write(build_windows_zip_update_batch(zip_path, program_dir, exe_path, pid, temp_extract))
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
 
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
@@ -2573,13 +2604,23 @@ class ClientApp(wx.App):
         vol = max(0, min(100, vol))
         if vol == 0:
             return
+        self.stop_current_sound()
         if sys.platform == 'darwin':
             afplay = shutil.which('afplay')
             if afplay:
                 # afplay accepts linear gain in 0.0-1.0
-                subprocess.Popen([afplay, '-v', f"{vol / 100.0:.2f}", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._sound_process = subprocess.Popen([afplay, '-v', f"{vol / 100.0:.2f}", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return
         wx.adv.Sound.PlaySound(path, wx.adv.SOUND_ASYNC)
+
+    def stop_current_sound(self):
+        process = getattr(self, "_sound_process", None)
+        if process is not None and process.poll() is None:
+            try: process.terminate()
+            except OSError: pass
+        self._sound_process = None
+        try: wx.adv.Sound.Stop()
+        except Exception: pass
 
     def play_sound(self, sound_file):
         pack = self._resolved_sound_pack()
@@ -5111,7 +5152,12 @@ class MainFrame(wx.Frame):
                 app.ExitMainLoop()
             else:
                 wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
-        download_update(asset_url, dest, progress, _done)
+        expected_sha256 = None
+        if UPDATE_CONTEXT.get("source") == "feed":
+            if sys.platform == "darwin": expected_sha256 = UPDATE_CONTEXT.get("mac_zip_sha256")
+            elif use_installer: expected_sha256 = UPDATE_CONTEXT.get("installer_sha256")
+            else: expected_sha256 = UPDATE_CONTEXT.get("win_zip_sha256")
+        download_update(asset_url, dest, progress, _done, expected_sha256=expected_sha256)
     def _prompt_invite_user(self, username, methods=None):
         with InviteUserDialog(self, username, methods=methods) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -5247,20 +5293,24 @@ class MainFrame(wx.Frame):
             self._group_call_dlg.handle_audio(msg)
     def on_voice_call_incoming(self, msg):
         caller = str(msg.get("from", "")); call_id = str(msg.get("call_id", ""))
+        wx.GetApp().play_sound("incoming_call.wav")
         answer = wx.MessageBox(f"{caller} is calling. Answer this voice call?", "Incoming Voice Call", wx.YES_NO | wx.ICON_QUESTION, self)
+        wx.GetApp().stop_current_sound()
         action = "voice_call_accept" if answer == wx.YES else "voice_call_decline"
         self.sock.sendall((json.dumps({"action": action, "call_id": call_id}) + "\n").encode())
     def on_voice_call_event(self, msg):
         event = msg.get("event", ""); call_id = str(msg.get("call_id", "")); other = str(msg.get("with", ""))
-        if event == "ringing": show_notification("Voice call", f"Calling {other}...", timeout=5); return
-        if event == "failed": wx.MessageBox(msg.get("reason", "Call failed."), "Voice Call", wx.OK | wx.ICON_WARNING, self); return
+        if event == "ringing": wx.GetApp().play_sound("outgoing_call.wav"); show_notification("Voice call", f"Calling {other}...", timeout=5); return
+        if event == "failed": wx.GetApp().play_sound("call_ended.wav"); wx.MessageBox(msg.get("reason", "Call failed."), "Voice Call", wx.OK | wx.ICON_WARNING, self); return
         if event == "accepted":
-            if self._group_call_dlg and self._group_call_dlg.IsShown(): self._group_call_dlg.Close()
+            wx.GetApp().play_sound("call_connected.wav")
+            if self._group_call_dlg and self._group_call_dlg.IsShown(): self._group_call_dlg._close_sound_played = True; self._group_call_dlg.Close()
             self._group_call_dlg = GroupCallDialog(self, self.sock, self.user)
             self._group_call_dlg.configure_direct_call(call_id, other)
             self._group_call_dlg.Show(); self._group_call_dlg.start_audio(); return
         if event in ("declined", "ended"):
-            if self._group_call_dlg and self._group_call_dlg.direct_call_id == call_id: self._group_call_dlg.Close()
+            wx.GetApp().play_sound("call_ended.wav")
+            if self._group_call_dlg and self._group_call_dlg.direct_call_id == call_id: self._group_call_dlg._close_sound_played = True; self._group_call_dlg.Close()
             show_notification("Voice call", "Call declined." if event == "declined" else "Call ended.", timeout=4)
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
@@ -6363,6 +6413,7 @@ class GroupCallDialog(wx.Dialog):
         self.input_stream = None
         self.output_stream = None
         self.direct_call_id = None
+        self._close_sound_played = False
         self.muted = False
         self.deafened = False
         self.Bind(wx.EVT_CLOSE, self.on_close)
@@ -6415,6 +6466,9 @@ class GroupCallDialog(wx.Dialog):
     def on_close(self, event):
         self.stop_audio()
         group = self.current_group or self.group_txt.GetValue().strip()
+        if not self._close_sound_played:
+            wx.GetApp().play_sound("call_ended.wav" if self.direct_call_id else "group_call_leave.wav")
+            self._close_sound_played = True
         if self.direct_call_id:
             try: self.sock.sendall((json.dumps({"action": "voice_call_end", "call_id": self.direct_call_id}) + "\n").encode())
             except Exception: pass
@@ -6474,6 +6528,7 @@ class GroupCallDialog(wx.Dialog):
         if self.direct_call_id:
             try: self.sock.sendall((json.dumps({"action": "voice_call_end", "call_id": self.direct_call_id}) + "\n").encode())
             except Exception as exc: self._append_log(f"Leave failed: {exc}")
+            wx.GetApp().play_sound("call_ended.wav"); self._close_sound_played = True
             self.stop_audio(); self.Close(); return
         group = self.group_txt.GetValue().strip() or self.current_group
         if not group:
@@ -6541,8 +6596,10 @@ class GroupCallDialog(wx.Dialog):
         if msg.get("ok"):
             self._append_log(f"Call action OK for group {msg.get('group', '')}.")
             if msg.get("event") == "joined" and msg.get("mode", "voice") == "voice":
+                wx.GetApp().play_sound("group_call_join.wav")
                 self.start_audio()
             elif msg.get("event") == "left":
+                wx.GetApp().play_sound("group_call_leave.wav"); self._close_sound_played = True
                 self.stop_audio()
             self.on_refresh(None)
         else:
