@@ -37,3 +37,6 @@ backups/
 *.bak.*
 *.before-*
 *.old
+
+# Local private context links and notes
+.ignore/

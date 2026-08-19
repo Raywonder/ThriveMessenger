@@ -1,6 +1,7 @@
 import wx, socket, json, threading, datetime, wx.adv, configparser, ssl, sys, os, base64, uuid, subprocess, tempfile, re, random, shutil, time, secrets, ctypes
 import urllib.request, urllib.parse
 import traceback, platform
+import webbrowser
 import keyring
 import concurrent.futures
 import hashlib
@@ -241,6 +242,21 @@ def normalize_server_entry(entry):
         port = 2005
     primary = bool(entry.get('primary', False))
     return {'name': name, 'host': host, 'port': port, 'cafile': cafile, 'primary': primary}
+
+def normalize_mastodon_instance(instance):
+    raw = str(instance or "").strip()
+    if not raw:
+        raise ValueError("Mastodon instance is required.")
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("Use an https Mastodon instance, such as md.tappedin.fm.")
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        raise ValueError("Mastodon instance host is invalid.")
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"https://{host}{port}"
 
 def dedupe_server_entries(entries):
     out = []
@@ -2332,7 +2348,11 @@ class ClientApp(wx.App):
             dlg = LoginDialog(None, self.user_config, invite_context=self.launch_invite_context)
             result = dlg.ShowModal()
             if result == wx.ID_OK:
-                if getattr(dlg, "login_mode", "password") == "passkey":
+                if getattr(dlg, "login_mode", "password") == "mastodon":
+                    success, sock, sf, login_user = self.perform_mastodon_login(dlg.mastodon_instance, dlg.selected_server)
+                    if success:
+                        dlg.username = login_user or dlg.username
+                elif getattr(dlg, "login_mode", "password") == "passkey":
                     success, sock, sf, _ = self.perform_passkey_login(dlg.username, dlg.selected_server)
                 else:
                     success, sock, sf, _ = self.perform_login(dlg.username, dlg.password, dlg.selected_server)
@@ -2342,9 +2362,9 @@ class ClientApp(wx.App):
                     self.user_config['primary_server_name'] = dlg.primary_server_name
                     if dlg.remember_checked:
                         self.user_config['username'] = dlg.username
-                        self.user_config['password'] = dlg.password
+                        self.user_config['password'] = "" if getattr(dlg, "login_mode", "password") == "mastodon" else dlg.password
                         self.user_config['remember'] = True
-                        self.user_config['autologin'] = dlg.autologin_checked
+                        self.user_config['autologin'] = False if getattr(dlg, "login_mode", "password") == "mastodon" else dlg.autologin_checked
                         self.user_config['autologin_mode'] = getattr(dlg, "login_mode", "password")
                     else:
                         # Clear sensitive data but keep generic settings
@@ -2436,6 +2456,114 @@ class ClientApp(wx.App):
             log_event("error", "passkey_login_connection_error", {"error": str(e)})
             if not suppress_errors:
                 wx.MessageBox(f"A connection error occurred: {e}", "Connection Error", wx.ICON_ERROR)
+            return False, None, None, str(e)
+
+    def _mastodon_register_app(self, instance):
+        base = normalize_mastodon_instance(instance)
+        payload = urllib.parse.urlencode({
+            "client_name": "Thrive Messenger",
+            "redirect_uris": "urn:ietf:wg:oauth:2.0:oob",
+            "scopes": "read:accounts",
+            "website": "https://im.tappedin.fm/",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/api/v1/apps",
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": f"ThriveMessenger/{VERSION_TAG}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+
+    def _mastodon_exchange_code(self, instance, app_data, code):
+        base = normalize_mastodon_instance(instance)
+        payload = urllib.parse.urlencode({
+            "client_id": str(app_data.get("client_id") or ""),
+            "client_secret": str(app_data.get("client_secret") or ""),
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "grant_type": "authorization_code",
+            "code": str(code or "").strip(),
+            "scope": "read:accounts",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/oauth/token",
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": f"ThriveMessenger/{VERSION_TAG}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+
+    def perform_mastodon_login(self, instance, server_entry=None, suppress_errors=False, show_post_login=True):
+        try:
+            if server_entry:
+                set_active_server_config(server_entry)
+            base = normalize_mastodon_instance(instance)
+            app_data = self._mastodon_register_app(base)
+            client_id = str(app_data.get("client_id") or "").strip()
+            if not client_id or not str(app_data.get("client_secret") or "").strip():
+                raise RuntimeError("Mastodon app registration did not return client credentials.")
+            auth_query = urllib.parse.urlencode({
+                "client_id": client_id,
+                "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+                "response_type": "code",
+                "scope": "read:accounts",
+            })
+            auth_url = f"{base}/oauth/authorize?{auth_query}"
+            webbrowser.open(auth_url)
+            with wx.TextEntryDialog(
+                None,
+                "Approve Thrive Messenger in your Mastodon browser window, then paste the authorization code here.",
+                "Mastodon Login",
+            ) as code_dlg:
+                if code_dlg.ShowModal() != wx.ID_OK:
+                    return False, None, None, "Mastodon login was cancelled."
+                code = code_dlg.GetValue().strip()
+            if not code:
+                return False, None, None, "Mastodon authorization code is required."
+            token_data = self._mastodon_exchange_code(base, app_data, code)
+            access_token = str(token_data.get("access_token") or "").strip()
+            if not access_token:
+                raise RuntimeError("Mastodon did not return an access token.")
+            ssock = create_secure_socket(server_entry)
+            ssock.sendall(json.dumps({
+                "action": "mastodon_login",
+                "instance": base,
+                "access_token": access_token,
+            }).encode() + b"\n")
+            sf = ssock.makefile()
+            resp = json.loads(sf.readline() or "{}")
+            if resp.get("status") == "ok":
+                self.session_password = ""
+                self.active_server_entry = normalize_server_entry(server_entry or SERVER_CONFIG)
+                info = fetch_server_welcome(server_entry or SERVER_CONFIG)
+                post_login = str(info.get('post_login', '') or '').strip()
+                if show_post_login and info.get('enabled') and post_login:
+                    show_notification("Server Message", post_login, timeout=8)
+                return True, ssock, sf, str(resp.get("user") or "")
+            reason = resp.get("reason", "Unknown error")
+            log_event("error", "mastodon_login_failed", {"reason": reason})
+            if not suppress_errors:
+                wx.MessageBox("Mastodon login failed: " + reason, "Login Failed", wx.ICON_ERROR)
+                prompt_submit_logs(None, self.user_config, reason="mastodon_login_failed")
+            ssock.close()
+            return False, None, None, reason
+        except Exception as e:
+            log_event("error", "mastodon_login_connection_error", {"error": str(e)})
+            if not suppress_errors:
+                wx.MessageBox(f"A Mastodon login error occurred: {e}", "Mastodon Login Error", wx.ICON_ERROR)
+                try:
+                    prompt_submit_logs(None, self.user_config, reason="mastodon_login_connection_error")
+                except Exception:
+                    pass
             return False, None, None, str(e)
 
     def _current_server_label(self):
@@ -2730,6 +2858,12 @@ class ClientApp(wx.App):
                     elif act == "group_call_result": wx.CallAfter(self.frame.on_group_call_result, msg)
                     elif act == "group_call_signal": wx.CallAfter(self.frame.on_group_call_signal, msg)
                     elif act == "group_call_signal_result": wx.CallAfter(self.frame.on_group_call_signal_result, msg)
+                    elif act == "voice_call_request": wx.CallAfter(self.frame.on_voice_call_request, msg)
+                    elif act == "voice_call_event": wx.CallAfter(self.frame.on_voice_call_event, msg)
+                    elif act == "voice_call_result": wx.CallAfter(self.frame.on_voice_call_result, msg)
+                    elif act == "voice_call_signal": wx.CallAfter(self.frame.on_voice_call_signal, msg)
+                    elif act == "voice_call_signal_result": wx.CallAfter(self.frame.on_voice_call_signal_result, msg)
+                    elif act == "voice_call_voicemail": wx.CallAfter(self.frame.on_voice_call_voicemail, msg)
                     elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
                     elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
                 except Exception as dispatch_err:
@@ -3230,6 +3364,9 @@ class LoginDialog(wx.Dialog):
         self.invite_context = invite_context or {}
         self.invite_validation = None
         self.login_mode = "password"
+        self.username = ""
+        self.password = ""
+        self.mastodon_instance = "md.tappedin.fm"
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
         self.server_entries = ensure_official_server_entry(self.user_config.get('server_entries', []))
@@ -3289,6 +3426,8 @@ class LoginDialog(wx.Dialog):
         login_btn = wx.Button(panel, label="&Login"); login_btn.Bind(wx.EVT_BUTTON, self.on_login)
         passkey_btn = wx.Button(panel, label="Login with Passkey")
         passkey_btn.Bind(wx.EVT_BUTTON, self.on_login_passkey)
+        mastodon_btn = wx.Button(panel, label="Login with Mastodon")
+        mastodon_btn.Bind(wx.EVT_BUTTON, self.on_login_mastodon)
         create_btn = wx.Button(panel, label="&Create Account..."); create_btn.Bind(wx.EVT_BUTTON, self.on_create_account)
         forgot_btn = wx.Button(panel, label="&Forgot Password?"); forgot_btn.Bind(wx.EVT_BUTTON, self.on_forgot)
 
@@ -3298,7 +3437,7 @@ class LoginDialog(wx.Dialog):
                 box.GetStaticBox().SetBackgroundColour(dark_color)
             for ctrl in [self.server_choice, self.welcome_preview, self.u, self.p]:
                 ctrl.SetBackgroundColour(dark_color); ctrl.SetForegroundColour(light_text_color)
-            for btn in [manage_servers_btn, set_primary_btn, login_btn, passkey_btn, create_btn, forgot_btn]:
+            for btn in [manage_servers_btn, set_primary_btn, login_btn, passkey_btn, mastodon_btn, create_btn, forgot_btn]:
                 btn.SetBackgroundColour(dark_color); btn.SetForegroundColour(light_text_color)
             self.remember_cb.SetForegroundColour(light_text_color); self.autologin_cb.SetForegroundColour(light_text_color)
 
@@ -3312,6 +3451,7 @@ class LoginDialog(wx.Dialog):
         btn_sizer = wx.BoxSizer(wx.HORIZONTAL); 
         btn_sizer.Add(login_btn, 1, wx.EXPAND | wx.ALL, 2); btn_sizer.Add(passkey_btn, 1, wx.EXPAND | wx.ALL, 2)
         btn_sizer2 = wx.BoxSizer(wx.HORIZONTAL)
+        btn_sizer2.Add(mastodon_btn, 1, wx.EXPAND | wx.ALL, 2)
         btn_sizer2.Add(create_btn, 1, wx.EXPAND | wx.ALL, 2)
         s.Add(btn_sizer, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
         s.Add(btn_sizer2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 5)
@@ -3548,6 +3688,28 @@ class LoginDialog(wx.Dialog):
         self.password = ""
         self.remember_checked = self.remember_cb.IsChecked()
         self.autologin_checked = self.autologin_cb.IsChecked()
+        self._persist_login_server_selection()
+        self.EndModal(wx.ID_OK)
+
+    def on_login_mastodon(self, _):
+        with wx.TextEntryDialog(
+            self,
+            "Enter your Mastodon instance, such as md.tappedin.fm.",
+            "Login with Mastodon",
+            value="md.tappedin.fm",
+        ) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            instance = dlg.GetValue().strip()
+        if not instance:
+            wx.MessageBox("Mastodon instance is required.", "Login Error", wx.ICON_ERROR)
+            return
+        self.login_mode = "mastodon"
+        self.mastodon_instance = instance
+        self.username = self.u.GetValue().strip()
+        self.password = ""
+        self.remember_checked = self.remember_cb.IsChecked()
+        self.autologin_checked = False
         self._persist_login_server_selection()
         self.EndModal(wx.ID_OK)
 
@@ -5496,6 +5658,66 @@ class MainFrame(wx.Frame):
     def on_group_call_signal_result(self, msg):
         if self._group_call_dlg and self._group_call_dlg.IsShown():
             self._group_call_dlg.handle_signal_result(msg)
+    def _direct_call_chat(self, msg):
+        other = str(msg.get("from") or msg.get("caller") or msg.get("callee") or msg.get("to") or "").strip()
+        if other == self.user:
+            participants = msg.get("participants") if isinstance(msg.get("participants"), list) else []
+            for candidate in participants:
+                candidate = str(candidate or "").strip()
+                if candidate and candidate != self.user:
+                    other = candidate
+                    break
+        return self.get_chat(other) if other else None
+    def on_voice_call_request(self, msg):
+        caller = str(msg.get("from") or msg.get("caller") or "Unknown").strip()
+        call_id = str(msg.get("call_id") or "").strip()
+        wx.GetApp().play_sound("receive.wav")
+        show_notification("Incoming Thrive call", f"{caller} is calling.", timeout=8)
+        chat = self.get_chat(caller)
+        if chat:
+            chat.append("Incoming voice call. This client build cannot connect direct-call audio yet, so the call was declined.", "System", time.time())
+        if call_id:
+            try:
+                self.sock.sendall((json.dumps({"action": "voice_call_decline", "call_id": call_id}) + "\n").encode())
+            except Exception:
+                pass
+    def on_voice_call_event(self, msg):
+        event = str(msg.get("event") or "updated").strip()
+        by = str(msg.get("by") or "").strip()
+        chat = self._direct_call_chat(msg)
+        line = f"Voice call {event}" + (f" by {by}." if by else ".")
+        if chat:
+            chat.append(line, "System", time.time())
+        show_notification("Thrive call", line, timeout=5)
+    def on_voice_call_result(self, msg):
+        if msg.get("ok"):
+            event = str(msg.get("event") or "updated").strip()
+            target = str(msg.get("to") or msg.get("callee") or "").strip()
+            line = f"Voice call {event}" + (f" with {target}." if target else ".")
+        else:
+            line = "Voice call failed: " + str(msg.get("reason") or "unknown error")
+        chat = self._direct_call_chat(msg)
+        if chat:
+            chat.append(line, "System", time.time())
+        show_notification("Thrive call", line, timeout=5)
+    def on_voice_call_signal(self, msg):
+        # Direct-call signaling exists server-side, but this desktop build does not yet
+        # include a media engine. End the call instead of silently swallowing signals.
+        call_id = str(msg.get("call_id") or "").strip()
+        if call_id:
+            try:
+                self.sock.sendall((json.dumps({"action": "voice_call_end", "call_id": call_id}) + "\n").encode())
+            except Exception:
+                pass
+    def on_voice_call_signal_result(self, msg):
+        if not msg.get("ok"):
+            show_notification("Thrive call", str(msg.get("reason") or "Call signal failed."), timeout=5)
+    def on_voice_call_voicemail(self, msg):
+        sender = str(msg.get("from") or "Unknown").strip()
+        show_notification("Thrive voicemail", f"Voice message from {sender}.", timeout=8)
+        chat = self.get_chat(sender)
+        if chat:
+            chat.append("Voice voicemail received. This client build cannot play Thrive call audio yet.", "System", time.time())
     def on_add(self, _):
         with wx.TextEntryDialog(self, "Enter the username of the contact you wish to add:", "Add Contact") as dlg:
             if dlg.ShowModal() == wx.ID_OK:

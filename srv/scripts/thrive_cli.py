@@ -6,9 +6,11 @@ local SQLite access only for server-side admin maintenance.
 """
 
 import argparse
+import base64
 import configparser
 import getpass
 import json
+import mimetypes
 import os
 import secrets
 import socket
@@ -159,6 +161,55 @@ def recv_until_action(sock: socket.socket, wanted_actions: Iterable[str], timeou
             startup_events.append(event)
     finally:
         sock.settimeout(prior_timeout)
+
+
+def safe_filename(name: str) -> str:
+    cleaned = os.path.basename(str(name or "").strip())
+    if not cleaned or cleaned in (".", ".."):
+        cleaned = "attachment.bin"
+    return cleaned
+
+
+def unique_output_path(directory: Path, filename: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    base = safe_filename(filename)
+    candidate = directory / base
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem or "attachment"
+    suffix = candidate.suffix
+    for idx in range(1, 10000):
+        alt = directory / f"{stem}-{idx}{suffix}"
+        if not alt.exists():
+            return alt
+    raise FileExistsError(f"Could not choose unique output path for {base}")
+
+
+def read_file_payload(path: Path) -> Dict[str, Any]:
+    data = path.read_bytes()
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return {
+        "filename": path.name,
+        "size": len(data),
+        "mime": mime,
+        "data": base64.b64encode(data).decode("ascii"),
+    }
+
+
+def save_file_payload(file_info: Dict[str, Any], output_dir: Path) -> Dict[str, Any]:
+    filename = safe_filename(str(file_info.get("filename") or "attachment.bin"))
+    raw = file_info.get("data") or ""
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"Missing file data for {filename}")
+    data = base64.b64decode(raw.encode("ascii"), validate=False)
+    out = unique_output_path(output_dir, filename)
+    out.write_bytes(data)
+    return {
+        "filename": filename,
+        "path": str(out),
+        "size": len(data),
+        "mime": str(file_info.get("mime") or ""),
+    }
 
 
 def login(args: argparse.Namespace, password: Optional[str] = None) -> socket.socket:
@@ -367,18 +418,128 @@ def cmd_send(args: argparse.Namespace) -> None:
         sock.close()
 
 
+def cmd_send_file(args: argparse.Namespace) -> None:
+    files = []
+    payload_files = []
+    for raw in args.files:
+        path = Path(raw).expanduser().resolve()
+        if not path.is_file():
+            fail(f"File not found: {path}", args.json)
+        payload = read_file_payload(path)
+        files.append({k: payload[k] for k in ("filename", "size", "mime")})
+        payload_files.append(payload)
+    sock = login(args)
+    try:
+        transfer_id = secrets.token_hex(12)
+        send_json(sock, {"action": "file_offer", "to": args.to, "files": files, "transfer_id": transfer_id})
+        response = recv_until_action(sock, ["file_accepted", "file_offer_failed", "file_declined"], timeout=args.wait)
+        if response.get("action") != "file_accepted":
+            emit({"status": "error", "sent": False, "to": args.to, "response": response}, args.json)
+            return
+        server_transfer_id = response.get("transfer_id")
+        send_json(sock, {"action": "file_data", "transfer_id": server_transfer_id, "files": payload_files})
+        emit({"status": "ok", "sent": True, "to": args.to, "files": files, "transfer_id": server_transfer_id, "response": response}, args.json)
+    finally:
+        sock.close()
+
+
+def cmd_bot_store_file(args: argparse.Namespace) -> None:
+    path = Path(args.file).expanduser().resolve()
+    if not path.is_file():
+        fail(f"File not found: {path}", args.json)
+    payload = read_file_payload(path)
+    if args.mime:
+        payload["mime"] = args.mime
+    sock = login(args)
+    try:
+        request_id = args.request_id or secrets.token_hex(12)
+        send_json(sock, {
+            "action": "bot_mesh_store_file",
+            "to": args.to,
+            "filename": payload["filename"],
+            "mime": payload["mime"],
+            "data": payload["data"],
+            "request_id": request_id,
+        })
+        response = recv_until_action(sock, ["bot_mesh_file_stored"], timeout=args.wait)
+        emit({"status": "ok" if response.get("ok") else "error", "response": response}, args.json)
+    finally:
+        sock.close()
+
+
+def cmd_bot_fetch_file(args: argparse.Namespace) -> None:
+    sock = login(args)
+    try:
+        send_json(sock, {"action": "bot_mesh_fetch_file", "file_id": args.file_id, "consume": args.consume})
+        response = recv_until_action(sock, ["bot_mesh_file_data"], timeout=args.wait)
+        saved = None
+        if response.get("ok"):
+            saved = save_file_payload(response, args.output_dir)
+            if not args.include_data:
+                response = dict(response)
+                response.pop("data", None)
+        emit({"status": "ok" if response.get("ok") else "error", "saved": saved, "response": response}, args.json)
+    finally:
+        sock.close()
+
+
+def _maybe_handle_voice_call_event(sock: socket.socket, event: Dict[str, Any], args: argparse.Namespace) -> bool:
+    action = event.get("action")
+    if action != "voice_call_request" or not getattr(args, "auto_decline_calls", False):
+        return False
+    call_id = str(event.get("call_id", "") or "").strip()
+    caller = str(event.get("from", event.get("caller", "")) or "").strip()
+    if call_id:
+        send_json(sock, {"action": "voice_call_decline", "call_id": call_id})
+    message = str(getattr(args, "call_decline_message", "") or "").strip()
+    if message and caller:
+        send_json(sock, {"action": "msg", "to": caller, "from": args.username, "msg": message})
+    return True
+
+
 def cmd_listen(args: argparse.Namespace) -> None:
     sock = login(args)
     try:
         emit({"status": "ok", "message": f"Listening as {args.username}. Press Ctrl+C to stop."}, args.json)
         while True:
             event = recv_json_line(sock)
+            saved_files = []
+            action = event.get("action", "event")
+            if _maybe_handle_voice_call_event(sock, event, args):
+                event = dict(event)
+                event["handled"] = "auto_declined"
+            elif action == "file_offer" and args.auto_accept_files:
+                send_json(sock, {"action": "file_accept", "transfer_id": event.get("transfer_id")})
+            elif action == "file_data" and args.save_dir:
+                for file_info in event.get("files", []) if isinstance(event.get("files"), list) else []:
+                    try:
+                        saved_files.append(save_file_payload(file_info, args.save_dir))
+                    except Exception as exc:
+                        saved_files.append({"error": str(exc), "filename": file_info.get("filename", "") if isinstance(file_info, dict) else ""})
+                event = dict(event)
+                event["saved_files"] = saved_files
+                if not args.include_data:
+                    for file_info in event.get("files", []) if isinstance(event.get("files"), list) else []:
+                        if isinstance(file_info, dict):
+                            file_info.pop("data", None)
+            elif action == "bot_mesh_file_available" and args.save_dir and args.auto_fetch_bot_files:
+                send_json(sock, {"action": "bot_mesh_fetch_file", "file_id": event.get("file_id"), "consume": args.consume_bot_files})
+            elif action == "bot_mesh_file_data" and args.save_dir and event.get("ok"):
+                try:
+                    saved_files.append(save_file_payload(event, args.save_dir))
+                except Exception as exc:
+                    saved_files.append({"error": str(exc), "filename": event.get("filename", "")})
+                event = dict(event)
+                event["saved_files"] = saved_files
+                if not args.include_data:
+                    event.pop("data", None)
             if args.json:
                 print(json.dumps(event, sort_keys=True), flush=True)
             else:
-                action = event.get("action", "event")
                 sender = event.get("from", "")
                 body = event.get("msg", event.get("reason", ""))
+                if saved_files:
+                    body = f"saved {len(saved_files)} file(s): " + ", ".join(str(item.get("path", item.get("error", ""))) for item in saved_files)
                 print(f"{datetime.now().isoformat()} {action} {sender}: {body}", flush=True)
     except KeyboardInterrupt:
         pass
@@ -388,8 +549,11 @@ def cmd_listen(args: argparse.Namespace) -> None:
 
 def cmd_register_bot_session(args: argparse.Namespace) -> None:
     sock = login(args)
+    session_id = f"{args.username}:{args.host_label}:{os.getpid()}:{secrets.token_hex(8)}"
+    heartbeat_interval = max(10.0, min(60.0, float(args.wait or 5.0) * 3.0))
     payload = {
         "action": "register_bot_session",
+        "session_id": session_id,
         "auth_type": args.auth_type,
         "runtime": args.runtime,
         "host_label": args.host_label,
@@ -410,10 +574,45 @@ def cmd_register_bot_session(args: argparse.Namespace) -> None:
         send_json(sock, payload)
         response = recv_until_action(sock, ["bot_session_registered"], timeout=args.wait)
         emit({"status": "ok" if response.get("ok") else "error", "response": response}, args.json)
+        if response.get("ok") and args.provider_health:
+            send_json(sock, {"action": "get_agent_provider_health"})
+            try:
+                health = recv_until_action(sock, ["agent_provider_health"], timeout=args.wait)
+                emit({"status": "ok" if health.get("ok") else "error", "response": health}, args.json)
+            except Exception as exc:
+                emit({"status": "warning", "message": "Provider health response was not received before timeout.", "reason": str(exc)}, args.json)
         if args.listen and response.get("ok"):
-            sock.settimeout(None)
+            sock.settimeout(heartbeat_interval)
             while True:
-                event = recv_json_line(sock)
+                try:
+                    event = recv_json_line(sock)
+                except socket.timeout:
+                    send_json(sock, {
+                        "action": "bot_session_heartbeat",
+                        "session_id": session_id,
+                        "host_label": args.host_label,
+                    })
+                    continue
+                if event.get("action") == "bot_catchup_messages":
+                    messages = event.get("messages") if isinstance(event.get("messages"), list) else []
+                    actionable = sum(1 for item in messages if isinstance(item, dict) and item.get("actionable"))
+                    summary = {
+                        "action": "bot_catchup_summary",
+                        "bot": event.get("bot", args.username),
+                        "channel": event.get("channel", "thrive"),
+                        "missed_count": len(messages),
+                        "actionable_count": actionable,
+                    }
+                    if args.json:
+                        print(json.dumps(summary, sort_keys=True), flush=True)
+                    else:
+                        print(json.dumps(summary, ensure_ascii=False), flush=True)
+                    continue
+                if event.get("action") == "bot_session_heartbeat":
+                    continue
+                if _maybe_handle_voice_call_event(sock, event, args):
+                    event = dict(event)
+                    event["handled"] = "auto_declined"
                 if args.json:
                     print(json.dumps(event, sort_keys=True), flush=True)
                 else:
@@ -446,7 +645,8 @@ def add_login_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="thrive-cli", description="Thrive Messenger CLI for admins, agents, and CLI users.")
     add_common(parser)
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
 
     p = sub.add_parser("doctor", help="Check config, local DB, and server reachability.")
     p.set_defaults(func=cmd_doctor)
@@ -473,8 +673,40 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for immediate server replies.")
     send.set_defaults(func=cmd_send)
 
+    send_file = sub.add_parser("send-file", help="Offer one or more files to a user and send after acceptance.")
+    add_login_args(send_file)
+    send_file.add_argument("--to", required=True, help="Recipient username or bot.")
+    send_file.add_argument("files", nargs="+", help="File path(s) to send.")
+    send_file.add_argument("--wait", type=float, default=30.0, help="Seconds to wait for recipient acceptance.")
+    send_file.set_defaults(func=cmd_send_file)
+
+    bot_store = sub.add_parser("bot-store-file", help="Store a file in the bot mesh and notify the target bot.")
+    add_login_args(bot_store)
+    bot_store.add_argument("--to", required=True, help="Target bot username.")
+    bot_store.add_argument("file", help="File path to store.")
+    bot_store.add_argument("--mime", default="", help="Override MIME type.")
+    bot_store.add_argument("--request-id", default="", help="Optional request id to correlate with a bot task.")
+    bot_store.add_argument("--wait", type=float, default=10.0, help="Seconds to wait for server response.")
+    bot_store.set_defaults(func=cmd_bot_store_file)
+
+    bot_fetch = sub.add_parser("bot-fetch-file", help="Fetch a bot-mesh file by id and save it locally.")
+    add_login_args(bot_fetch)
+    bot_fetch.add_argument("file_id", help="Bot mesh file id.")
+    bot_fetch.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save the fetched file.")
+    bot_fetch.add_argument("--consume", action="store_true", help="Remove the bot-mesh temp file after fetching.")
+    bot_fetch.add_argument("--include-data", action="store_true", help="Include base64 data in JSON output.")
+    bot_fetch.add_argument("--wait", type=float, default=10.0, help="Seconds to wait for server response.")
+    bot_fetch.set_defaults(func=cmd_bot_fetch_file)
+
     listen = sub.add_parser("listen", help="Log in and print incoming events.")
     add_login_args(listen)
+    listen.add_argument("--save-dir", type=Path, default=None, help="Directory for received file_data or bot-mesh files.")
+    listen.add_argument("--auto-accept-files", action="store_true", help="Automatically accept incoming direct file offers.")
+    listen.add_argument("--auto-fetch-bot-files", action="store_true", help="Automatically fetch bot-mesh file_available events.")
+    listen.add_argument("--consume-bot-files", action="store_true", help="Consume bot-mesh files after auto-fetching.")
+    listen.add_argument("--include-data", action="store_true", help="Include base64 file data in JSON output.")
+    listen.add_argument("--auto-decline-calls", action="store_true", help="Decline incoming direct voice calls instead of leaving them ringing.")
+    listen.add_argument("--call-decline-message", default="", help="Optional direct message sent to the caller after auto-declining.")
     listen.set_defaults(func=cmd_listen)
 
     reg = sub.add_parser("register-bot-session", help="Log in as a bot and advertise bot-mesh capabilities.")
@@ -492,7 +724,10 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument("--moderation-kinds", nargs="*", default=["direct_message", "file_offer"], help="Moderation event kinds.")
     reg.add_argument("--notify-user", default="", help="User to notify for moderation events.")
     reg.add_argument("--wait", type=float, default=5.0, help="Seconds to wait for the bot session registration response.")
+    reg.add_argument("--provider-health", action="store_true", help="Ask the server for redacted agent provider health after registration.")
     reg.add_argument("--listen", action="store_true", help="Keep listening after registration.")
+    reg.add_argument("--auto-decline-calls", action="store_true", help="Decline incoming direct voice calls instead of leaving them ringing.")
+    reg.add_argument("--call-decline-message", default="", help="Optional direct message sent to the caller after auto-declining.")
     reg.set_defaults(func=cmd_register_bot_session)
 
     return parser
