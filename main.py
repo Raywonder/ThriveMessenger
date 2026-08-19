@@ -1025,6 +1025,37 @@ def parse_github_tag(tag):
     if not m: return None
     return (int(m.group(1)) - 2000, 0, int(m.group(2)), int(m.group(3)) if m.group(3) else 0)
 
+def parse_update_feed(feed_data, local_tag, platform):
+    """Normalize current and legacy update-feed keys for one client platform."""
+    local = parse_github_tag(local_tag)
+    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
+    remote = parse_github_tag(tag)
+    if local is None or remote is None or remote <= local:
+        return None
+    mac_zip = (
+        feed_data.get("mac_zip_url")
+        or feed_data.get("mac_url")
+        or feed_data.get("mac_x86_64_url")
+    )
+    win_zip = feed_data.get("win_zip_url") or feed_data.get("windows_zip_url")
+    generic_zip = feed_data.get("zip_url")
+    if platform == "darwin":
+        preferred_zip = mac_zip or generic_zip or win_zip
+    elif platform == "win32":
+        preferred_zip = win_zip or generic_zip or mac_zip
+    else:
+        preferred_zip = generic_zip or win_zip or mac_zip
+    return {
+        "source": "feed",
+        "tag": tag,
+        "remote": remote,
+        "zip_url": preferred_zip,
+        "mac_zip_url": mac_zip,
+        "win_zip_url": win_zip,
+        "installer_url": feed_data.get("installer_url") or feed_data.get("win_installer_url"),
+        "repo": feed_data.get("repo"),
+    }
+
 def _load_update_settings():
     cfg = load_client_config()
     update_feed_url = cfg.get('updates', 'feed_url', fallback='').strip()
@@ -1264,28 +1295,11 @@ def check_for_update(callback):
                     feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG, "Accept": "application/json"})
                     with urllib.request.urlopen(feed_req, timeout=15) as resp:
                         feed_data = json.loads(resp.read().decode())
-                    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
-                    remote = parse_github_tag(tag)
-                    if remote and remote > local:
-                        mac_zip = feed_data.get("mac_zip_url")
-                        win_zip = feed_data.get("win_zip_url")
-                        generic_zip = feed_data.get("zip_url")
-                        preferred_zip = generic_zip
-                        if sys.platform == "darwin":
-                            preferred_zip = mac_zip or generic_zip or win_zip
-                        elif sys.platform == "win32":
-                            preferred_zip = win_zip or generic_zip or mac_zip
-                        UPDATE_CONTEXT.update({
-                            "source": "feed",
-                            "feed_url": feed_url,
-                            "tag": tag,
-                            "zip_url": preferred_zip,
-                            "mac_zip_url": mac_zip,
-                            "win_zip_url": win_zip,
-                            "installer_url": feed_data.get("installer_url") or feed_data.get("win_installer_url"),
-                            "repo": feed_data.get("repo"),
-                        })
-                        wx.CallAfter(callback, tag, ".".join(str(x) for x in remote), None)
+                    update = parse_update_feed(feed_data, VERSION_TAG, sys.platform)
+                    if update:
+                        update["feed_url"] = feed_url
+                        UPDATE_CONTEXT.update(update)
+                        wx.CallAfter(callback, update["tag"], ".".join(str(x) for x in update["remote"]), None)
                         return
                 except Exception as feed_err:
                     print(f"Update feed check failed: {feed_err}")
