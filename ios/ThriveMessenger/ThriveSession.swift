@@ -31,8 +31,13 @@ final class ThriveSession {
         do {
             let value = NWConnection(host: .init(host), port: .init(rawValue: UInt16(port))!, using: .tls); connection = value
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                var finished = false
-                value.stateUpdateHandler = { state in guard !finished else { return }; switch state { case .ready: finished = true; continuation.resume(); case .failed(let error): finished = true; continuation.resume(throwing: error); default: break } }
+                value.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready: value.stateUpdateHandler = nil; continuation.resume()
+                    case .failed(let error): value.stateUpdateHandler = nil; continuation.resume(throwing: error)
+                    default: break
+                    }
+                }
                 value.start(queue: .global(qos: .userInitiated))
             }
             receiveNext(); try await send(["action": "login", "user": username, "pass": password])
