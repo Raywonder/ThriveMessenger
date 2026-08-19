@@ -48,7 +48,9 @@ if [[ ! -d "${APP_PATH}" ]]; then
 fi
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+if ! /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"; then
+  /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+fi
 
 if [[ -n "${THRIVE_CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --deep --options runtime --timestamp --sign "${THRIVE_CODESIGN_IDENTITY}" "${APP_PATH}"
