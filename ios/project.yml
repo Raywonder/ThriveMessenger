@@ -23,6 +23,8 @@ targets:
         INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connects to self-hosted Thrive Messenger servers on your network.
         INFOPLIST_KEY_NSMicrophoneUsageDescription: Lets you speak in direct and group voice calls.
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         SUPPORTS_MACCATALYST: NO
         TARGETED_DEVICE_FAMILY: "1,2"
     scheme:
