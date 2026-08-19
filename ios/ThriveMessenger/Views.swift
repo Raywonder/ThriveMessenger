@@ -32,12 +32,18 @@ struct GroupsView: View {
 
 struct CreateRoomView: View {
     @Environment(\.dismiss) private var dismiss; @Bindable var session: ThriveSession
-    @State private var name = "", description = "", visibility = "public", expiration = "never"
+    @State private var name = ""
+    @State private var description = ""
+    @State private var visibility = "public"
+    @State private var expiration = "never"
     var body: some View { NavigationStack { Form { TextField("Room name", text: $name); TextField("Description", text: $description, axis: .vertical); Picker("Visibility", selection: $visibility) { Text("Public").tag("public"); Text("Private").tag("private") }; Picker("Expiration", selection: $expiration) { Text("Never").tag("never"); Text("One day").tag("day"); Text("One week").tag("week"); Text("One month").tag("month"); Text("One year").tag("year"); Text("When everyone leaves").tag("empty") } }.navigationTitle("New Group Room").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Create") { Task { await session.createRoom(name: name, description: description, visibility: visibility, expiration: expiration); dismiss() } }.disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } } } }
 }
 
 struct RoomView: View {
-    @Bindable var session: ThriveSession; @State private var draft = "", importing = false, selectedMember: RoomMember?
+    @Bindable var session: ThriveSession
+    @State private var draft = ""
+    @State private var importing = false
+    @State private var selectedMember: RoomMember?
     var body: some View { VStack {
         if let room = session.openRoom, !room.description.isEmpty { Text(room.description).font(.subheadline).foregroundStyle(.secondary).padding(.horizontal) }
         MessageList(messages: session.roomMessages)
