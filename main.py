@@ -2459,12 +2459,13 @@ class ClientApp(wx.App):
         if stop_event:
             stop_event.set()
         self._keepalive_stop = threading.Event()
-        threading.Thread(target=self._keepalive_monitor, args=(self._keepalive_stop,), daemon=True).start()
+        monitored_sock = getattr(self, "sock", None)
+        threading.Thread(target=self._keepalive_monitor, args=(self._keepalive_stop, monitored_sock), daemon=True).start()
 
-    def _keepalive_monitor(self, stop_event):
+    def _keepalive_monitor(self, stop_event, monitored_sock):
         while not stop_event.wait(KEEPALIVE_CHECK_INTERVAL):
             sock = getattr(self, "sock", None)
-            if not sock or self.intentional_disconnect:
+            if not sock or sock is not monitored_sock or self.intentional_disconnect:
                 continue
             idle_for = time.time() - getattr(self, "_last_activity", time.time())
             if idle_for < IDLE_KEEPALIVE_SECONDS:
@@ -2473,12 +2474,14 @@ class ClientApp(wx.App):
             try:
                 sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
             except Exception:
-                if not self.intentional_disconnect:
+                if not self.intentional_disconnect and getattr(self, "sock", None) is monitored_sock:
                     wx.CallAfter(self.on_server_disconnect)
                 return
             if stop_event.wait(KEEPALIVE_RESPONSE_TIMEOUT):
                 return
-            if getattr(self, "_last_activity", previous_activity) <= previous_activity and not self.intentional_disconnect:
+            if (getattr(self, "_last_activity", previous_activity) <= previous_activity
+                    and not self.intentional_disconnect
+                    and getattr(self, "sock", None) is monitored_sock):
                 wx.CallAfter(self.on_server_disconnect)
                 return
 
@@ -2667,6 +2670,7 @@ class ClientApp(wx.App):
 
     def on_file_accepted(self, msg):
         transfer_id = msg["transfer_id"]; to = msg["to"]; files_info = msg["files"]
+        file_token = msg.get("file_token", "")
         client_tid = msg.get("client_transfer_id") or transfer_id
         file_paths = self.pending_file_paths.pop(client_tid, None)
         if not file_paths:
@@ -2678,7 +2682,16 @@ class ClientApp(wx.App):
                 files_data = []
                 for fp in file_paths:
                     with open(fp, 'rb') as f: files_data.append({"filename": os.path.basename(fp), "data": base64.b64encode(f.read()).decode('ascii')})
-                self.sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "to": to, "files": files_data}) + "\n").encode())
+                # Keep large payloads off the live messaging socket so normal
+                # chat and server commands remain responsive during uploads.
+                xfer_sock = create_secure_socket()
+                try:
+                    xfer_sock.sendall((json.dumps({"action": "file_data", "transfer_id": transfer_id, "file_token": file_token, "to": to, "files": files_data}) + "\n").encode())
+                    response = json.loads(xfer_sock.makefile().readline() or "{}")
+                finally:
+                    xfer_sock.close()
+                if response.get("status") != "ok":
+                    raise RuntimeError(response.get("reason", "Server rejected file data"))
                 names = [os.path.basename(fp) for fp in file_paths]
                 wx.CallAfter(self._on_files_sent, to, names, file_paths)
             except Exception as e:
@@ -5292,16 +5305,21 @@ class MainFrame(wx.Frame):
                 # like VMware Workstation report as disabled when the VM has
                 # input capture, but can still legitimately receive foreground.
                 our_pid = ctypes.windll.kernel32.GetCurrentProcessId()
+                found = ctypes.c_void_p(0)
                 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
                 def _find_other(hwnd, _):
                     if not ctypes.windll.user32.IsWindowVisible(hwnd): return True
                     pid = ctypes.c_ulong(0)
                     ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                     if pid.value != our_pid:
-                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                        found.value = hwnd
                         return False
                     return True
                 ctypes.windll.user32.EnumWindows(EnumWindowsProc(_find_other), None)
+                # Set focus only after EnumWindows releases its window-list
+                # lock; doing this in the callback can deadlock NVDA hooks.
+                if found.value:
+                    ctypes.windll.user32.SetForegroundWindow(found.value)
             for child in self.GetChildren():
                 if isinstance(child, ChatDialog) and child.IsShown():
                     child._restore_from_tray = True; child.Hide()
@@ -5527,6 +5545,19 @@ class AdminDialog(wx.Dialog):
         # Use a single ListBox for better screen-reader navigation.
         self.hist = wx.ListBox(self, style=wx.LB_SINGLE)
         self.hist.SetToolTip("Command responses history. Use arrow keys to review responses.")
+        template_row = wx.BoxSizer(wx.HORIZONTAL)
+        template_row.Add(wx.StaticText(self, label="&Command template:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.command_templates = wx.Choice(self, choices=[
+            "Help", "Show account limit", "Show global group policy", "List group policy keys",
+            "Create account", "Invite user", "Send server alert", "Ban user", "Schedule restart",
+        ])
+        self.command_templates.SetSelection(0)
+        self.command_templates.SetToolTip("Choose a command to insert. Review and edit it before sending.")
+        template_row.Add(self.command_templates, 1, wx.RIGHT, 6)
+        insert_btn = wx.Button(self, label="&Insert")
+        insert_btn.SetToolTip("Insert the selected command without running it.")
+        insert_btn.Bind(wx.EVT_BUTTON, self.on_insert_template)
+        template_row.Add(insert_btn, 0)
         box_msg = wx.StaticBoxSizer(wx.VERTICAL, self, "&Enter command (e.g., /create user pass or /help)"); self.input_ctrl = wx.TextCtrl(box_msg.GetStaticBox(), style=wx.TE_PROCESS_ENTER)
         self.input_ctrl.SetToolTip("To get more help, type ? or help! You can also use /help or /?.")
         btn = wx.Button(self, label="&Send Command")
@@ -5542,13 +5573,28 @@ class AdminDialog(wx.Dialog):
             btn_rules.SetBackgroundColour(dark_color); btn_rules.SetForegroundColour(light_text_color)
             btn_group_policy.SetBackgroundColour(dark_color); btn_group_policy.SetForegroundColour(light_text_color)
             
-        s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
+        s.Add(self.hist, 1, wx.EXPAND|wx.ALL, 5); s.Add(template_row, 0, wx.EXPAND|wx.LEFT|wx.RIGHT|wx.TOP, 5); self.input_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send); box_msg.Add(self.input_ctrl, 0, wx.EXPAND|wx.ALL, 5)
         s.Add(box_msg, 0, wx.EXPAND|wx.ALL, 5); btn.Bind(wx.EVT_BUTTON, self.on_send); btn_rules.Bind(wx.EVT_BUTTON, self.on_bot_rules); btn_group_policy.Bind(wx.EVT_BUTTON, self.on_group_policy)
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         btn_row.Add(btn, 1, wx.RIGHT, 5)
         btn_row.Add(btn_rules, 1, wx.LEFT | wx.RIGHT, 5)
         btn_row.Add(btn_group_policy, 1, wx.LEFT, 5)
         s.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5); self.SetSizer(s)
+    def on_insert_template(self, _):
+        templates = {
+            "Help": "/help",
+            "Show account limit": "/accountlimit show",
+            "Show global group policy": "/gpolicy show",
+            "List group policy keys": "/gpolicy keys",
+            "Create account": "/create username password email@example.com",
+            "Invite user": "/invite username email@example.com",
+            "Send server alert": "/alert message",
+            "Ban user": "/ban username MM/DD/YYYY reason",
+            "Schedule restart": "/restart",
+        }
+        self.input_ctrl.SetValue(templates[self.command_templates.GetStringSelection()])
+        self.input_ctrl.SetFocus()
+        self.input_ctrl.SetInsertionPointEnd()
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("admin", self)
@@ -5876,7 +5922,7 @@ class GroupPolicyDialog(wx.Dialog):
 
 class GroupCallDialog(wx.Dialog):
     def __init__(self, parent, sock, username):
-        super().__init__(parent, title="Group Calls", size=(720, 500))
+        super().__init__(parent, title="Group Call Signaling Preview", size=(720, 500))
         self.parent_frame = parent
         self.sock = sock
         self.username = username
@@ -5885,6 +5931,12 @@ class GroupCallDialog(wx.Dialog):
         self.Bind(wx.EVT_CLOSE, self.on_close)
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
+        preview_notice = wx.StaticText(
+            panel,
+            label="Preview: this coordinates call participants and signaling only; live microphone audio is not included yet.",
+        )
+        preview_notice.Wrap(680)
+        s.Add(preview_notice, 0, wx.EXPAND | wx.ALL, 8)
 
         top = wx.BoxSizer(wx.HORIZONTAL)
         top.Add(wx.StaticText(panel, label="Group:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -5920,6 +5972,12 @@ class GroupCallDialog(wx.Dialog):
         panel.SetSizer(s)
 
     def on_close(self, event):
+        group = self.current_group or self.group_txt.GetValue().strip()
+        if group:
+            try:
+                self.sock.sendall((json.dumps({"action": "group_call_leave", "group": group}) + "\n").encode())
+            except Exception:
+                pass
         if self.parent_frame:
             self.parent_frame._group_call_dlg = None
         event.Skip()

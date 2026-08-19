@@ -42,7 +42,9 @@ bot_moderation_lock = threading.Lock()
 restart_lock = threading.Lock()
 restart_scheduled_for = None
 group_call_sessions = {}
-group_call_lock = threading.Lock()
+# Snapshot and cleanup helpers can be called while the registry is already
+# locked. A re-entrant lock keeps those operations atomic without deadlocking.
+group_call_lock = threading.RLock()
 FEATURE_DEFAULTS = {
     "bots": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot contacts and bot chat features."},
     "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
@@ -1337,6 +1339,33 @@ def handle_client(cs, addr):
         except (UnicodeDecodeError, json.JSONDecodeError): return
 
         action = req.get("action")
+
+        # File payloads use a short-lived connection so a large upload cannot
+        # block the authenticated messaging and administration session.
+        if action == "file_data":
+            transfer_id = req.get("transfer_id")
+            file_token = req.get("file_token")
+            with transfer_lock:
+                transfer = pending_transfers.pop(transfer_id, None)
+            if not transfer or transfer.get("file_token") != file_token:
+                sock.sendall(b'{"status":"error","reason":"Invalid transfer"}\n')
+                return
+            recipient = transfer["to"]
+            with lock:
+                sock_to = clients.get(recipient)
+            if sock_to:
+                name_map = {item["filename"]: item["filename"] for item in transfer["files"]}
+                safe_files = [
+                    dict(item, filename=name_map.get(item["filename"], item["filename"]))
+                    for item in req.get("files", [])
+                    if "/" not in item["filename"] and "\\" not in item["filename"]
+                ]
+                try:
+                    sock_to.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": safe_files}) + "\n").encode())
+                except Exception:
+                    pass
+            sock.sendall(b'{"status":"ok"}\n')
+            return
 
         # --- Welcome Message (pre-login safe endpoint) ---
         if action == "get_welcome":
@@ -2810,6 +2839,13 @@ def handle_client(cs, addr):
                 signal_type = str(msg.get("signal_type", "")).strip()
                 signal_data = msg.get("data", {})
                 if not group or not target:
+                    sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Group and target are required."}) + "\n").encode())
+                    continue
+                if not signal_type or len(signal_type) > 64 or not isinstance(signal_data, dict):
+                    sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Invalid signaling payload."}) + "\n").encode())
+                    continue
+                if len(json.dumps(signal_data, ensure_ascii=False)) > 65536:
+                    sock.sendall((json.dumps({"action": "group_call_signal_result", "ok": False, "reason": "Signaling payload is too large."}) + "\n").encode())
                     continue
                 with group_call_lock:
                     data = group_call_sessions.get(group) or {}
@@ -2972,10 +3008,13 @@ def handle_client(cs, addr):
                 transfer_id = msg["transfer_id"]
                 with transfer_lock: transfer = pending_transfers.get(transfer_id)
                 if not transfer: continue
+                if transfer["to"] != user: continue
+                file_token = str(uuid.uuid4())
+                with transfer_lock: transfer["file_token"] = file_token
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
-                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"]}) + "\n").encode())
+                    try: sock_sender.sendall((json.dumps({"action": "file_accepted", "transfer_id": transfer_id, "client_transfer_id": transfer.get("client_transfer_id", ""), "to": transfer["to"], "files": transfer["files"], "file_token": file_token}) + "\n").encode())
                     except: pass
 
             elif action == "file_decline":
@@ -3166,18 +3205,38 @@ def handle_delete(user):
     print(f"User '{user}' and all associated contact data deleted.")
     kick_if_banned(user)
 
+ADMIN_CLI_HELP = """Available commands (with or without a leading slash):
+  help or ?
+  create <user> <pass> [email]
+  accountlimit show | accountlimit set <number>
+  gpolicy show [group] | gpolicy set <key> <value> [group] | gpolicy reset [group] | gpolicy keys
+  ban <user> <MM/DD/YYYY> <reason> | unban <user> | del <user>
+  admin <user> | unadmin <user>
+  alert <message>
+  banfile <user> <ext|all> [MM/DD/YYYY] <reason> | unbanfile <user> [ext]
+  restart | exit"""
+
+def parse_admin_command(command_text):
+    text = str(command_text or "").strip()
+    if text.startswith("/"):
+        text = text[1:].strip()
+    parts = text.split()
+    if parts and parts[0] == "?":
+        parts[0] = "help"
+    return parts
+
 def run_cli():
     print("Thrive Server Admin Console")
-    print("Available commands: help, create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
+    print(ADMIN_CLI_HELP)
     while True:
         try:
-            cmd_line = input("> ").strip()
-            parts = cmd_line.split()
+            cmd_line = input("> ")
+            parts = parse_admin_command(cmd_line)
             if not parts: continue
             command = parts[0].lower()
             if command == "help":
-                print("Available commands: help, create, ban, unban, del, admin, unadmin, alert, banfile, unbanfile, restart, exit")
-            if command == "exit":
+                print(ADMIN_CLI_HELP)
+            elif command == "exit":
                 broadcast_alert(f"The server is shutting down in {shutdown_timeout} seconds.")
                 print(f"Server shutting down in {shutdown_timeout} seconds...")
                 time.sleep(shutdown_timeout)
@@ -3187,7 +3246,32 @@ def run_cli():
                 print(f"Server restarting in {shutdown_timeout} seconds...")
                 time.sleep(shutdown_timeout)
                 os.execv(sys.executable, [sys.executable] + sys.argv)
-            elif command == "create" and len(parts)==3: handle_create(parts[1], parts[2])
+            elif command == "create" and len(parts) in (3, 4): handle_create(parts[1], parts[2], parts[3] if len(parts) == 4 else "")
+            elif command == "accountlimit" and len(parts) >= 2:
+                if parts[1].lower() == "show":
+                    print(f"Current max accounts per email: {_max_accounts_per_email()} (0 means unlimited).")
+                elif parts[1].lower() == "set" and len(parts) == 3:
+                    limit = max(0, int(parts[2]))
+                    _set_server_setting("max_accounts_per_email", str(limit))
+                    print(f"Updated max accounts per email to {limit}.")
+                else:
+                    print("Usage: accountlimit show OR accountlimit set <number>")
+            elif command == "gpolicy" and len(parts) >= 2:
+                sub = parts[1].lower()
+                target_group = parts[-1] if ((sub in ("show", "reset") and len(parts) >= 3) or (sub == "set" and len(parts) >= 5)) else "__global__"
+                scope = "group" if target_group != "__global__" else "global"
+                if sub == "show":
+                    print(json.dumps({"scope": scope, "group": target_group, "policy": _fetch_group_policy(scope, target_group)}, ensure_ascii=False, indent=2))
+                elif sub == "keys":
+                    print(json.dumps(_policy_schema_payload(), ensure_ascii=False, indent=2))
+                elif sub == "set" and len(parts) >= 4:
+                    merged = _upsert_group_policy(scope, target_group, {parts[2]: parts[3]}, "local-cli")
+                    print(f"Group policy updated for {scope}:{target_group}. {parts[2]}={merged.get(parts[2])}")
+                elif sub == "reset":
+                    _reset_group_policy(scope, target_group)
+                    print(f"Group policy reset for {scope}:{target_group}.")
+                else:
+                    print("Usage: gpolicy show [group] | set <key> <value> [group] | reset [group] | keys")
             elif command == "ban" and len(parts)>=4: handle_ban(parts[1], parts[2], " ".join(parts[3:]))
             elif command == "unban" and len(parts)==2: handle_unban(parts[1])
             elif command == "del" and len(parts)==2: handle_delete(parts[1])

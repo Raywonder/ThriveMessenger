@@ -7,7 +7,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 python versionfile.py
-pyinstaller --clean --noconfirm --windowed --version-file=vdata.txt --name "thrive_messenger" --distpath $OutputDir main.py
+python -m PyInstaller --clean --noconfirm --windowed --version-file=vdata.txt --name "thrive_messenger" --distpath $OutputDir main.py
 
 $AppDir = Join-Path $Root (Join-Path $OutputDir "thrive_messenger")
 if (!(Test-Path $AppDir)) {
