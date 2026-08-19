@@ -10,6 +10,7 @@ OUT_DIR="${ROOT_DIR}/dist-macos"
 ARCH_LABEL="${1:-$(uname -m)}"
 VENV_DIR="${ROOT_DIR}/.venv-build"
 PYTHON_BIN="${THRIVE_PYTHON_BIN:-python3}"
+APP_VERSION="${THRIVE_APP_VERSION:-15.10.0}"
 
 ${PYTHON_BIN} -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
@@ -45,6 +46,16 @@ if [[ ! -d "${APP_PATH}" ]]; then
   echo "Build failed: ${APP_PATH} was not created" >&2
   exit 1
 fi
+
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+
+if [[ -n "${THRIVE_CODESIGN_IDENTITY:-}" ]]; then
+  codesign --force --deep --options runtime --timestamp --sign "${THRIVE_CODESIGN_IDENTITY}" "${APP_PATH}"
+else
+  codesign --force --deep --sign - "${APP_PATH}"
+fi
+codesign --verify --deep --strict "${APP_PATH}"
 
 ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "${ZIP_PATH}"
 echo "Created ${ZIP_PATH}"
