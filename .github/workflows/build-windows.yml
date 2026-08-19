@@ -20,7 +20,6 @@ on:
       - "scripts/**"
       - ".github/workflows/build-windows.yml"
       - "pyproject.toml"
-      - "Thrive Messenger.spec"
       - "thrive_messenger_installer.iss"
       - "vdata.yml"
 

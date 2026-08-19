@@ -35,8 +35,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#SourcePath}\dist\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}\dist\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourcePath}\dist-windows\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\dist-windows\thrive_messenger\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
