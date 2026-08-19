@@ -7,7 +7,7 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     MARKETING_VERSION: 15.10.0
-    CURRENT_PROJECT_VERSION: 1
+    CURRENT_PROJECT_VERSION: 2
 targets:
   ThriveMessenger:
     type: application
