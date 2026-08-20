@@ -277,6 +277,17 @@ def _load_password_from_keyring(username, settings):
             return ''
     return ''
 
+def _delete_password_from_keyring(username, settings):
+    if not username:
+        return
+    account = _keyring_account_for(username, settings)
+    for service, key_account in ((KEYRING_SERVICE, account), (KEYRING_SERVICE, username)):
+        try:
+            if keyring.get_password(service, key_account):
+                keyring.delete_password(service, key_account)
+        except Exception:
+            pass
+
 def _encode_password_fallback(password):
     if not password:
         return ''
@@ -1748,6 +1759,10 @@ class SettingsDialog(wx.Dialog):
         self.btn_chpass = wx.Button(tab_general, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
         general_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.btn_delete_account = wx.Button(tab_general, label="&Delete Account from This Server...")
+        self.btn_delete_account.SetToolTip("Permanently delete this account and unlink its connected identities from the current Thrive server.")
+        self.btn_delete_account.Bind(wx.EVT_BUTTON, self.on_delete_account)
+        general_sizer.Add(self.btn_delete_account, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         tab_general.SetSizer(general_sizer)
 
         admin_box.Add(self.admin_hint, 0, wx.EXPAND | wx.ALL, 5)
@@ -1811,6 +1826,7 @@ class SettingsDialog(wx.Dialog):
             self.bot_agent_backend_choice.SetBackgroundColour(dark_color); self.bot_agent_backend_choice.SetForegroundColour(light_text_color)
             self.bot_agent_auth_choice.SetBackgroundColour(dark_color); self.bot_agent_auth_choice.SetForegroundColour(light_text_color)
             self.btn_chpass.SetBackgroundColour(dark_color); self.btn_chpass.SetForegroundColour(light_text_color)
+            self.btn_delete_account.SetBackgroundColour(dark_color); self.btn_delete_account.SetForegroundColour(light_text_color)
             self.btn_open_admin_console.SetBackgroundColour(dark_color); self.btn_open_admin_console.SetForegroundColour(light_text_color)
             self.btn_open_bot_rules.SetBackgroundColour(dark_color); self.btn_open_bot_rules.SetForegroundColour(light_text_color)
             self.btn_open_group_policy.SetBackgroundColour(dark_color); self.btn_open_group_policy.SetForegroundColour(light_text_color)
@@ -1836,6 +1852,36 @@ class SettingsDialog(wx.Dialog):
                 frame = self.GetParent()
                 try: frame.sock.sendall((json.dumps({"action": "change_password", "current_pass": cur, "new_pass": new}) + "\n").encode())
                 except Exception as e: wx.MessageBox(f"Failed to send request: {e}", "Error", wx.ICON_ERROR)
+    def on_delete_account(self, _):
+        frame = self.GetParent()
+        username = str(getattr(frame, "user", "") or "").strip()
+        server = normalize_server_entry(getattr(wx.GetApp(), "active_server_entry", SERVER_CONFIG))
+        host = server.get("host", "the current server")
+        warning = (
+            f"This permanently deletes the account '{username}' from {host}, revokes its signed-in devices, "
+            "and unlinks connected identities such as Mastodon or WordPress. It does not delete those external accounts.\n\n"
+            f"Type {username} to confirm."
+        )
+        with wx.TextEntryDialog(self, warning, "Permanently Delete Account") as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            confirmation = dlg.GetValue().strip()
+        if confirmation.casefold() != username.casefold():
+            wx.MessageBox("The username did not match. The account was not deleted.", "Deletion Cancelled", wx.OK | wx.ICON_INFORMATION, self)
+            return
+        final = wx.MessageBox(
+            f"Delete '{username}' permanently from {host}? This cannot be undone.",
+            "Final Account Deletion Confirmation",
+            wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING,
+            self,
+        )
+        if final != wx.YES:
+            return
+        try:
+            frame.sock.sendall((json.dumps({"action": "delete_account", "confirm_username": confirmation}) + "\n").encode())
+            self.EndModal(wx.ID_CANCEL)
+        except Exception as e:
+            wx.MessageBox(f"Could not request account deletion: {e}", "Account Deletion Failed", wx.OK | wx.ICON_ERROR, self)
     def on_open_admin_console(self, _):
         frame = self.GetParent()
         if frame and hasattr(frame, "on_admin"):
@@ -2684,6 +2730,7 @@ class ClientApp(wx.App):
                     elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
                     elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                     elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
+                    elif act == "delete_account_result": wx.CallAfter(self.frame.on_delete_account_result, msg)
                     elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
                     elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
                     elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
@@ -4787,6 +4834,21 @@ class MainFrame(wx.Frame):
         else:
             reason = msg.get("reason", "Unknown error.")
             wx.MessageBox(f"Could not change password: {reason}", "Error", wx.ICON_ERROR)
+    def on_delete_account_result(self, msg):
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Account deletion failed."), "Account Deletion Failed", wx.OK | wx.ICON_ERROR, self)
+            return
+        app = wx.GetApp()
+        username = self.user
+        _delete_password_from_keyring(username, app.user_config)
+        _delete_passkey_from_keyring(username, settings=app.user_config, server_entry=app.active_server_entry)
+        app.user_config["username"] = ""
+        app.user_config["password"] = ""
+        app.user_config["password_fallback"] = ""
+        app.user_config["remember"] = False
+        save_user_config(app.user_config)
+        wx.MessageBox("Your account and its linked identities were deleted from this Thrive server.", "Account Deleted", wx.OK | wx.ICON_INFORMATION, self)
+        self.on_logout(None)
     def on_user_directory(self, _):
         if self._directory_dlg:
             self._directory_dlg.Raise(); self._directory_dlg.SetFocus(); return

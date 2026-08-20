@@ -21,6 +21,7 @@ final class ThriveSession {
     var directMessages: [String: [ChatMessage]] = [:]
     var incomingCall: IncomingCall?
     var activeCall: ActiveCall?
+    var accountDeletionCompleted = false
     private var connection: NWConnection?
     private var buffer = Data()
     private let audio = VoiceAudioService()
@@ -57,6 +58,7 @@ final class ThriveSession {
     func declineCall() async { guard let call = incomingCall else { return }; incomingCall = nil; SoundPlayer.stop(); await safeSend(["action": "voice_call_decline", "call_id": call.id]) }
     func joinGroupCall() async { guard let room = openRoom else { return }; await safeSend(["action": "group_call_join", "group": room.name, "mode": "voice"]) }
     func endCall() async { guard let call = activeCall else { return }; await safeSend(call.isGroup ? ["action": "group_call_leave", "group": call.group] : ["action": "voice_call_end", "call_id": call.id]); finishCall("call_ended") }
+    func deleteAccount(confirming username: String) async { accountDeletionCompleted = false; await safeSend(["action": "delete_account", "confirm_username": username]) }
     func disconnect() { audio.stop(); SoundPlayer.stop(); connection?.cancel(); connection = nil; isSignedIn = false; contacts = []; rooms = []; openRoom = nil; activeCall = nil; incomingCall = nil }
 
     private func safeSend(_ object: [String: Any]) async { do { try await send(object) } catch { errorMessage = error.localizedDescription } }
@@ -86,6 +88,9 @@ final class ThriveSession {
         case "voice_call_event": directCallEvent(json)
         case "group_call_result": groupCallEvent(json)
         case "group_call_audio": if let encoded = json["data"] as? String, let data = Data(base64Encoded: encoded) { audio.play(data, deafened: isDeafened) }
+        case "delete_account_result":
+            if json["ok"] as? Bool == true { accountDeletionCompleted = true; disconnect() }
+            else { errorMessage = json["reason"] as? String ?? "Account deletion failed." }
         default: break
         }
     }
