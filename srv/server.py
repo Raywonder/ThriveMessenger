@@ -15,6 +15,7 @@ except ImportError:
 DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
 clients = {}
+user_sessions = {}
 client_statuses = {}
 session_preferences = {}
 lock = threading.Lock()
@@ -2831,6 +2832,7 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS linked_identities (username TEXT, provider TEXT, external_id TEXT, credential_ref TEXT, created_at TEXT, PRIMARY KEY(username, provider, external_id))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS wordpress_account_links (
         thrive_username TEXT PRIMARY KEY,
         wp_user_id TEXT,
@@ -3258,6 +3260,22 @@ def kick_if_banned(user):
             client_statuses.pop(user, None)
         broadcast_contact_status(user, False)
 
+def close_user_sessions(user, exclude=None):
+    """Close every active connection for a user except an optional response socket."""
+    with lock:
+        sessions = list(user_sessions.get(user, set()))
+    for session_sock in sessions:
+        if session_sock is exclude:
+            continue
+        try:
+            session_sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            session_sock.close()
+        except Exception:
+            pass
+
 def handle_client(cs, addr):
     sock = cs
     f = sock.makefile("r")
@@ -3651,6 +3669,7 @@ def handle_client(cs, addr):
         with lock:
             prior_sock = clients.get(user)
             clients[user] = sock
+            user_sessions.setdefault(user, set()).add(sock)
             client_statuses[user] = "online"
             session_preferences[sock] = {}
 
@@ -5312,6 +5331,16 @@ def handle_client(cs, addr):
                         con.close()
                         sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Current password is incorrect."}) + "\n").encode())
 
+            elif action == "delete_account":
+                if str(msg.get("confirm_username", "")).strip().casefold() != str(user).casefold():
+                    sock.sendall((json.dumps({"action": "delete_account_result", "ok": False, "reason": "Enter your username exactly to confirm account deletion."}) + "\n").encode())
+                else:
+                    deleted = delete_user_account(user)
+                    sock.sendall((json.dumps({"action": "delete_account_result", "ok": deleted, "reason": "" if deleted else "Account not found."}) + "\n").encode())
+                    if deleted:
+                        close_user_sessions(user, exclude=sock)
+                        break
+
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         pass
@@ -5323,7 +5352,13 @@ def handle_client(cs, addr):
         with lock:
             if user and clients.get(user) is sock:
                 del clients[user]
-            if not bot_session_still_alive:
+            if user:
+                sessions = user_sessions.get(user)
+                if sessions is not None:
+                    sessions.discard(sock)
+                    if not sessions:
+                        user_sessions.pop(user, None)
+            if not bot_session_still_alive and not user_sessions.get(user):
                 client_statuses.pop(user, None)
             session_preferences.pop(sock, None)
         if not bot_session_still_alive:
@@ -5450,13 +5485,55 @@ def handle_unban(user):
     print(f"User '{user}' unbanned.")
 
 def handle_delete(user):
-    con = sqlite3.connect(DB)
-    con.execute("DELETE FROM users WHERE username=?", (user,))
-    con.execute("DELETE FROM contacts WHERE owner=? OR contact=?", (user, user))
-    con.commit()
-    con.close()
-    print(f"User '{user}' and all associated contact data deleted.")
+    deleted = delete_user_account(user)
+    print(f"User '{user}' and associated Thrive account data deleted." if deleted else f"User '{user}' was not found.")
     kick_if_banned(user)
+
+def delete_user_account(user):
+    """Delete a Thrive account and unlink identities owned by that account."""
+    username = str(user or "").strip()
+    if not username:
+        return False
+    con = sqlite3.connect(DB)
+    con.execute("PRAGMA foreign_keys=ON")
+    try:
+        row = con.execute("SELECT username FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone()
+        if not row:
+            return False
+        username = row[0]
+        tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        statements = (
+            ("group_room_messages", "DELETE FROM group_room_messages WHERE sender=?", (username,)),
+            ("group_room_members", "DELETE FROM group_room_members WHERE username=?", (username,)),
+            ("linked_identities", "DELETE FROM linked_identities WHERE username=?", (username,)),
+            ("wordpress_account_links", "DELETE FROM wordpress_account_links WHERE thrive_username=?", (username,)),
+            ("mastodon_account_links", "DELETE FROM mastodon_account_links WHERE thrive_username=?", (username,)),
+            ("user_passkeys", "DELETE FROM user_passkeys WHERE username=?", (username,)),
+            ("bot_tokens", "DELETE FROM bot_tokens WHERE owner=? OR bot=?", (username, username)),
+            ("bot_rule_overrides", "DELETE FROM bot_rule_overrides WHERE owner=? OR bot=?", (username, username)),
+            ("invite_tokens", "DELETE FROM invite_tokens WHERE invited_user=? OR invited_by=?", (username, username)),
+            ("feature_allow_users", "DELETE FROM feature_allow_users WHERE username=?", (username,)),
+            ("user_access_groups", "DELETE FROM user_access_groups WHERE username=?", (username,)),
+            ("file_bans", "DELETE FROM file_bans WHERE username=?", (username,)),
+            ("contacts", "DELETE FROM contacts WHERE owner=? OR contact=?", (username, username)),
+        )
+        if "group_rooms" in tables:
+            owned_rooms = [r[0] for r in con.execute("SELECT room_id FROM group_rooms WHERE owner=?", (username,)).fetchall()]
+            if owned_rooms:
+                con.executemany("DELETE FROM group_rooms WHERE room_id=?", [(room_id,) for room_id in owned_rooms])
+        for table, sql, params in statements:
+            if table in tables:
+                con.execute(sql, params)
+        con.execute("DELETE FROM users WHERE username=?", (username,))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    if _is_admin(username):
+        remove_admin(username)
+    return True
 
 def run_cli():
     print("Thrive Server Admin Console")
