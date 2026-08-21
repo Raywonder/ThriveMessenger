@@ -13,7 +13,40 @@ struct LoginView: View {
 
 struct ContactsView: View {
     @Bindable var session: ThriveSession
-    var body: some View { List(session.contacts) { contact in NavigationLink { DirectChatView(session: session, contact: contact.name) } label: { Label(contact.name, systemImage: contact.online ? "circle.fill" : "circle").accessibilityLabel("\(contact.name), \(contact.online ? "online" : "offline")") } }.navigationTitle("Contacts").overlay { if session.contacts.isEmpty { ContentUnavailableView("No Contacts", systemImage: "person.2") } } }
+    private var contactsByLetter: [(letter: String, contacts: [Contact])] {
+        Dictionary(grouping: session.contacts) { contact in
+            guard let first = contact.name.trimmingCharacters(in: .whitespacesAndNewlines).first else { return "#" }
+            let letter = String(first).uppercased()
+            return letter.rangeOfCharacter(from: .letters) == nil ? "#" : letter
+        }
+        .map { (letter: $0.key, contacts: $0.value.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }) }
+        .sorted { lhs, rhs in
+            if lhs.letter == "#" { return false }
+            if rhs.letter == "#" { return true }
+            return lhs.letter.localizedCaseInsensitiveCompare(rhs.letter) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        List {
+            ForEach(contactsByLetter, id: \.letter) { section in
+                Section {
+                    ForEach(section.contacts) { contact in
+                        NavigationLink { DirectChatView(session: session, contact: contact.name) } label: {
+                            Label(contact.name, systemImage: contact.online ? "circle.fill" : "circle")
+                                .accessibilityLabel("\(contact.name), \(contact.online ? "online" : "offline")")
+                        }
+                    }
+                } header: {
+                    Text(section.letter)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityLabel("Contacts beginning with \(section.letter)")
+                }
+            }
+        }
+        .navigationTitle("Contacts")
+        .overlay { if session.contacts.isEmpty { ContentUnavailableView("No Contacts", systemImage: "person.2") } }
+    }
 }
 
 struct DirectChatView: View {
