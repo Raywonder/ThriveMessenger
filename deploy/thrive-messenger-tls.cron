@@ -1,0 +1,1 @@
+17 4 * * * root /home/tappedin/apps/ThriveMessenger/srv/scripts/sync-cpanel-tls.sh >>/var/log/thrive-messenger-tls-sync.log 2>&1
