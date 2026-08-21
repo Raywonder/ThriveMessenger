@@ -16,6 +16,7 @@ DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
 clients = {}
 user_sessions = {}
+socket_session_ids = {}
 client_statuses = {}
 session_preferences = {}
 lock = threading.Lock()
@@ -2833,6 +2834,13 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS linked_identities (username TEXT, provider TEXT, external_id TEXT, credential_ref TEXT, created_at TEXT, PRIMARY KEY(username, provider, external_id))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS authenticated_devices (
+        session_id TEXT PRIMARY KEY, username TEXT NOT NULL, device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL, platform TEXT, client_version TEXT,
+        authenticated_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+        expires_at TEXT, revoked_at TEXT, UNIQUE(username, device_id)
+    )''')
+    cur.execute('''CREATE INDEX IF NOT EXISTS idx_authenticated_devices_user ON authenticated_devices(username)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS wordpress_account_links (
         thrive_username TEXT PRIMARY KEY,
         wp_user_id TEXT,
@@ -3276,6 +3284,49 @@ def close_user_sessions(user, exclude=None):
         except Exception:
             pass
 
+SESSION_DURATION_SECONDS = {"hour": 3600, "day": 86400, "week": 604800, "month": 2592000, "year": 31536000}
+
+def _session_expiry(duration, now):
+    duration = str(duration or "month").strip().lower()
+    if duration == "forever": return None
+    if duration not in SESSION_DURATION_SECONDS: duration = "month"
+    return (now + datetime.timedelta(seconds=SESSION_DURATION_SECONDS[duration])).isoformat() + "Z"
+
+def register_authenticated_device(db, username, req):
+    now = datetime.datetime.utcnow(); session_id = str(uuid.uuid4())
+    device_id = str(req.get("device_id") or uuid.uuid4()).strip()[:200]
+    device_name = str(req.get("device_name") or "Unknown device").strip()[:200] or "Unknown device"
+    db.execute("DELETE FROM authenticated_devices WHERE username=? AND device_id=?", (username, device_id))
+    db.execute("""INSERT INTO authenticated_devices
+        (session_id,username,device_id,device_name,platform,client_version,authenticated_at,last_seen_at,expires_at,revoked_at)
+        VALUES(?,?,?,?,?,?,?,?,?,NULL)""", (
+        session_id, username, device_id, device_name, str(req.get("platform") or "unknown")[:80],
+        str(req.get("client_version") or "")[:80], now.isoformat()+"Z", now.isoformat()+"Z",
+        _session_expiry(req.get("session_duration"), now)))
+    db.commit(); return session_id
+
+def list_authenticated_devices(username, current_session_id=None):
+    now = datetime.datetime.utcnow().isoformat()+"Z"; con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    rows = con.execute("""SELECT session_id,device_id,device_name,platform,client_version,authenticated_at,last_seen_at,expires_at
+        FROM authenticated_devices WHERE username=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?)
+        ORDER BY last_seen_at DESC""", (username, now)).fetchall(); con.close()
+    result=[]
+    for row in rows:
+        item=dict(row); item["current"] = item["session_id"] == current_session_id
+        item["duration"] = "forever" if not item.get("expires_at") else "expires"; result.append(item)
+    return result
+
+def revoke_authenticated_device(username, session_id):
+    con=sqlite3.connect(DB); cur=con.execute("UPDATE authenticated_devices SET revoked_at=? WHERE username=? AND session_id=? AND revoked_at IS NULL", (datetime.datetime.utcnow().isoformat()+"Z", username, session_id)); con.commit(); changed=cur.rowcount>0; con.close()
+    if changed:
+        with lock: targets=[s for s,sid in socket_session_ids.items() if sid==session_id]
+        for target in targets:
+            try: target.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: target.close()
+            except Exception: pass
+    return changed
+
 def handle_client(cs, addr):
     sock = cs
     f = sock.makefile("r")
@@ -3664,12 +3715,14 @@ def handle_client(cs, addr):
                 db.close()
                 return
 
-        sock.sendall(b'{"status":"ok"}\n')
+        session_id = register_authenticated_device(db, user, req)
+        sock.sendall((json.dumps({"status":"ok", "session_id":session_id})+"\n").encode())
         prior_sock = None
         with lock:
             prior_sock = clients.get(user)
             clients[user] = sock
             user_sessions.setdefault(user, set()).add(sock)
+            socket_session_ids[sock] = session_id
             client_statuses[user] = "online"
             session_preferences[sock] = {}
 
@@ -5341,6 +5394,17 @@ def handle_client(cs, addr):
                         close_user_sessions(user, exclude=sock)
                         break
 
+            elif action == "list_authenticated_devices":
+                devices=list_authenticated_devices(user, socket_session_ids.get(sock))
+                sock.sendall((json.dumps({"action":"authenticated_devices","count":len(devices),"devices":devices})+"\n").encode())
+
+            elif action == "deauthenticate_device":
+                target=str(msg.get("session_id","")).strip(); current=socket_session_ids.get(sock)
+                ok=bool(target) and revoke_authenticated_device(user,target)
+                try: sock.sendall((json.dumps({"action":"deauthenticate_device_result","ok":ok,"reason":"" if ok else "Device session was not found or is already signed out.","session_id":target})+"\n").encode())
+                except OSError: pass
+                if ok and target==current: break
+
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
         pass
@@ -5361,6 +5425,7 @@ def handle_client(cs, addr):
             if not bot_session_still_alive and not user_sessions.get(user):
                 client_statuses.pop(user, None)
             session_preferences.pop(sock, None)
+            socket_session_ids.pop(sock, None)
         if not bot_session_still_alive:
             _cleanup_bot_session(user)
         if user:
@@ -5506,6 +5571,7 @@ def delete_user_account(user):
             ("group_room_messages", "DELETE FROM group_room_messages WHERE sender=?", (username,)),
             ("group_room_members", "DELETE FROM group_room_members WHERE username=?", (username,)),
             ("linked_identities", "DELETE FROM linked_identities WHERE username=?", (username,)),
+            ("authenticated_devices", "DELETE FROM authenticated_devices WHERE username=?", (username,)),
             ("wordpress_account_links", "DELETE FROM wordpress_account_links WHERE thrive_username=?", (username,)),
             ("mastodon_account_links", "DELETE FROM mastodon_account_links WHERE thrive_username=?", (username,)),
             ("user_passkeys", "DELETE FROM user_passkeys WHERE username=?", (username,)),
