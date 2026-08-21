@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import Observation
+import UIKit
 
 @MainActor @Observable
 final class ThriveSession {
@@ -22,6 +23,8 @@ final class ThriveSession {
     var incomingCall: IncomingCall?
     var activeCall: ActiveCall?
     var accountDeletionCompleted = false
+    var authenticatedDevices: [AuthenticatedDevice] = []
+    var sessionDuration = "month"
     private var connection: NWConnection?
     private var buffer = Data()
     private let audio = VoiceAudioService()
@@ -41,7 +44,8 @@ final class ThriveSession {
                 }
                 value.start(queue: .global(qos: .userInitiated))
             }
-            receiveNext(); try await send(["action": "login", "user": username, "pass": password])
+            let deviceID = UIDevice.current.identifierForVendor?.uuidString ?? UUID().uuidString
+            receiveNext(); try await send(["action": "login", "user": username, "pass": password, "device_id": deviceID, "device_name": UIDevice.current.name, "platform": "iOS", "client_version": "15.10.0", "session_duration": sessionDuration])
         } catch { errorMessage = error.localizedDescription; disconnect() }
         isBusy = false
     }
@@ -59,6 +63,8 @@ final class ThriveSession {
     func joinGroupCall() async { guard let room = openRoom else { return }; await safeSend(["action": "group_call_join", "group": room.name, "mode": "voice"]) }
     func endCall() async { guard let call = activeCall else { return }; await safeSend(call.isGroup ? ["action": "group_call_leave", "group": call.group] : ["action": "voice_call_end", "call_id": call.id]); finishCall("call_ended") }
     func deleteAccount(confirming username: String) async { accountDeletionCompleted = false; await safeSend(["action": "delete_account", "confirm_username": username]) }
+    func refreshAuthenticatedDevices() async { await safeSend(["action": "list_authenticated_devices"]) }
+    func deauthenticate(_ device: AuthenticatedDevice) async { await safeSend(["action": "deauthenticate_device", "session_id": device.id]) }
     func disconnect() { audio.stop(); SoundPlayer.stop(); connection?.cancel(); connection = nil; isSignedIn = false; contacts = []; rooms = []; openRoom = nil; activeCall = nil; incomingCall = nil }
 
     private func safeSend(_ object: [String: Any]) async { do { try await send(object) } catch { errorMessage = error.localizedDescription } }
@@ -91,6 +97,10 @@ final class ThriveSession {
         case "delete_account_result":
             if json["ok"] as? Bool == true { accountDeletionCompleted = true; disconnect() }
             else { errorMessage = json["reason"] as? String ?? "Account deletion failed." }
+        case "authenticated_devices": authenticatedDevices = (json["devices"] as? [[String: Any]] ?? []).compactMap(AuthenticatedDevice.init)
+        case "deauthenticate_device_result":
+            if json["ok"] as? Bool == true { Task { await refreshAuthenticatedDevices() } }
+            else { errorMessage = json["reason"] as? String ?? "Device sign out failed." }
         default: break
         }
     }
@@ -106,3 +116,15 @@ struct RoomMember: Identifiable, Hashable { let name, role: String; var id: Stri
 struct ChatMessage: Identifiable, Hashable { let id, sender, body, kind, filename: String; let sentAt: Date; init(sender: String, body: String) { id = UUID().uuidString; self.sender = sender; self.body = body; kind = "text"; filename = ""; sentAt = Date() }; init?(_ value: [String: Any]) { id = value["message_id"] as? String ?? UUID().uuidString; sender = value["sender"] as? String ?? "Unknown"; body = value["body"] as? String ?? ""; kind = value["kind"] as? String ?? "text"; filename = value["filename"] as? String ?? ""; sentAt = Date(timeIntervalSince1970: value["sent_at"] as? Double ?? Date().timeIntervalSince1970) } }
 struct IncomingCall: Identifiable { let id, caller: String }
 struct ActiveCall: Identifiable { let id, group, title: String; let isGroup: Bool }
+struct AuthenticatedDevice: Identifiable, Hashable {
+    let id, name, platform, authenticatedAt: String
+    let expiresAt: String?
+    let current: Bool
+    init?(_ value: [String: Any]) {
+        guard let id = value["session_id"] as? String else { return nil }
+        self.id = id; name = value["device_name"] as? String ?? "Unknown device"
+        platform = value["platform"] as? String ?? "Unknown platform"
+        authenticatedAt = value["authenticated_at"] as? String ?? "Unknown"
+        expiresAt = value["expires_at"] as? String; current = value["current"] as? Bool ?? false
+    }
+}

@@ -440,6 +440,9 @@ def load_user_config():
         'bot_mesh_agent_host_label': platform.node() or 'local',
         'passkey_ids': {},
         'passkey_tokens': {},
+        'device_id': str(uuid.uuid4()),
+        'device_name': platform.node() or 'This device',
+        'session_duration': 'month',
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -521,6 +524,10 @@ def load_user_config():
         settings['passkey_ids'] = {}
     if not isinstance(settings.get('passkey_tokens', {}), dict):
         settings['passkey_tokens'] = {}
+    settings['device_id'] = str(settings.get('device_id') or uuid.uuid4())
+    settings['device_name'] = str(settings.get('device_name') or platform.node() or 'This device')[:200]
+    if settings.get('session_duration') not in ('hour', 'day', 'week', 'month', 'year', 'forever'):
+        settings['session_duration'] = 'month'
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
@@ -557,6 +564,15 @@ def save_user_config(settings):
             json.dump(data_to_save, f, indent=4)
     except Exception as e:
         print(f"Error saving settings file: {e}")
+
+def _device_login_fields(settings):
+    return {
+        "device_id": str(settings.get("device_id") or uuid.uuid4()),
+        "device_name": str(settings.get("device_name") or platform.node() or "This device")[:200],
+        "platform": platform.system() or sys.platform,
+        "client_version": VERSION_TAG,
+        "session_duration": str(settings.get("session_duration") or "month"),
+    }
 
     # 2. Manage Keyring
     if username:
@@ -1467,6 +1483,52 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def on_restore(self, event): self.frame.restore_from_tray()
     def on_exit(self, event): self.frame.on_exit(None)
 
+class AuthenticatedDevicesDialog(wx.Dialog):
+    """Server-backed inventory of authenticated devices and locations."""
+    def __init__(self, parent):
+        super().__init__(parent, title="Authenticated Devices", size=(700, 460))
+        self.devices = []
+        panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
+        self.summary = wx.StaticText(panel, label="Loading authenticated devices…")
+        self.device_list = wx.ListBox(panel, name="Authenticated device list")
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        refresh_btn = wx.Button(panel, label="&Refresh")
+        self.revoke_btn = wx.Button(panel, label="&Sign Out Selected Device")
+        close_btn = wx.Button(panel, wx.ID_CLOSE, "&Close")
+        row.Add(refresh_btn, 0, wx.RIGHT, 8); row.Add(self.revoke_btn, 0, wx.RIGHT, 8); row.Add(close_btn)
+        sizer.Add(self.summary, 0, wx.EXPAND | wx.ALL, 10)
+        sizer.Add(self.device_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        sizer.Add(row, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        panel.SetSizer(sizer)
+        refresh_btn.Bind(wx.EVT_BUTTON, self.refresh)
+        self.revoke_btn.Bind(wx.EVT_BUTTON, self.revoke_selected)
+        close_btn.Bind(wx.EVT_BUTTON, lambda _: self.EndModal(wx.ID_CLOSE))
+        self.device_list.Bind(wx.EVT_LISTBOX, lambda _: self.revoke_btn.Enable(self.device_list.GetSelection() != wx.NOT_FOUND))
+        self.revoke_btn.Disable(); wx.CallAfter(self.refresh, None)
+
+    @property
+    def frame(self): return self.GetParent()
+
+    def refresh(self, _):
+        self.frame.sock.sendall((json.dumps({"action": "list_authenticated_devices"}) + "\n").encode())
+
+    def update_devices(self, message):
+        self.devices = list(message.get("devices", []))
+        self.summary.SetLabel(f"You are currently authenticated on {len(self.devices)} device(s) or locations.")
+        labels = []
+        for item in self.devices:
+            current = " — current device" if item.get("current") else ""
+            expiry = item.get("expires_at") or "never"
+            labels.append(f"{item.get('device_name', 'Unknown device')} | {item.get('platform', 'unknown')} | authenticated {item.get('authenticated_at', '')} | expires {expiry}{current}")
+        self.device_list.Set(labels); self.revoke_btn.Disable()
+
+    def revoke_selected(self, _):
+        index = self.device_list.GetSelection()
+        if index == wx.NOT_FOUND or index >= len(self.devices): return
+        item = self.devices[index]; label = item.get('device_name', 'selected device')
+        if wx.MessageBox(f"Sign out {label}?", "Confirm Device Sign Out", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES: return
+        self.frame.sock.sendall((json.dumps({"action": "deauthenticate_device", "session_id": item.get("session_id", "")}) + "\n").encode())
+
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config, can_admin=False):
         super().__init__(parent, title="Settings", size=(560, 650)); self.config = current_config
@@ -1559,6 +1621,12 @@ class SettingsDialog(wx.Dialog):
             label="Notify me when this account signs in from another device",
         )
         self.notify_other_device_login_cb.SetValue(bool(self.config.get('notify_on_other_device_login', False)))
+        session_row = wx.BoxSizer(wx.HORIZONTAL)
+        session_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Keep this device authenticated for:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.session_duration_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=["One hour", "One day", "One week", "One month", "One year", "Forever"])
+        duration_values = ['hour', 'day', 'week', 'month', 'year', 'forever']
+        self.session_duration_choice.SetSelection(duration_values.index(self.config.get('session_duration', 'month')) if self.config.get('session_duration', 'month') in duration_values else 3)
+        session_row.Add(self.session_duration_choice, 1, wx.EXPAND)
         incoming_row = wx.BoxSizer(wx.HORIZONTAL)
         incoming_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Incoming message behavior:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.incoming_behavior_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
@@ -1743,6 +1811,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.prefer_display_names_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.notify_other_device_login_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(session_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(incoming_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(timestamp_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(date_group_row, 0, wx.EXPAND | wx.ALL, 5)
@@ -1759,6 +1828,10 @@ class SettingsDialog(wx.Dialog):
         self.btn_chpass = wx.Button(tab_general, label="C&hange Password...")
         self.btn_chpass.Bind(wx.EVT_BUTTON, self.on_change_password)
         general_sizer.Add(self.btn_chpass, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        self.btn_authenticated_devices = wx.Button(tab_general, label="Manage &Authenticated Devices...")
+        self.btn_authenticated_devices.SetToolTip("View all authenticated locations and devices and sign out individual devices.")
+        self.btn_authenticated_devices.Bind(wx.EVT_BUTTON, lambda _: self.GetParent().show_authenticated_devices())
+        general_sizer.Add(self.btn_authenticated_devices, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         self.btn_delete_account = wx.Button(tab_general, label="&Delete Account from This Server...")
         self.btn_delete_account.SetToolTip("Permanently delete this account and unlink its connected identities from the current Thrive server.")
         self.btn_delete_account.Bind(wx.EVT_BUTTON, self.on_delete_account)
@@ -2333,7 +2406,8 @@ class ClientApp(wx.App):
             if server_entry:
                 set_active_server_config(server_entry)
             ssock = create_secure_socket(server_entry)
-            ssock.sendall(json.dumps({"action":"login","user":username,"pass":password}).encode()+b"\n")
+            login_request = {"action":"login","user":username,"pass":password, **_device_login_fields(self.user_config)}
+            ssock.sendall(json.dumps(login_request).encode()+b"\n")
             sf = ssock.makefile()
             resp = json.loads(sf.readline() or "{}")
             if resp.get("status") == "ok":
@@ -2372,7 +2446,8 @@ class ClientApp(wx.App):
                     wx.MessageBox(reason, "Passkey Login Failed", wx.ICON_ERROR)
                 return False, None, None, reason
             ssock = create_secure_socket(server_entry)
-            ssock.sendall(json.dumps({"action": "login_passkey", "user": username, "passkey_token": token}).encode() + b"\n")
+            login_request = {"action": "login_passkey", "user": username, "passkey_token": token, **_device_login_fields(self.user_config)}
+            ssock.sendall(json.dumps(login_request).encode() + b"\n")
             sf = ssock.makefile()
             resp = json.loads(sf.readline() or "{}")
             if resp.get("status") == "ok":
@@ -2731,6 +2806,8 @@ class ClientApp(wx.App):
                     elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                     elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
                     elif act == "delete_account_result": wx.CallAfter(self.frame.on_delete_account_result, msg)
+                    elif act == "authenticated_devices": wx.CallAfter(self.frame.on_authenticated_devices, msg)
+                    elif act == "deauthenticate_device_result": wx.CallAfter(self.frame.on_deauthenticate_device_result, msg)
                     elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
                     elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
                     elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
@@ -4785,6 +4862,7 @@ class MainFrame(wx.Frame):
                 app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
                 app.user_config['prefer_contact_display_names'] = dlg.prefer_display_names_cb.IsChecked()
                 app.user_config['notify_on_other_device_login'] = dlg.notify_other_device_login_cb.IsChecked()
+                app.user_config['session_duration'] = ['hour', 'day', 'week', 'month', 'year', 'forever'][dlg.session_duration_choice.GetSelection()]
                 incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
                 incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
                 app.user_config['incoming_message_behavior'] = incoming_behavior
@@ -4827,6 +4905,30 @@ class MainFrame(wx.Frame):
                     wx.MessageBox(f"Settings saved, but advanced client config could not be written:\n{admin_err}", "Settings Saved With Warning", wx.OK | wx.ICON_WARNING)
                 else:
                     wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+
+    def show_authenticated_devices(self):
+        dialog = getattr(self, "_authenticated_devices_dialog", None)
+        if dialog and dialog.IsShown():
+            dialog.Raise(); dialog.SetFocus(); dialog.refresh(None); return
+        dialog = AuthenticatedDevicesDialog(self)
+        self._authenticated_devices_dialog = dialog
+        try: dialog.ShowModal()
+        finally:
+            self._authenticated_devices_dialog = None
+            dialog.Destroy()
+
+    def on_authenticated_devices(self, msg):
+        dialog = getattr(self, "_authenticated_devices_dialog", None)
+        if dialog:
+            dialog.update_devices(msg)
+
+    def on_deauthenticate_device_result(self, msg):
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not sign out that device."), "Device Sign Out Failed", wx.OK | wx.ICON_ERROR, self)
+            return
+        dialog = getattr(self, "_authenticated_devices_dialog", None)
+        if dialog:
+            dialog.refresh(None)
 
     def on_change_password_result(self, msg):
         if msg.get("ok"):

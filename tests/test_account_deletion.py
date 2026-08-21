@@ -26,6 +26,7 @@ class AccountDeletionTests(unittest.TestCase):
         con.execute("INSERT INTO contacts(owner,contact) VALUES('bob','alice')")
         con.execute("INSERT INTO user_passkeys(id,username,label,token_hash,created_at,revoked) VALUES('p1','alice','Phone','hash','now',0)")
         con.execute("INSERT INTO linked_identities(username,provider,external_id,credential_ref,created_at) VALUES('alice','mastodon','@alice','vault:mastodon/alice','now')")
+        con.execute("INSERT INTO authenticated_devices(session_id,username,device_id,device_name,authenticated_at,last_seen_at) VALUES('s1','alice','d1','Phone','now','now')")
         con.execute("INSERT INTO feature_allow_users(feature_key,username) VALUES('voice','alice')")
         con.commit()
         con.close()
@@ -41,6 +42,7 @@ class AccountDeletionTests(unittest.TestCase):
             ("users", "username"),
             ("user_passkeys", "username"),
             ("linked_identities", "username"),
+            ("authenticated_devices", "username"),
             ("feature_allow_users", "username"),
             ("group_room_members", "username"),
             ("group_room_messages", "sender"),

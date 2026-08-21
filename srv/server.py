@@ -11,6 +11,7 @@ DB = 'thrive.db'
 ADMIN_FILE = 'admins.txt'
 clients = {}
 user_sessions = {}
+socket_session_ids = {}
 client_statuses = {}
 session_preferences = {}
 lock = threading.Lock()
@@ -1356,6 +1357,20 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS invite_tokens (token TEXT PRIMARY KEY, invited_user TEXT, invited_email TEXT, invited_by TEXT, created_at TEXT, expires_at TEXT, used INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS user_passkeys (id TEXT PRIMARY KEY, username TEXT, label TEXT, token_hash TEXT, created_at TEXT, last_used_at TEXT, revoked INTEGER DEFAULT 0)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS linked_identities (username TEXT, provider TEXT, external_id TEXT, credential_ref TEXT, created_at TEXT, PRIMARY KEY(username, provider, external_id))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS authenticated_devices (
+        session_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        platform TEXT,
+        client_version TEXT,
+        authenticated_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        UNIQUE(username, device_id)
+    )''')
+    cur.execute('''CREATE INDEX IF NOT EXISTS idx_authenticated_devices_user ON authenticated_devices(username)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
@@ -1415,6 +1430,82 @@ def close_user_sessions(user, exclude=None):
             session_sock.close()
         except Exception:
             pass
+
+SESSION_DURATION_SECONDS = {
+    "hour": 60 * 60,
+    "day": 24 * 60 * 60,
+    "week": 7 * 24 * 60 * 60,
+    "month": 30 * 24 * 60 * 60,
+    "year": 365 * 24 * 60 * 60,
+}
+
+def _session_expiry(duration, now):
+    duration = str(duration or "month").strip().lower()
+    if duration == "forever":
+        return None, duration
+    if duration not in SESSION_DURATION_SECONDS:
+        duration = "month"
+    return (now + datetime.timedelta(seconds=SESSION_DURATION_SECONDS[duration])).isoformat() + "Z", duration
+
+def register_authenticated_device(db, username, req):
+    """Create or renew one persistent authentication record per user/device."""
+    now = datetime.datetime.utcnow()
+    session_id = str(uuid.uuid4())
+    device_id = str(req.get("device_id") or uuid.uuid4()).strip()[:200]
+    device_name = str(req.get("device_name") or "Unknown device").strip()[:200] or "Unknown device"
+    platform_name = str(req.get("platform") or "unknown").strip()[:80]
+    client_version = str(req.get("client_version") or "").strip()[:80]
+    expires_at, _ = _session_expiry(req.get("session_duration"), now)
+    db.execute("DELETE FROM authenticated_devices WHERE username=? AND device_id=?", (username, device_id))
+    db.execute(
+        """INSERT INTO authenticated_devices
+           (session_id, username, device_id, device_name, platform, client_version,
+            authenticated_at, last_seen_at, expires_at, revoked_at)
+           VALUES(?,?,?,?,?,?,?,?,?,NULL)""",
+        (session_id, username, device_id, device_name, platform_name, client_version,
+         now.isoformat() + "Z", now.isoformat() + "Z", expires_at),
+    )
+    db.commit()
+    return session_id
+
+def list_authenticated_devices(username, current_session_id=None):
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        """SELECT session_id, device_id, device_name, platform, client_version,
+                  authenticated_at, last_seen_at, expires_at
+           FROM authenticated_devices
+           WHERE username=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?)
+           ORDER BY last_seen_at DESC""",
+        (username, now),
+    ).fetchall()
+    con.close()
+    devices = []
+    for row in rows:
+        item = dict(row)
+        item["current"] = item["session_id"] == current_session_id
+        item["duration"] = "forever" if not item.get("expires_at") else "expires"
+        devices.append(item)
+    return devices
+
+def revoke_authenticated_device(username, session_id):
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    con = sqlite3.connect(DB)
+    cur = con.execute(
+        "UPDATE authenticated_devices SET revoked_at=? WHERE username=? AND session_id=? AND revoked_at IS NULL",
+        (now, username, session_id),
+    )
+    con.commit(); changed = cur.rowcount > 0; con.close()
+    if changed:
+        with lock:
+            targets = [s for s, sid in socket_session_ids.items() if sid == session_id]
+        for target in targets:
+            try: target.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: target.close()
+            except Exception: pass
+    return changed
 
 def handle_client(cs, addr):
     sock = cs
@@ -1763,12 +1854,14 @@ def handle_client(cs, addr):
                 db.close()
                 return
 
-        sock.sendall(b'{"status":"ok"}\n')
+        session_id = register_authenticated_device(db, user, req)
+        sock.sendall((json.dumps({"status":"ok", "session_id": session_id}) + "\n").encode())
         prior_sock = None
         with lock:
             prior_sock = clients.get(user)
             clients[user] = sock
             user_sessions.setdefault(user, set()).add(sock)
+            socket_session_ids[sock] = session_id
             client_statuses[user] = "online"
             session_preferences[sock] = {}
 
@@ -3376,6 +3469,26 @@ def handle_client(cs, addr):
                         con.close()
                         sock.sendall((json.dumps({"action": "change_password_result", "ok": False, "reason": "Current password is incorrect."}) + "\n").encode())
 
+            elif action == "list_authenticated_devices":
+                current_session_id = socket_session_ids.get(sock)
+                devices = list_authenticated_devices(user, current_session_id)
+                sock.sendall((json.dumps({"action": "authenticated_devices", "count": len(devices), "devices": devices}) + "\n").encode())
+
+            elif action == "deauthenticate_device":
+                target_session_id = str(msg.get("session_id", "")).strip()
+                current_session_id = socket_session_ids.get(sock)
+                if not target_session_id:
+                    ok, reason = False, "Missing session ID."
+                else:
+                    ok = revoke_authenticated_device(user, target_session_id)
+                    reason = "" if ok else "Device session was not found or is already signed out."
+                try:
+                    sock.sendall((json.dumps({"action": "deauthenticate_device_result", "ok": ok, "reason": reason, "session_id": target_session_id}) + "\n").encode())
+                except OSError:
+                    pass
+                if ok and target_session_id == current_session_id:
+                    break
+
             elif action == "delete_account":
                 if str(msg.get("confirm_username", "")).strip().casefold() != str(user).casefold():
                     sock.sendall((json.dumps({"action": "delete_account_result", "ok": False, "reason": "Enter your username exactly to confirm account deletion."}) + "\n").encode())
@@ -3404,6 +3517,7 @@ def handle_client(cs, addr):
             if user and not user_sessions.get(user):
                 client_statuses.pop(user, None)
             session_preferences.pop(sock, None)
+            socket_session_ids.pop(sock, None)
         _cleanup_bot_session(user)
         if user:
             _remove_user_from_all_group_calls(user)
@@ -3542,6 +3656,7 @@ def delete_user_account(user):
         con.execute("DELETE FROM group_room_messages WHERE sender=?", (username,))
         con.execute("DELETE FROM group_room_members WHERE username=?", (username,))
         con.execute("DELETE FROM linked_identities WHERE username=?", (username,))
+        con.execute("DELETE FROM authenticated_devices WHERE username=?", (username,))
         con.execute("DELETE FROM user_passkeys WHERE username=?", (username,))
         con.execute("DELETE FROM bot_tokens WHERE owner=? OR bot=?", (username, username))
         con.execute("DELETE FROM bot_rule_overrides WHERE owner=? OR bot=?", (username, username))
