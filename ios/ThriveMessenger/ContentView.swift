@@ -21,6 +21,9 @@ struct ContentView: View {
             .alert("Connection", isPresented: Binding(get: { model.client.errorMessage != nil }, set: { if !$0 { model.client.errorMessage = nil } })) {
                 Button("OK", role: .cancel) {}
             } message: { Text(model.client.errorMessage ?? "") }
+            .alert("Passkey", isPresented: Binding(get: { model.client.passkeyMessage != nil }, set: { if !$0 { model.client.passkeyMessage = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: { Text(model.client.passkeyMessage ?? "") }
             .sheet(isPresented: $showingSignIn) {
                 SignInView(client: model.client)
             }
@@ -45,6 +48,11 @@ private struct GroupNavigationView: View {
                 .navigationTitle("Thrive Messenger")
                 .toolbar {
                     ToolbarItem(placement: .topBarLeading) { Button("Sign In") { showSignIn = true } }
+                    ToolbarItem(placement: .topBarLeading) {
+                        if model.client.isConnected {
+                            Button("Register Passkey") { model.client.registerPasskey() }
+                        }
+                    }
                     ToolbarItem(placement: .topBarTrailing) { Button("New Group", systemImage: "person.3.fill") { showCreate = true } }
                 }
         } detail: {
@@ -72,6 +80,10 @@ private struct SignInView: View {
                     client.connect(user: user, password: password)
                     dismiss()
                 }.disabled(user.isEmpty || password.isEmpty)
+                Button("Use Saved Passkey") {
+                    client.connectWithSavedPasskey(user: user)
+                    dismiss()
+                }.disabled(user.isEmpty)
             }
             .navigationTitle("Sign In")
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Cancel") { dismiss() } } }

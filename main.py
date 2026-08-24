@@ -4720,6 +4720,7 @@ class MainFrame(wx.Frame):
         self._unread_counts = {}
         self._pending_display_names = {}
         self._passkey_response_lock = threading.Lock()
+        self._passkey_request_lock = threading.Lock()
         self._passkey_response_events = {}
         self._passkey_responses = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window); panel = wx.Panel(self)
@@ -5186,31 +5187,46 @@ class MainFrame(wx.Frame):
         expected_action = str(expected_action or "")
         if not expected_action:
             return None, "Internal passkey request error."
-        event = threading.Event()
-        with self._passkey_response_lock:
-            self._passkey_response_events[expected_action] = event
-            self._passkey_responses.pop(expected_action, None)
-        try:
-            self.sock.sendall((json.dumps(payload) + "\n").encode())
-        except OSError as e:
-            with self._passkey_response_lock:
-                self._passkey_response_events.pop(expected_action, None)
-                self._passkey_responses.pop(expected_action, None)
-            return None, "The connection closed while sending the passkey request. Thrive will reconnect in the background; try again after the contact list is back online."
-        except Exception as e:
-            with self._passkey_response_lock:
-                self._passkey_response_events.pop(expected_action, None)
-                self._passkey_responses.pop(expected_action, None)
-            return None, f"Could not send the passkey request: {e}"
-        if not event.wait(timeout):
-            with self._passkey_response_lock:
-                self._passkey_response_events.pop(expected_action, None)
-                self._passkey_responses.pop(expected_action, None)
-            return None, "The server did not answer the passkey request in time. The connection may be reconnecting; try again in a moment."
-        with self._passkey_response_lock:
-            self._passkey_response_events.pop(expected_action, None)
-            response = self._passkey_responses.pop(expected_action, None)
-        return response, ""
+        with self._passkey_request_lock:
+            last_error = ""
+            for attempt in range(2):
+                app = wx.GetApp()
+                if getattr(app, "reconnect_in_progress", False):
+                    deadline = time.time() + min(timeout, 8)
+                    while getattr(app, "reconnect_in_progress", False) and time.time() < deadline:
+                        time.sleep(0.2)
+                current_socket = getattr(app, "sock", None) or self.sock
+                self.sock = current_socket
+                event = threading.Event()
+                with self._passkey_response_lock:
+                    self._passkey_response_events[expected_action] = event
+                    self._passkey_responses.pop(expected_action, None)
+                try:
+                    current_socket.sendall((json.dumps(payload) + "\n").encode())
+                except OSError:
+                    last_error = "The connection was changing while Thrive sent the passkey request."
+                    with self._passkey_response_lock:
+                        self._passkey_response_events.pop(expected_action, None)
+                        self._passkey_responses.pop(expected_action, None)
+                    if attempt == 0:
+                        time.sleep(0.5)
+                        continue
+                    return None, last_error + " Thrive is reconnecting; try again after the contact list is back online."
+                except Exception as e:
+                    with self._passkey_response_lock:
+                        self._passkey_response_events.pop(expected_action, None)
+                        self._passkey_responses.pop(expected_action, None)
+                    return None, f"Could not send the passkey request: {e}"
+                if not event.wait(timeout):
+                    with self._passkey_response_lock:
+                        self._passkey_response_events.pop(expected_action, None)
+                        self._passkey_responses.pop(expected_action, None)
+                    return None, "The server did not answer the passkey request in time. The connection may be reconnecting; try again in a moment."
+                with self._passkey_response_lock:
+                    self._passkey_response_events.pop(expected_action, None)
+                    response = self._passkey_responses.pop(expected_action, None)
+                return response, ""
+            return None, last_error or "The passkey request could not be sent."
 
     def _list_passkeys(self):
         resp, _ = self._send_passkey_request({"action": "list_passkeys"}, "passkey_list")

@@ -9,10 +9,12 @@ final class ThriveClient: ObservableObject {
     @Published private(set) var groups: [Group] = []
     @Published private(set) var groupMessages: [String: [GroupMessage]] = [:]
     @Published var errorMessage: String?
+    @Published var passkeyMessage: String?
 
     private var connection: NWConnection?
     private var buffer = Data()
     private var configuration = ServerConfiguration()
+    private var pendingPasskeyToken: String?
 
     func connect(user: String, password: String, server: ServerConfiguration = .init()) {
         disconnect()
@@ -40,6 +42,48 @@ final class ThriveClient: ObservableObject {
         }
         connection.start(queue: .global(qos: .userInitiated))
         receive()
+    }
+
+    func connectWithSavedPasskey(user: String, server: ServerConfiguration = .init()) {
+        guard let token = PasskeyStore.load(username: user, server: server) else {
+            errorMessage = "No passkey is saved for this account on this device."
+            return
+        }
+        disconnect()
+        configuration = server
+        username = user
+        let params = NWParameters.tcp
+        params.defaultProtocolStack.applicationProtocols.insert(NWProtocolTLS.Options(), at: 0)
+        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(server.host), port: NWEndpoint.Port(rawValue: server.port)!)
+        let connection = NWConnection(to: endpoint, using: params)
+        self.connection = connection
+        connection.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor in
+                switch state {
+                case .ready:
+                    self?.isConnected = true
+                    self?.send(["action": "login_passkey", "user": user, "passkey_token": token])
+                case .failed(let error):
+                    self?.isConnected = false
+                    self?.errorMessage = error.localizedDescription
+                case .cancelled:
+                    self?.isConnected = false
+                default: break
+                }
+            }
+        }
+        connection.start(queue: .global(qos: .userInitiated))
+        receive()
+    }
+
+    func registerPasskey(label: String = "Thrive Messenger iPhone") {
+        guard isConnected else {
+            errorMessage = "Connect with your password before registering a passkey."
+            return
+        }
+        let token = UUID().uuidString + UUID().uuidString
+        pendingPasskeyToken = token
+        send(["action": "register_passkey", "label": label, "passkey_token": token])
     }
 
     func disconnect() {
@@ -80,6 +124,14 @@ final class ThriveClient: ObservableObject {
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                   let action = object["action"] as? String else { continue }
             switch action {
+            case "passkey_register_result":
+                if object["ok"] as? Bool == true, let token = pendingPasskeyToken,
+                   PasskeyStore.save(token, username: username, server: configuration) {
+                    passkeyMessage = "Passkey registered on this device."
+                } else {
+                    errorMessage = object["reason"] as? String ?? "The passkey could not be saved on this device."
+                }
+                pendingPasskeyToken = nil
             case "contact_list": contacts = decode(object["contacts"])
             case "group_list_response": groups = decode(object["groups"])
             case "group_msg":

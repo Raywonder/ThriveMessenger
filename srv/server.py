@@ -3202,25 +3202,35 @@ def handle_client(cs, addr):
                     label = f"Thrive Messenger - {user}"
                 now = datetime.datetime.utcnow().isoformat()
                 token_hash = _hash_passkey_secret(raw_token)
-                con = sqlite3.connect(DB)
-                existing = con.execute(
-                    "SELECT id FROM user_passkeys WHERE username=? AND token_hash=? LIMIT 1",
-                    (user, token_hash),
-                ).fetchone()
-                if existing:
-                    passkey_id = existing[0]
-                    con.execute(
-                        "UPDATE user_passkeys SET label=?, revoked=0 WHERE id=?",
-                        (label, passkey_id),
-                    )
-                else:
-                    passkey_id = str(uuid.uuid4())
-                    con.execute(
-                        "INSERT INTO user_passkeys(id, username, label, token_hash, created_at, last_used_at, revoked) VALUES(?,?,?,?,?,?,0)",
-                        (passkey_id, user, label, token_hash, now, now),
-                    )
-                con.commit()
-                con.close()
+                try:
+                    with sqlite3.connect(DB, timeout=10) as con:
+                        existing = con.execute(
+                            "SELECT id FROM user_passkeys WHERE username=? AND token_hash=? LIMIT 1",
+                            (user, token_hash),
+                        ).fetchone()
+                        if existing:
+                            passkey_id = existing[0]
+                            con.execute(
+                                "UPDATE user_passkeys SET label=?, revoked=0 WHERE id=?",
+                                (label, passkey_id),
+                            )
+                        else:
+                            passkey_id = str(uuid.uuid4())
+                            con.execute(
+                                "INSERT INTO user_passkeys(id, username, label, token_hash, created_at, last_used_at, revoked) VALUES(?,?,?,?,?,?,0)",
+                                (passkey_id, user, label, token_hash, now, now),
+                            )
+                except sqlite3.Error as exc:
+                    try:
+                        sock.sendall((json.dumps({
+                            "action": "passkey_register_result",
+                            "ok": False,
+                            "reason": "The passkey store is temporarily busy. Please try again in a moment.",
+                        }) + "\n").encode())
+                    except Exception:
+                        pass
+                    print(f"Passkey registration database error for {user}: {exc}")
+                    continue
                 try:
                     sock.sendall((json.dumps({
                         "action": "passkey_register_result",
@@ -3232,12 +3242,15 @@ def handle_client(cs, addr):
                     pass
 
             elif action == "list_passkeys":
-                con = sqlite3.connect(DB)
-                rows = con.execute(
-                    "SELECT id, label, created_at, last_used_at, revoked FROM user_passkeys WHERE username=? ORDER BY created_at DESC",
-                    (user,),
-                ).fetchall()
-                con.close()
+                try:
+                    with sqlite3.connect(DB, timeout=10) as con:
+                        rows = con.execute(
+                            "SELECT id, label, created_at, last_used_at, revoked FROM user_passkeys WHERE username=? ORDER BY created_at DESC",
+                            (user,),
+                        ).fetchall()
+                except sqlite3.Error as exc:
+                    print(f"Passkey listing database error for {user}: {exc}")
+                    rows = []
                 entries = [
                     {
                         "id": r[0],
@@ -3268,14 +3281,16 @@ def handle_client(cs, addr):
                     except Exception:
                         pass
                     continue
-                con = sqlite3.connect(DB)
-                res = con.execute(
-                    "UPDATE user_passkeys SET revoked=1 WHERE id=? AND username=?",
-                    (passkey_id, user),
-                )
-                con.commit()
-                changed = int(getattr(res, "rowcount", 0) or 0)
-                con.close()
+                try:
+                    with sqlite3.connect(DB, timeout=10) as con:
+                        res = con.execute(
+                            "UPDATE user_passkeys SET revoked=1 WHERE id=? AND username=?",
+                            (passkey_id, user),
+                        )
+                        changed = int(getattr(res, "rowcount", 0) or 0)
+                except sqlite3.Error as exc:
+                    print(f"Passkey revoke database error for {user}: {exc}")
+                    changed = 0
                 try:
                     sock.sendall((json.dumps({
                         "action": "passkey_revoke_result",
