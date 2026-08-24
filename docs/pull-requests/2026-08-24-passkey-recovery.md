@@ -4,6 +4,8 @@ Status: Ready for review; do not close until owner-facing device checks pass
 
 Branch: `codex/passkey-recovery-all-clients`
 
+Fork review link: https://git.tappedin.fm/tappedinfm/ThriveMessenger/pulls/new/codex/passkey-recovery-all-clients
+
 Commit: `696d256` (`Repair passkey registration across clients`)
 
 ## What changed
@@ -25,3 +27,7 @@ Commit: `696d256` (`Repair passkey registration across clients`)
 - Run the shared desktop build on macOS and verify registration/list/revoke.
 - Run the iOS flow on a device or simulator with Keychain state and verify registration followed by saved-passkey sign-in.
 - Review the issue and this change through the local fork PR workflow.
+
+The branch has been pushed to the Raywonder Gitea fork and is intentionally
+left open for those device checks. GitHub issue/PR creation remains pending
+because the available GitHub CLI session is not authenticated.
