@@ -6,6 +6,8 @@ exec /usr/bin/python3 srv/scripts/thrive_cli.py \
   --agent-env /home/tappedin/.config/thrive-messenger/agent-bots.env \
   --host 127.0.0.1 \
   --port 2005 \
+  --ssl \
+  --insecure \
   register-bot-session \
   --username Clawdia \
   --no-prompt \
