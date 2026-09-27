@@ -110,6 +110,12 @@ begin
   Log('Removing the other Thrive copy registered in the ' + ViewName + ' view: ' + Loc);
   { User settings (%APPDATA%\ThriveMessenger) and saved sign-ins (Credential Manager) are not touched by the uninstaller. }
   Exec(UninstStr, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  { Tidy up the now-empty old folders (RemoveDir only removes empty ones). }
+  if Loc <> '' then
+  begin
+    RemoveDir(RemoveBackslashUnlessRoot(Loc));
+    RemoveDir(ExtractFileDir(RemoveBackslashUnlessRoot(Loc)));
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
