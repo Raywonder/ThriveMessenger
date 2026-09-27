@@ -423,6 +423,8 @@ def load_user_config():
         'save_chat_history_default': False,
         'message_edit_window_seconds': 300,
         'message_undo_window_seconds': 15,
+        'delete_messages_for_everyone': True,
+        'delete_attached_files_with_message': False,
         'allow_cross_server_directory_message': True,
         'directory_dm_defaults': {},
         'incoming_popup_on_message': False,
@@ -480,6 +482,8 @@ def load_user_config():
         settings['message_undo_window_seconds'] = 15
     settings['allow_cross_server_directory_message'] = bool(settings.get('allow_cross_server_directory_message', True))
     settings['double_escape_to_close_chat'] = bool(settings.get('double_escape_to_close_chat', True))
+    settings['delete_messages_for_everyone'] = bool(settings.get('delete_messages_for_everyone', True))
+    settings['delete_attached_files_with_message'] = bool(settings.get('delete_attached_files_with_message', False))
     settings['interrupt_speech'] = bool(settings.get('interrupt_speech', True))
     settings['prefer_contact_display_names'] = bool(settings.get('prefer_contact_display_names', False))
     if not isinstance(settings.get('contact_display_names', {}), dict):
@@ -1043,6 +1047,48 @@ def speak_text(text, interrupt=None):
             app._tts_process = proc
     except Exception as e:
         print(f"TTS speak failed: {e}")
+
+def _received_files_dir():
+    return os.path.join(os.path.expanduser('~'), 'Documents', 'ThriveMessenger', 'files')
+
+def _move_to_trash(path):
+    """Recoverable delete: Recycle Bin on Windows, Trash on macOS."""
+    if sys.platform == 'win32':
+        import ctypes
+        from ctypes import wintypes
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+        FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+        op = SHFILEOPSTRUCTW(None, FO_DELETE, os.path.abspath(path) + "\0", None,
+                             FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI, False, None, None)
+        return ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) == 0 and not os.path.exists(path)
+    if sys.platform == 'darwin':
+        trash = os.path.join(os.path.expanduser('~'), '.Trash')
+        if os.path.isdir(trash):
+            dest = os.path.join(trash, os.path.basename(path))
+            if os.path.exists(dest):
+                name, ext = os.path.splitext(os.path.basename(path))
+                dest = os.path.join(trash, f"{name} {int(time.time())}{ext}")
+            shutil.move(path, dest)
+            return True
+    return False
+
+def remove_received_files(paths):
+    """Move files this app saved from a transfer to the trash. Never touches files outside the received-files folder."""
+    root = os.path.realpath(_received_files_dir())
+    removed = 0
+    for path in paths or []:
+        try:
+            real = os.path.realpath(str(path))
+            if not real.startswith(root + os.sep) or not os.path.isfile(real):
+                continue
+            if _move_to_trash(real):
+                removed += 1
+        except Exception as e:
+            print(f"Could not remove received file {path}: {e}")
+    return removed
 
 def play_tts_audio_from_message(msg):
     try:
@@ -1734,6 +1780,12 @@ class SettingsDialog(wx.Dialog):
         escape_row.Add(self.escape_action_choice, 1, wx.EXPAND)
         self.double_escape_chat_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Require double Escape to dismiss chat windows")
         self.double_escape_chat_cb.SetValue(bool(self.config.get('double_escape_to_close_chat', True)))
+        self.delete_for_everyone_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Delete messages for everyone")
+        self.delete_for_everyone_cb.SetValue(bool(self.config.get('delete_messages_for_everyone', True)))
+        self.delete_for_everyone_cb.SetToolTip("When you delete a message you sent (or any message, if you are an admin), it is removed for both people in the conversation.")
+        self.delete_attached_files_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Also delete attached files when deleting a message")
+        self.delete_attached_files_cb.SetValue(bool(self.config.get('delete_attached_files_with_message', False)))
+        self.delete_attached_files_cb.SetToolTip("Files you received with that message are moved to the Recycle Bin on this computer.")
 
         cfg = load_client_config()
         self.client_conf_path = get_user_client_conf_path()
@@ -1867,6 +1919,8 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(escape_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(self.double_escape_chat_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.delete_for_everyone_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.delete_attached_files_cb, 0, wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
         audio_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 8)
         audio_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -1931,7 +1985,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -2875,7 +2929,13 @@ class ClientApp(wx.App):
                         wx.CallAfter(self.frame.on_group_call_audio, msg)
                     elif act == "voice_call_incoming": wx.CallAfter(self.frame.on_voice_call_incoming, msg)
                     elif act == "voice_call_event": wx.CallAfter(self.frame.on_voice_call_event, msg)
-                    elif act == "feature_caps": wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
+                    elif act == "feature_caps":
+                        wx.CallAfter(self.frame.set_feature_caps, msg.get("caps", {}))
+                        if "is_admin" in msg:
+                            wx.CallAfter(setattr, self.frame, "am_admin", bool(msg.get("is_admin")))
+                    elif act == "msg_sent": wx.CallAfter(self.frame.on_message_sent_ack, msg)
+                    elif act in ("msg_edited", "msg_deleted"): wx.CallAfter(self.frame.on_message_changed, msg)
+                    elif act in ("msg_edit_result", "msg_delete_result"): wx.CallAfter(self.frame.on_message_change_result, msg)
                     elif act == "banned_kick": wx.CallAfter(self.on_banned); handled = True; break
                 except Exception as dispatch_err:
                     print(f"Warning: failed to process server action '{act}': {dispatch_err}")
@@ -3036,7 +3096,7 @@ class ClientApp(wx.App):
             self.play_sound("file_receive.wav")
             chat = self.frame.get_chat(sender)
             names = ", ".join(saved)
-            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", time.time())
+            if chat: chat.append(f"{len(saved)} file(s) received and saved: {names}", "System", time.time(), files=saved_paths)
             else:
                 show_notification("Files Received", f"{sender} sent you {len(saved)} file(s)")
             if self.user_config.get('auto_open_received_files', True):
@@ -4947,6 +5007,8 @@ class MainFrame(wx.Frame):
                 app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'none')
                 app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
                 app.user_config['double_escape_to_close_chat'] = dlg.double_escape_chat_cb.IsChecked()
+                app.user_config['delete_messages_for_everyone'] = dlg.delete_for_everyone_cb.IsChecked()
+                app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
                 edit_window, undo_window = dlg.message_policy()
                 app.user_config['message_edit_window_seconds'] = edit_window
                 app.user_config['message_undo_window_seconds'] = undo_window
@@ -5913,7 +5975,7 @@ class MainFrame(wx.Frame):
         incoming_behavior = str(app.user_config.get('incoming_message_behavior', 'silent_count') or 'silent_count').strip().lower()
         if incoming_behavior == 'popup':
             dlg.Show()
-        dlg.append(text, sender, ts, announce=False)
+        dlg.append(text, sender, ts, announce=False, msg_id=str(msg.get("id") or "") or None)
         dlg.set_typing_label(sender, False)
         self.clear_typing_state(sender)
         is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
@@ -5930,6 +5992,45 @@ class MainFrame(wx.Frame):
         if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
             sender_label = self.format_user_label(sender)
             speak_text(f"{sender_label} says {text}")
+    am_admin = False
+    def _chat_for_message_event(self, msg):
+        me = str(self.user or "").lower()
+        frm = str(msg.get("from") or "")
+        to = str(msg.get("to") or "")
+        other = to if frm.lower() == me else frm
+        return self.get_chat(other)
+    def on_message_sent_ack(self, msg):
+        chat = self.get_chat(msg.get("to"))
+        if chat:
+            chat.set_row_message_id(str(msg.get("client_id") or ""), str(msg.get("id") or ""))
+    def on_message_changed(self, msg):
+        chat = self._chat_for_message_event(msg)
+        if not chat:
+            return
+        actor = str(msg.get("edited_by") or msg.get("deleted_by") or "")
+        by_me = actor.lower() == str(self.user or "").lower()
+        label = self.format_user_label(actor) if actor else "Someone"
+        if msg.get("action") == "msg_edited":
+            if chat.apply_remote_edit(str(msg.get("id") or ""), str(msg.get("msg", "") or "")) and not by_me:
+                speak_text(f"{label} edited a message", interrupt=False)
+        else:
+            if chat.apply_remote_delete(str(msg.get("id") or "")) and not by_me:
+                speak_text(f"{label} deleted a message", interrupt=False)
+    def on_message_change_result(self, msg):
+        is_edit = msg.get("action") == "msg_edit_result"
+        chat = None
+        for child in self.GetChildren():
+            if isinstance(child, ChatDialog) and child.has_message_id(str(msg.get("id") or "")):
+                chat = child
+                break
+        if msg.get("ok"):
+            speak_text("Message edited" if is_edit else "Deleted for everyone", interrupt=True)
+            return
+        reason = str(msg.get("reason") or ("The message could not be edited." if is_edit else "The message could not be deleted."))
+        if chat:
+            chat.append_error(reason)
+        else:
+            speak_text(reason, interrupt=True)
     TYPING_STOP_ANNOUNCE_DELAY_MS = 2500
     def _typing_states(self):
         if not hasattr(self, "_typing_state_by_user"):
@@ -6994,6 +7095,7 @@ class ChatDialog(wx.Dialog):
         self._show_call = bool(show_call)
         self._pending_message_after_add = None
         self._last_deleted_message = None
+        self._editing_message_id = None
         self._last_escape_ts = 0.0
         self._allow_close_once = False
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
@@ -7257,6 +7359,9 @@ class ChatDialog(wx.Dialog):
             self._allow_close_once = True
             self.Close()
             return
+        elif event.GetKeyCode() == wx.WXK_ESCAPE and self._editing_message_id:
+            self._cancel_edit_mode(announce=True)
+            return
         elif event.GetKeyCode() == wx.WXK_ESCAPE:
             require_double = bool(wx.GetApp().user_config.get('double_escape_to_close_chat', True))
             if not require_double:
@@ -7296,7 +7401,11 @@ class ChatDialog(wx.Dialog):
                 self.append_error(reason or "Message failed.")
                 return
         else:
-            msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts}
+            if self._editing_message_id:
+                self._send_message_edit(txt)
+                return
+            client_id = uuid.uuid4().hex
+            msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts,"client_id":client_id}
             try:
                 self.sock.sendall(json.dumps(msg).encode()+b"\n")
             except Exception as e:
@@ -7307,7 +7416,7 @@ class ChatDialog(wx.Dialog):
                 except Exception:
                     pass
                 return
-        self.append(txt, self.user, ts)
+        self.append(txt, self.user, ts, client_id=(client_id if not self.is_remote_directory_chat else None))
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
@@ -7355,10 +7464,17 @@ class ChatDialog(wx.Dialog):
         self._pending_message_after_add = None
         self.input_ctrl.SetValue(pending)
         self.on_send(None)
-    def append(self, text, sender, ts, is_error=False, announce=True):
+    def append(self, text, sender, ts, is_error=False, announce=True, msg_id=None, client_id=None, files=None):
         display, formatted_time = self._build_message_display(text, sender, ts, is_error=is_error)
         self.hist.Append(display)
-        self._history_rows.append({"sender": sender, "text": text, "time": ts, "error": is_error})
+        row = {"sender": sender, "text": text, "time": ts, "error": is_error}
+        if msg_id:
+            row["id"] = msg_id
+        if client_id:
+            row["client_id"] = client_id
+        if files:
+            row["files"] = list(files)
+        self._history_rows.append(row)
         self.hist.SetSelection(self.hist.GetCount() - 1)
         app = wx.GetApp()
         if announce and sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
@@ -7411,13 +7527,13 @@ class ChatDialog(wx.Dialog):
         if idx is None:
             return
         row = self._history_rows[idx]
-        own_message = self._is_row_editable(row)
+        can_edit = self._can_edit_row(row)
         menu = wx.Menu()
         mi_view = menu.Append(wx.ID_ANY, "View Full Message")
         mi_copy = menu.Append(wx.ID_ANY, "&Copy Message\tCtrl+C")
-        # Edit only appears for your own recent messages; nobody can edit someone else's.
-        mi_edit = menu.Append(wx.ID_ANY, "Edit Message") if own_message else None
-        mi_remove = menu.Append(wx.ID_ANY, "Remove Message")
+        # Edit only appears for your own messages (or any message, for admins); nobody else can edit them.
+        mi_edit = menu.Append(wx.ID_ANY, "&Edit Message") if can_edit else None
+        mi_remove = menu.Append(wx.ID_ANY, "&Delete Message\tDelete")
         mi_undo = menu.Append(wx.ID_ANY, "Undo Delete")
         mi_undo.Enable(self._can_undo_delete())
         self.Bind(wx.EVT_MENU, self.on_view_selected_message, mi_view)
@@ -7457,26 +7573,138 @@ class ChatDialog(wx.Dialog):
                 wx.TheClipboard.Flush()
             finally:
                 wx.TheClipboard.Close()
-        speak_text("Message copied" if copied else "Could not copy the message", interrupt=True)
+        speak_text("Copied" if copied else "Could not copy the message", interrupt=True)
+    def _am_admin(self):
+        parent = self.GetParent()
+        return bool(getattr(parent, "am_admin", False))
+    def _can_edit_row(self, row):
+        if row.get("error", False) or row.get("sender") in ("System", "", None):
+            return False
+        if self._is_row_editable(row):
+            return True
+        # Admins may edit anyone's message, but only ones the server knows by ID.
+        return bool(row.get("id")) and self._am_admin()
+    def _can_delete_for_everyone(self, row):
+        if not row.get("id") or row.get("error", False):
+            return False
+        return str(row.get("sender") or "").lower() == str(self.user or "").lower() or self._am_admin()
+    def has_message_id(self, msg_id):
+        return bool(msg_id) and any(r.get("id") == msg_id for r in self._history_rows)
+    def _row_index_for_id(self, msg_id):
+        if not msg_id:
+            return None
+        for i, r in enumerate(self._history_rows):
+            if r.get("id") == msg_id:
+                return i
+        return None
+    def _refresh_row_display(self, idx):
+        row = self._history_rows[idx]
+        text = row.get("text", "")
+        if row.get("edited"):
+            text = f"{text} (edited)"
+        display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
+        selected = self.hist.GetSelection()
+        self.hist.SetString(idx, display)
+        if selected != wx.NOT_FOUND:
+            self.hist.SetSelection(selected)
+    def set_row_message_id(self, client_id, msg_id):
+        if not client_id or not msg_id:
+            return
+        for r in reversed(self._history_rows):
+            if r.get("client_id") == client_id:
+                r["id"] = msg_id
+                return
+    def apply_remote_edit(self, msg_id, text):
+        idx = self._row_index_for_id(msg_id)
+        if idx is None:
+            return False
+        self._history_rows[idx]["text"] = text
+        self._history_rows[idx]["edited"] = True
+        self._refresh_row_display(idx)
+        return True
+    def apply_remote_delete(self, msg_id):
+        idx = self._row_index_for_id(msg_id)
+        if idx is None:
+            return False
+        self._delete_row_locally(idx, allow_undo=False)
+        return True
+    def _delete_row_locally(self, idx, allow_undo=True):
+        keep_focus_in_hist = wx.Window.FindFocus() is self.hist
+        row = self._history_rows.pop(idx)
+        self.hist.Delete(idx)
+        if allow_undo:
+            self._last_deleted_message = {"row": row, "index": idx, "deleted_at": time.time()}
+        if self.hist.GetCount() > 0:
+            self.hist.SetSelection(max(0, idx - 1))
+        if keep_focus_in_hist:
+            self.hist.SetFocus()
+        if self._editing_message_id and row.get("id") == self._editing_message_id:
+            self._cancel_edit_mode(announce=False)
+        if row.get("files") and wx.GetApp().user_config.get('delete_attached_files_with_message', False):
+            removed = remove_received_files(row.get("files") or [])
+            if removed:
+                speak_text(f"{removed} attached file{'s' if removed != 1 else ''} moved to the Recycle Bin", interrupt=False)
+        return row
     def on_edit_selected_message(self, _):
         idx = self._selected_history_index()
         if idx is None:
             return
         row = self._history_rows[idx]
-        if not self._is_row_editable(row):
+        if not self._can_edit_row(row):
             return
         self.input_ctrl.SetValue(str(row.get("text", "")))
+        if row.get("id"):
+            self._editing_message_id = row["id"]
+            self.typing_lbl.SetLabel("Editing a message. Press Enter to save or Escape to cancel.")
+            speak_text("Editing message. Press Enter to save, or Escape to cancel.", interrupt=True)
         self.input_ctrl.SetFocus()
         self.input_ctrl.SetInsertionPointEnd()
+    def _cancel_edit_mode(self, announce=True):
+        self._editing_message_id = None
+        self.input_ctrl.Clear()
+        self.typing_lbl.SetLabel("")
+        if announce:
+            speak_text("Edit cancelled", interrupt=True)
+    def _send_message_edit(self, txt):
+        msg_id = self._editing_message_id
+        try:
+            self.sock.sendall((json.dumps({"action": "msg_edit", "id": msg_id, "msg": txt}) + "\n").encode())
+        except Exception as e:
+            self.append_error(f"Could not save the edit: {e}")
+            return
+        # The server confirms with msg_edited, which updates the row for both people.
+        self._editing_message_id = None
+        self.typing_lbl.SetLabel("")
+        self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_remove_selected_message(self, _):
         idx = self._selected_history_index()
         if idx is None:
             return
-        row = self._history_rows.pop(idx)
-        self._last_deleted_message = {"row": row, "index": idx, "deleted_at": time.time()}
-        self.hist.Delete(idx)
-        if self.hist.GetCount() > 0:
-            self.hist.SetSelection(max(0, idx - 1))
+        row = self._history_rows[idx]
+        want_everyone = bool(wx.GetApp().user_config.get('delete_messages_for_everyone', True))
+        if want_everyone and self._can_delete_for_everyone(row) and not self.is_remote_directory_chat:
+            res = wx.MessageBox(
+                "Delete this message for everyone in this conversation? This can't be undone.",
+                "Delete Message",
+                wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION,
+                self,
+            )
+            if res != wx.YES:
+                self.hist.SetFocus()
+                return
+            try:
+                self.sock.sendall((json.dumps({"action": "msg_delete", "id": row["id"]}) + "\n").encode())
+            except Exception as e:
+                self.append_error(f"Could not delete the message: {e}")
+                return
+            # Removed now; the server's msg_deleted for this id then finds nothing left to do here.
+            self._delete_row_locally(idx, allow_undo=False)
+            return
+        self._delete_row_locally(idx, allow_undo=True)
+        if want_everyone and row.get("id") and not row.get("error") and row.get("sender") not in ("System",):
+            speak_text("Removed from this device only. Only the sender or an admin can delete it for everyone.", interrupt=True)
+        else:
+            speak_text("Message removed", interrupt=True)
     def on_undo_last_deleted_message(self, _):
         if not self._can_undo_delete():
             return
@@ -7513,6 +7741,9 @@ class ChatDialog(wx.Dialog):
     def on_history_key(self, event):
         if event.GetKeyCode() in (ord('C'), ord('c')) and event.ControlDown() and not event.AltDown() and not event.ShiftDown():
             self.on_copy_selected_message()
+            return
+        if event.GetKeyCode() in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE) and not event.HasAnyModifiers():
+            self.on_remove_selected_message(None)
             return
         if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             idx = self.hist.GetSelection()
