@@ -7414,13 +7414,16 @@ class ChatDialog(wx.Dialog):
         own_message = self._is_row_editable(row)
         menu = wx.Menu()
         mi_view = menu.Append(wx.ID_ANY, "View Full Message")
-        mi_edit = menu.Append(wx.ID_ANY, "Edit Message")
+        mi_copy = menu.Append(wx.ID_ANY, "&Copy Message\tCtrl+C")
+        # Edit only appears for your own recent messages; nobody can edit someone else's.
+        mi_edit = menu.Append(wx.ID_ANY, "Edit Message") if own_message else None
         mi_remove = menu.Append(wx.ID_ANY, "Remove Message")
         mi_undo = menu.Append(wx.ID_ANY, "Undo Delete")
-        mi_edit.Enable(own_message)
         mi_undo.Enable(self._can_undo_delete())
         self.Bind(wx.EVT_MENU, self.on_view_selected_message, mi_view)
-        self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
+        self.Bind(wx.EVT_MENU, self.on_copy_selected_message, mi_copy)
+        if mi_edit:
+            self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
         self.Bind(wx.EVT_MENU, self.on_remove_selected_message, mi_remove)
         self.Bind(wx.EVT_MENU, self.on_undo_last_deleted_message, mi_undo)
         self.PopupMenu(menu)
@@ -7442,6 +7445,19 @@ class ChatDialog(wx.Dialog):
         dlg.ShowModal()
         dlg.Destroy()
         self.hist.SetFocus()
+    def on_copy_selected_message(self, _=None):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        text = str(self._history_rows[idx].get("text", "") or "")
+        copied = False
+        if wx.TheClipboard.Open():
+            try:
+                copied = bool(wx.TheClipboard.SetData(wx.TextDataObject(text)))
+                wx.TheClipboard.Flush()
+            finally:
+                wx.TheClipboard.Close()
+        speak_text("Message copied" if copied else "Could not copy the message", interrupt=True)
     def on_edit_selected_message(self, _):
         idx = self._selected_history_index()
         if idx is None:
@@ -7495,6 +7511,9 @@ class ChatDialog(wx.Dialog):
         wx.MessageBox(f"Multiple links found. Opening first link:\n{chosen}", "Open Link", wx.OK | wx.ICON_INFORMATION)
         open_path_or_url(chosen)
     def on_history_key(self, event):
+        if event.GetKeyCode() in (ord('C'), ord('c')) and event.ControlDown() and not event.AltDown() and not event.ShiftDown():
+            self.on_copy_selected_message()
+            return
         if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             idx = self.hist.GetSelection()
             if idx != wx.NOT_FOUND:
