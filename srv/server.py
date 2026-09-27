@@ -748,6 +748,71 @@ def _deliver_pending_voicemail(sock, username):
         except Exception:
             break
 
+HISTORY_DEFAULT_LIMIT = 200
+HISTORY_MAX_LIMIT = 1000
+
+def _history_item(row):
+    rowid, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path = row
+    item = {"seq": rowid, "id": msg_uid or f"h{rowid}", "from": frm, "to": to_user, "msg": body or "",
+            "time": (created_at or "") + ("Z" if created_at and not str(created_at).endswith("Z") else ""),
+            "edited": bool(edited_at)}
+    label = re.match(r"^(Voice message|Voicemail) \((\d+):(\d\d)\)$", body or "")
+    if label:
+        item["voice"] = {"duration": int(label.group(2)) * 60 + int(label.group(3)),
+                         "voicemail": label.group(1) == "Voicemail",
+                         "stored": bool(attachment_path and os.path.isfile(attachment_path))}
+    return item
+
+def _history_query(user, other, before_seq=None, limit=HISTORY_DEFAULT_LIMIT, day=None, tz_offset_minutes=0):
+    """Messages between two users (deleted ones excluded), oldest first. Only ever the requester's own conversations."""
+    where = ("((lower(frm)=lower(?) AND lower(to_user)=lower(?)) OR (lower(frm)=lower(?) AND lower(to_user)=lower(?))) "
+             "AND deleted_at IS NULL")
+    params = [user, other, other, user]
+    if before_seq:
+        where += " AND id < ?"; params.append(int(before_seq))
+    if day:
+        where += " AND date(datetime(created_at, ?)) = ?"; params += [f"{int(tz_offset_minutes):+d} minutes", str(day)[:10]]
+    limit = max(1, min(int(limit or HISTORY_DEFAULT_LIMIT), HISTORY_MAX_LIMIT))
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        rows = con.execute(
+            f"SELECT id, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path FROM direct_message_history "
+            f"WHERE {where} ORDER BY id DESC LIMIT ?", params + [limit + 1]).fetchall()
+    finally:
+        con.close()
+    has_more = len(rows) > limit
+    rows = list(reversed(rows[:limit]))
+    return [_history_item(r) for r in rows], has_more
+
+def _history_days(user, other, tz_offset_minutes=0):
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        rows = con.execute(
+            "SELECT date(datetime(created_at, ?)) AS d, count(*) FROM direct_message_history "
+            "WHERE ((lower(frm)=lower(?) AND lower(to_user)=lower(?)) OR (lower(frm)=lower(?) AND lower(to_user)=lower(?))) "
+            "AND deleted_at IS NULL GROUP BY d ORDER BY d DESC",
+            (f"{int(tz_offset_minutes):+d} minutes", user, other, other, user)).fetchall()
+    finally:
+        con.close()
+    return [{"day": d, "count": c} for d, c in rows if d]
+
+def _voice_for_participant(user, msg_uid):
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        row = con.execute("SELECT frm, to_user, attachment_path, deleted_at FROM direct_message_history WHERE msg_uid=? "
+                          "ORDER BY id DESC LIMIT 1", (msg_uid,)).fetchone()
+    finally:
+        con.close()
+    if not row or row[3] or not row[2]:
+        return None
+    if str(user).lower() not in (str(row[0]).lower(), str(row[1]).lower()):
+        return None
+    path = row[2]
+    if not os.path.realpath(path).startswith(os.path.realpath(VOICE_DIR) + os.sep) or not os.path.isfile(path):
+        return None
+    with open(path, "rb") as fh:
+        return base64.b64encode(fh.read()).decode("ascii")
+
 def _send_to_all_sessions(usernames, payload):
     """Send one event to every signed-in device of each user (names matched ignoring case)."""
     wanted = {str(u or "").strip().lower() for u in usernames if str(u or "").strip()}
@@ -2104,9 +2169,20 @@ def _send_bot_event(sender_sock, sender_user, payload):
     target = _bot_reply_target_sock(sender_sock, sender_user)
     try:
         _send_json_line(target, payload)
-        return True
+        ok = True
     except Exception:
-        return False
+        ok = False
+    if isinstance(payload, dict) and payload.get("action") == "msg":
+        # Bot replies also reach the user's other signed-in devices.
+        with lock:
+            others = [s_ for s_ in user_sessions.get(sender_user, set()) if s_ is not target]
+        for s_ in others:
+            try:
+                _send_json_line(s_, payload)
+                ok = True
+            except Exception:
+                pass
+    return ok
 
 class _BotVoiceText(object):
     """A voice message for a bot: transcribed (in the reply worker, not the socket thread) into text for the agent."""
@@ -5784,6 +5860,7 @@ def handle_client(cs, addr):
                     except Exception:
                         pass
                 msg["id"] = uuid.uuid4().hex  # server-assigned, used for edit/delete-for-everyone
+                msg["server_time"] = _iso_utc_now() + "Z"  # one clock for ordering across devices
                 to, frm = msg["to"], user
                 message_text = str(msg.get("msg", "") or "")
                 if _message_too_long(message_text, max_direct_message_length):
@@ -5887,8 +5964,43 @@ def handle_client(cs, addr):
                             _send_json_line(sock, {"action": "msg_sent", "id": msg["id"], "client_id": client_msg_id, "to": to})
                         except Exception:
                             pass
+                if not reason:
+                    # The sender's other signed-in devices see the message too, so every device's chat matches.
+                    echo = dict(msg); echo["echo"] = True
+                    with lock:
+                        own_other = [s_ for s_ in user_sessions.get(frm, set()) if s_ is not sock]
+                    for s_ in own_other:
+                        try:
+                            _send_json_line(s_, echo)
+                        except Exception:
+                            pass
                 if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
+
+            elif action in ("history_request", "history_days", "voice_fetch"):
+                other = _canonical_username(msg.get("with")) or str(msg.get("with") or "").strip()
+                request_id = str(msg.get("request_id") or "")[:64]
+                try:
+                    tz_offset = max(-900, min(900, int(msg.get("tz_offset", 0) or 0)))
+                except Exception:
+                    tz_offset = 0
+                try:
+                    if action == "history_request":
+                        items, has_more = _history_query(user, other, before_seq=msg.get("before"), limit=msg.get("limit"),
+                                                         day=msg.get("day"), tz_offset_minutes=tz_offset)
+                        _send_json_line(sock, {"action": "history", "with": other, "request_id": request_id, "messages": items,
+                                               "has_more": has_more, "before": msg.get("before"), "day": msg.get("day")})
+                    elif action == "history_days":
+                        _send_json_line(sock, {"action": "history_days", "with": other, "request_id": request_id,
+                                               "days": _history_days(user, other, tz_offset)})
+                    else:
+                        b64 = _voice_for_participant(user, str(msg.get("id") or ""))
+                        _send_json_line(sock, {"action": "voice_data", "id": msg.get("id"), "request_id": request_id,
+                                               "ok": bool(b64), "b64": b64 or "", "mime": "audio/mpeg"})
+                except Exception as e:
+                    print(f"History request failed: {type(e).__name__}")
+                    _send_json_line(sock, {"action": "history" if action == "history_request" else action, "with": other,
+                                           "request_id": request_id, "messages": [], "days": [], "has_more": False, "error": True})
 
             elif action in ("file_rerequest", "file_rerequest_result"):
                 # "Get again": relay a request for a previously transferred file (or the answer) between two users.
