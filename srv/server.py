@@ -2239,10 +2239,14 @@ def _run_bot_reply(sender_sock, sender_user, to_user, text):
             "to": sender_user,
             "time": datetime.datetime.now().isoformat(),
             "msg": display_chunk,
+            "id": uuid.uuid4().hex,
         }
         if tts_payload:
             payload.update(tts_payload)
-        if not _send_bot_event(sender_sock, sender_user, payload):
+        sent = _send_bot_event(sender_sock, sender_user, payload)
+        # Keep bot replies in the DM history too, so the chat record isn't one-sided.
+        _record_direct_message_history(to_user, sender_user, display_chunk, handled_by_bot=True, delivered=sent, msg_uid=payload["id"])
+        if not sent:
             break
         delivered = True
         if total > 1:
@@ -5480,6 +5484,16 @@ def handle_client(cs, addr):
                 if not msg.get("time"):
                     msg["time"] = datetime.datetime.now().isoformat()  # older clients drop messages without a time
                 client_msg_id = str(msg.pop("client_id", "") or "")[:80]
+                # Contact names may differ in case from the account name; route to the real account.
+                if msg.get("to") and msg["to"] not in clients:
+                    try:
+                        _con = sqlite3.connect(DB)
+                        _row = _con.execute("SELECT username FROM users WHERE username=? COLLATE NOCASE LIMIT 1", (str(msg["to"]),)).fetchone()
+                        _con.close()
+                        if _row:
+                            msg["to"] = _row[0]
+                    except Exception:
+                        pass
                 msg["id"] = uuid.uuid4().hex  # server-assigned, used for edit/delete-for-everyone
                 to, frm = msg["to"], user
                 message_text = str(msg.get("msg", "") or "")
