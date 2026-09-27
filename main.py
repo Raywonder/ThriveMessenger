@@ -7463,28 +7463,86 @@ class EmojiPickerDialog(wx.Dialog):
             self.selected = self.items[idx][0]
             self.EndModal(wx.ID_OK)
 
+class _MciAudio(object):
+    """Windows MCI playback (winmm): plays MP3/WAV with pause and seek, no window or media framework needed."""
+    _counter = 0
+    def __init__(self):
+        import ctypes
+        self._send = ctypes.windll.winmm.mciSendStringW
+        self._buf = ctypes.create_unicode_buffer(256)
+        _MciAudio._counter += 1
+        self.alias = f"thrivevoice{_MciAudio._counter}"
+        self.open = False
+    def cmd(self, command):
+        err = self._send(command, self._buf, 255, 0)
+        return err, self._buf.value
+    def load(self, path):
+        self.close()
+        err, _ = self.cmd(f'open "{path}" type mpegvideo alias {self.alias}')
+        if err:
+            err, _ = self.cmd(f'open "{path}" alias {self.alias}')
+        if err:
+            return False
+        self.open = True
+        self.cmd(f"set {self.alias} time format milliseconds")
+        return True
+    def length(self):
+        err, val = self.cmd(f"status {self.alias} length")
+        return int(val) if not err and val.isdigit() else 0
+    def position(self):
+        err, val = self.cmd(f"status {self.alias} position")
+        return int(val) if not err and val.isdigit() else 0
+    def mode(self):
+        err, val = self.cmd(f"status {self.alias} mode")
+        return val if not err else "stopped"
+    def play(self):
+        return self.cmd(f"play {self.alias}")[0] == 0
+    def pause(self):
+        self.cmd(f"pause {self.alias}")
+    def resume(self):
+        self.cmd(f"resume {self.alias}")
+    def seek(self, ms, playing):
+        self.cmd(f"seek {self.alias} to {int(ms)}")
+        if playing:
+            self.cmd(f"play {self.alias}")
+    def close(self):
+        if self.open:
+            self.cmd(f"close {self.alias}")
+            self.open = False
+
 class VoicePlayer(object):
-    """Plays one voice message at a time inside a chat, without dialogs or focus changes."""
+    """Plays one voice message at a time inside a chat, without dialogs or focus changes.
+    Windows uses MCI (reliable for MP3); elsewhere wx.media."""
     SKIP_MS = 5000
     def __init__(self, host):
         self.host = host
         self.ctrl = None
+        self.mci = None
         self.path = None
         self.label = ""
         self.state = "stopped"
+        self._timer = None
     def _ensure(self):
+        if sys.platform == 'win32':
+            if self.mci is None:
+                try:
+                    self.mci = _MciAudio()
+                except Exception as e:
+                    print(f"MCI unavailable: {e}")
+            if self.mci is not None:
+                return self.mci
         if self.ctrl is None and wxmedia is not None:
             try:
-                self.ctrl = wxmedia.MediaCtrl(self.host, size=(1, 1), style=wx.SIMPLE_BORDER)
+                self.ctrl = wxmedia.MediaCtrl(self.host, size=(1, 1))
                 self.ctrl.Hide()
                 self.ctrl.Bind(wxmedia.EVT_MEDIA_LOADED, self._on_loaded)
-                self.ctrl.Bind(wxmedia.EVT_MEDIA_FINISHED, self._on_finished)
+                self.ctrl.Bind(wxmedia.EVT_MEDIA_FINISHED, lambda e: self._finished())
             except Exception as e:
                 print(f"Voice player unavailable: {e}")
                 self.ctrl = None
         return self.ctrl
     def toggle(self, path, label):
-        if self.path == path and self.state in ("playing", "paused"):
+        if self.path == path and self.state in ("playing", "paused", "loading"):
             self.stop()
             return
         self.play(path, label)
@@ -7492,42 +7550,86 @@ class VoicePlayer(object):
         if not path or not os.path.isfile(path):
             speak_text("This voice message isn't on this device any more.", interrupt=True)
             return
-        ctrl = self._ensure()
+        engine = self._ensure()
+        if self.state != "stopped":
+            self.stop(announce=False)
         self.path, self.label = path, label
-        if ctrl is None:
-            open_path_or_url(path)  # no media engine: fall back to the system player
+        if engine is None:
+            open_path_or_url(path)  # no audio engine: fall back to the system player
+            return
+        if engine is self.mci:
+            if not self.mci.load(path) or not self.mci.play():
+                speak_text("Couldn't play this voice message.", interrupt=True)
+                return
+            self.state = "playing"
+            speak_text(f"Playing {label}", interrupt=True)
+            self._start_watch()
             return
         self.state = "loading"
-        if not ctrl.Load(path):
+        if not self.ctrl.Load(path):
             self.state = "stopped"
             speak_text("Couldn't play this voice message.", interrupt=True)
+    def _start_watch(self):
+        if self._timer is None:
+            self._timer = wx.Timer()
+            self._timer.Bind(wx.EVT_TIMER, self._on_watch)
+        self._timer.Start(300)
+    def _on_watch(self, _):
+        if self.mci and self.state == "playing" and self.mci.mode() == "stopped":
+            self._finished()
     def _on_loaded(self, _):
         if self.state == "loading" and self.ctrl:
             self.ctrl.Play()
             self.state = "playing"
             speak_text(f"Playing {self.label}", interrupt=True)
-    def _on_finished(self, _):
+    def _finished(self):
+        if self._timer:
+            self._timer.Stop()
         if self.state != "stopped":
             self.state = "stopped"
+            if self.mci:
+                self.mci.close()
             speak_text("Finished", interrupt=False)
     def pause_resume(self):
-        if not self.ctrl or self.state not in ("playing", "paused"):
+        if self.state not in ("playing", "paused"):
+            return False
+        if self.mci and self.mci.open:
+            if self.state == "playing":
+                self.mci.pause(); self.state = "paused"; speak_text("Paused", interrupt=True)
+            else:
+                self.mci.resume(); self.state = "playing"; speak_text("Playing", interrupt=True)
+            return True
+        if not self.ctrl:
             return False
         if self.state == "playing":
             self.ctrl.Pause(); self.state = "paused"; speak_text("Paused", interrupt=True)
         else:
             self.ctrl.Play(); self.state = "playing"; speak_text("Playing", interrupt=True)
         return True
-    def stop(self):
-        if self.ctrl and self.state != "stopped":
+    def stop(self, announce=True):
+        if self._timer:
+            self._timer.Stop()
+        was = self.state
+        self.state = "stopped"
+        if self.mci and self.mci.open:
+            self.mci.cmd(f"stop {self.mci.alias}")
+            self.mci.close()
+        elif self.ctrl:
             self.ctrl.Stop()
-            self.state = "stopped"
+        if announce and was != "stopped":
             speak_text("Stopped", interrupt=True)
     def seek(self, delta_ms):
-        if not self.ctrl or self.state not in ("playing", "paused"):
+        if self.state not in ("playing", "paused"):
             return False
-        pos = max(0, min(self.ctrl.Tell() + delta_ms, max(0, self.ctrl.Length() - 100)))
-        self.ctrl.Seek(pos)
+        if self.mci and self.mci.open:
+            length = self.mci.length()
+            pos = max(0, min(self.mci.position() + delta_ms, max(0, length - 150)))
+            self.mci.seek(pos, playing=(self.state == "playing"))
+        elif self.ctrl:
+            pos = max(0, min(self.ctrl.Tell() + delta_ms, max(0, self.ctrl.Length() - 100)))
+            self.ctrl.Seek(pos)
+        else:
+            return False
         speak_text(format_seconds(pos / 1000.0), interrupt=True)
         return True
 
