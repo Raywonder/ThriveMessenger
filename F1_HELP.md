@@ -33,12 +33,18 @@
 ## Inside a Conversation
 Each conversation has three tabs:
 - **Messages**: the live chat.
-- **Chat Archive** (formerly "Saved Messages"): the messages you chose to save, grouped by year, month and day. Choose newest or oldest first. Press Enter on a day to read it in a read-only text box. Escape goes back to the list of days.
-  - To save a message, press Control+S on it, or use **Save to Chat Archive** in its context menu. If chat history saving is on for a contact, whole days are saved automatically.
+- **Chat Archive** (formerly "Saved Messages"): every day of this conversation, from the server's history plus anything saved on this device, grouped by year, month and day. Choose newest or oldest first. Press Enter on a day to read it in a read-only text box. Escape goes back to the list of days. Control+S on a message also saves it on this device.
 - **File Transfers**: every file and voice message you sent to or received from this person, with name, size, date, direction and status.
   - **Open** or **Show in Folder** works when the file is still on this device.
   - If it isn't, **Get Again** asks the other person's app for it. If they still have it, it comes back to you automatically. If not, it is marked **No longer available**.
   - The Show list filters to Voice messages or Voicemail.
+
+## Message History
+- When you open a chat, on any device and even after restarting Thrive, the last 200 messages are already there, in order and without duplicates. That includes Clawdia's and other bots' replies.
+- Messages you send from one device also show up on your other signed-in devices.
+- To see older messages, press **Load earlier messages** above the message list, or press Up Arrow on the first message. For a whole day at a time, use the Chat Archive tab.
+- Opening a chat puts you in the message box, with the newest message selected. The backlog isn't read out.
+- If you'd rather start with an empty chat each time, turn on **Start chats fresh each time** in Settings, General tab, Chat Behavior. Nothing is deleted, and older messages stay in the Chat Archive.
 
 ## Chat Links
 - Links in chat messages are clickable.

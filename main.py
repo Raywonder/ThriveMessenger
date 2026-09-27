@@ -443,6 +443,7 @@ def load_user_config():
         'escape_main_action': 'none',
         'double_escape_to_close_chat': True,
         'chat_tabs': True,
+        'start_chats_fresh': False,
         'keep_contact_list_open': True,
         'save_chat_history_default': False,
         'message_edit_window_seconds': 300,
@@ -508,6 +509,7 @@ def load_user_config():
     settings['double_escape_to_close_chat'] = bool(settings.get('double_escape_to_close_chat', True))
     settings['delete_messages_for_everyone'] = bool(settings.get('delete_messages_for_everyone', True))
     settings['chat_tabs'] = bool(settings.get('chat_tabs', True))
+    settings['start_chats_fresh'] = bool(settings.get('start_chats_fresh', False))
     settings['keep_contact_list_open'] = bool(settings.get('keep_contact_list_open', True))
     settings['delete_attached_files_with_message'] = bool(settings.get('delete_attached_files_with_message', False))
     settings['interrupt_speech'] = bool(settings.get('interrupt_speech', True))
@@ -1894,6 +1896,9 @@ class SettingsDialog(wx.Dialog):
         self.chat_tabs_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Open chats in tabs in one chat window")
         self.chat_tabs_cb.SetValue(bool(self.config.get('chat_tabs', True)))
         self.chat_tabs_cb.SetToolTip("Each conversation is a tab in one Chats window. Ctrl+Tab switches, Ctrl+W closes a tab. Applies to chats opened after saving.")
+        self.start_fresh_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Start chats fresh each time")
+        self.start_fresh_cb.SetValue(bool(self.config.get('start_chats_fresh', False)))
+        self.start_fresh_cb.SetToolTip("Open chats empty instead of showing recent messages. Nothing is deleted; older messages stay in the Chat Archive tab.")
         self.keep_contact_list_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Keep the contact list open when a chat opens")
         self.keep_contact_list_cb.SetValue(bool(self.config.get('keep_contact_list_open', True)))
         self.keep_contact_list_cb.SetToolTip("Chat windows get their own taskbar and Alt+Tab entry, so the contact list stays available. Ctrl+0 in a chat returns to it.")
@@ -2041,6 +2046,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.double_escape_chat_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.chat_tabs_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.keep_contact_list_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.start_fresh_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.delete_for_everyone_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.delete_attached_files_cb, 0, wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -2111,7 +2117,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -2845,6 +2851,8 @@ class ClientApp(wx.App):
         except Exception:
             pass
         wx.CallLater(800, self._flush_outbox)
+        if getattr(self, 'frame', None):
+            wx.CallLater(1200, self.frame.refresh_open_histories)
 
     def _start_reconnect_loop(self):
         if self.intentional_disconnect or self.reconnect_in_progress:
@@ -3187,6 +3195,9 @@ class ClientApp(wx.App):
                         if "is_admin" in msg:
                             wx.CallAfter(setattr, self.frame, "am_admin", bool(msg.get("is_admin")))
                     elif act == "msg_sent": wx.CallAfter(self.frame.on_message_sent_ack, msg)
+                    elif act == "history": wx.CallAfter(self.frame.on_history, msg)
+                    elif act == "history_days": wx.CallAfter(self.frame.on_history_days, msg)
+                    elif act == "voice_data": wx.CallAfter(self.frame.on_voice_data, msg)
                     elif act == "voicemail_saved": wx.CallAfter(self.frame.on_voicemail_saved, msg)
                     elif act in ("msg_edited", "msg_deleted"): wx.CallAfter(self.frame.on_message_changed, msg)
                     elif act in ("msg_edit_result", "msg_delete_result"): wx.CallAfter(self.frame.on_message_change_result, msg)
@@ -5443,6 +5454,7 @@ class MainFrame(wx.Frame):
         app.user_config['delete_messages_for_everyone'] = dlg.delete_for_everyone_cb.IsChecked()
         app.user_config['chat_tabs'] = dlg.chat_tabs_cb.IsChecked()
         app.user_config['keep_contact_list_open'] = dlg.keep_contact_list_cb.IsChecked()
+        app.user_config['start_chats_fresh'] = dlg.start_fresh_cb.IsChecked()
         app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
         edit_window, undo_window = dlg.message_policy()
         app.user_config['message_edit_window_seconds'] = edit_window
@@ -6397,8 +6409,11 @@ class MainFrame(wx.Frame):
         if not sender:
             return
         text = str(msg.get("msg", "") or "")
+        if sender.lower() == str(self.user or "").lower():
+            self._receive_own_echo(msg, text)
+            return
         # Some senders (relays, CLI tools) omit "time"; use the local receive time instead of dropping the message.
-        ts = msg.get("time") or datetime.datetime.now().isoformat()
+        ts = msg.get("server_time") or msg.get("time") or datetime.datetime.now().isoformat()
         if parse_timestamp_value(ts) is None:
             ts = datetime.datetime.now().isoformat()
         is_logging_enabled = is_chat_logging_enabled(app.user_config, sender)
@@ -6472,6 +6487,27 @@ class MainFrame(wx.Frame):
             sender_label = self.format_user_label(sender)
             speak_text(f"{sender_label} says {text}")
     am_admin = False
+    def on_history(self, msg):
+        chat = self.get_chat(msg.get("with"))
+        if not chat:
+            return
+        if msg.get("day"):
+            chat.archive_page.on_server_day(msg)
+        else:
+            chat.apply_history(msg)
+    def on_history_days(self, msg):
+        chat = self.get_chat(msg.get("with"))
+        if chat and getattr(chat, "archive_page", None):
+            chat.archive_page.on_server_days(msg.get("days") or [])
+    def on_voice_data(self, msg):
+        for chat in self.all_chats():
+            chat.on_voice_data(msg)
+    def refresh_open_histories(self):
+        """After a reconnect, fill in anything that arrived while we were away (merged, no duplicates)."""
+        for chat in self.all_chats():
+            if chat._hist_state.get("loaded"):
+                chat._hist_state["pending"] = False
+                chat.request_history()
     def _chat_for_message_event(self, msg):
         me = str(self.user or "").lower()
         frm = str(msg.get("from") or "")
@@ -6517,6 +6553,22 @@ class MainFrame(wx.Frame):
         if not hasattr(self, "_typing_state_by_user"):
             self._typing_state_by_user = {}
         return self._typing_state_by_user
+    def _receive_own_echo(self, msg, text):
+        """A message this user sent from another device: show it in that chat as theirs, quietly."""
+        other = str(msg.get("to") or "")
+        if not other:
+            return
+        dlg = self.get_chat(other)
+        if not dlg:
+            app = wx.GetApp()
+            dlg = ChatDialog(self, other, self.sock, self.user, is_chat_logging_enabled(app.user_config, other),
+                             is_contact=other in self.contact_states, can_call=self.can_use_voice_call(),
+                             show_call=self.is_voice_call_visible())
+        msg_id = str(msg.get("id") or "") or None
+        if msg_id and msg_id in dlg._known_ids:
+            return
+        ts = msg.get("server_time") or msg.get("time") or datetime.datetime.now().isoformat()
+        dlg.append(text, self.user, ts, announce=False, msg_id=msg_id)
     def on_typing_event(self, msg):
         from_user = str(msg.get("from") or "").strip()
         if not from_user:
@@ -6658,13 +6710,35 @@ class MainFrame(wx.Frame):
 
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
 def parse_timestamp_value(ts):
+    dt = _parse_timestamp_raw(ts)
+    if dt is not None and dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)  # server history is UTC; show local time
+    return dt
+
+def timestamp_epoch(ts):
+    """Seconds since the epoch for ordering rows from different sources (naive values are local time)."""
+    raw = _parse_timestamp_raw(ts)
+    if raw is None:
+        return time.time()
+    try:
+        return raw.timestamp()
+    except Exception:
+        return time.time()
+
+def local_utc_offset_minutes():
+    return int(round((datetime.datetime.now() - datetime.datetime.utcnow()).total_seconds() / 60.0))
+
+def _parse_timestamp_raw(ts):
     try:
         if isinstance(ts, (int, float)):
             return datetime.datetime.fromtimestamp(ts)
         try:
             return datetime.datetime.fromtimestamp(float(ts))
         except (ValueError, TypeError):
-            return datetime.datetime.fromisoformat(str(ts))
+            text = str(ts)
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            return datetime.datetime.fromisoformat(text)
     except (ValueError, TypeError, OSError):
         return None
 
@@ -8022,7 +8096,8 @@ class VoiceRecordedDialog(wx.Dialog):
         send.SetFocus()
 
 class ChatArchivePanel(wx.Panel):
-    """Chat Archive tab: saved days grouped by year and month; opening a day shows it as read-only text."""
+    """Chat Archive tab: every day of this conversation (from the server's history, plus anything saved on this
+    device), grouped by year and month; opening a day shows it as read-only text."""
     def __init__(self, parent, chat):
         super().__init__(parent)
         self.chat = chat
@@ -8035,7 +8110,7 @@ class ChatArchivePanel(wx.Panel):
         self.sort_choice.Bind(wx.EVT_CHOICE, lambda e: self.refresh())
         row.Add(self.sort_choice, 0)
         s.Add(row, 0, wx.ALL, 6)
-        s.Add(wx.StaticText(self, label="Saved &days (year, month, day). Press Enter to read a day:"), 0, wx.LEFT | wx.RIGHT, 6)
+        s.Add(wx.StaticText(self, label="&Days with messages (year, month, day). Press Enter to read a day:"), 0, wx.LEFT | wx.RIGHT, 6)
         self.tree = wx.TreeCtrl(self, style=wx.TR_DEFAULT_STYLE | wx.TR_HIDE_ROOT | wx.TR_SINGLE, name="Saved days")
         self.tree.Bind(wx.EVT_TREE_SEL_CHANGED, self.on_select)
         self.tree.Bind(wx.EVT_TREE_ITEM_ACTIVATED, self.on_activate)
@@ -8045,77 +8120,114 @@ class ChatArchivePanel(wx.Panel):
         self.view.Bind(wx.EVT_KEY_DOWN, self.on_view_key)
         s.Add(self.view, 1, wx.EXPAND | wx.ALL, 6)
         self.SetSizer(s)
+        self._local, self._server, self._pending_day = {}, {}, None
     def focus_default(self):
         self.tree.SetFocus()
-    def _days(self):
+    def _local_days(self):
         log_dir = self.chat._contact_log_dir()
-        out = []
+        out = {}
         if os.path.isdir(log_dir):
             for name in os.listdir(log_dir):
                 base, ext = os.path.splitext(name)
                 if ext.lower() != ".txt":
                     continue
                 try:
-                    day = datetime.date.fromisoformat(base)
+                    datetime.date.fromisoformat(base)
                 except Exception:
                     continue
-                path = os.path.join(log_dir, name)
-                try:
-                    with open(path, encoding="utf-8", errors="replace") as fh:
-                        count = sum(1 for line in fh if line.strip())
-                except Exception:
-                    count = 0
-                out.append((day, path, count))
-        out.sort(key=lambda t: t[0], reverse=(self.sort_choice.GetSelection() == 0))
+                out[base] = os.path.join(log_dir, name)
         return out
     def refresh(self):
+        self._local = self._local_days()
+        if not hasattr(self, "_server"):
+            self._server = {}
+        if not self.chat.is_remote_directory_chat:
+            try:
+                self.chat.sock.sendall((json.dumps({"action": "history_days", "with": self.chat.contact,
+                                                    "tz_offset": local_utc_offset_minutes()}) + "\n").encode())
+            except Exception:
+                pass
+        self._rebuild()
+    def on_server_days(self, days):
+        self._server = {d["day"]: int(d.get("count") or 0) for d in days if d.get("day")}
+        self._rebuild()
+    def _rebuild(self):
+        keep = self._selected_day()
         self.tree.DeleteAllItems()
         root = self.tree.AddRoot("Chat Archive")
-        days = self._days()
-        if not days:
-            self.tree.AppendItem(root, "No saved messages yet")
-            self.view.SetValue("Nothing is saved for this conversation yet. Use Save to Chat Archive on a message, "
-                               "or turn on chat history saving for this contact, and saved days will appear here.")
+        all_days = sorted(set(self._local) | set(getattr(self, "_server", {})), reverse=(self.sort_choice.GetSelection() == 0))
+        if not all_days:
+            self.tree.AppendItem(root, "No messages yet")
+            self.view.SetValue("Nothing in the Chat Archive for this conversation yet.")
             return
-        years, months = {}, {}
-        first_day = None
-        for day, path, count in days:
-            y = years.get(day.year)
-            if y is None:
-                y = years[day.year] = self.tree.AppendItem(root, str(day.year))
-            key = (day.year, day.month)
-            m = months.get(key)
-            if m is None:
-                m = months[key] = self.tree.AppendItem(y, day.strftime("%B %Y"))
-            label = f"{day.strftime('%A')}, {day.strftime('%B')} {get_day_with_suffix(day.day)} ({count} message{'s' if count != 1 else ''})"
-            item = self.tree.AppendItem(m, label)
-            self.tree.SetItemData(item, path)
-            if first_day is None:
-                first_day = item
-        if first_day is not None:
-            self.tree.EnsureVisible(first_day)
-            self.tree.SelectItem(first_day)
-    def _path_for(self, item):
+        years, months, first, target = {}, {}, None, None
+        for key in all_days:
+            day = datetime.date.fromisoformat(key)
+            y = years.get(day.year) or years.setdefault(day.year, self.tree.AppendItem(root, str(day.year)))
+            m = months.get((day.year, day.month)) or months.setdefault((day.year, day.month), self.tree.AppendItem(y, day.strftime("%B %Y")))
+            count = self._server.get(key, 0)
+            extra = f" ({count} message{'s' if count != 1 else ''})" if count else " (saved on this device)"
+            item = self.tree.AppendItem(m, f"{day.strftime('%A')}, {day.strftime('%B')} {get_day_with_suffix(day.day)}{extra}")
+            self.tree.SetItemData(item, key)
+            first = first or item
+            if key == keep:
+                target = item
+        target = target or first
+        if target is not None:
+            self.tree.EnsureVisible(target)
+            self.tree.SelectItem(target)
+    def _selected_day(self):
+        item = self.tree.GetSelection() if self.tree.GetCount() else None
         if not item or not item.IsOk():
             return None
-        return self.tree.GetItemData(item)
-    def _load(self, path):
+        data = self.tree.GetItemData(item)
+        return data if isinstance(data, str) else None
+    def _show_day(self, key):
+        self._pending_day = key
+        if self._server.get(key) and not self.chat.is_remote_directory_chat:
+            self.view.SetValue("Loading...")
+            try:
+                self.chat.sock.sendall((json.dumps({"action": "history_request", "with": self.chat.contact, "day": key,
+                                                    "limit": 1000, "tz_offset": local_utc_offset_minutes()}) + "\n").encode())
+                return
+            except Exception:
+                pass
+        self._show_local(key)
+    def _show_local(self, key):
+        path = self._local.get(key)
+        if not path:
+            self.view.SetValue("No messages for this day.")
+            return
         try:
             with open(path, encoding="utf-8", errors="replace") as fh:
                 self.view.SetValue(fh.read())
             self.view.SetInsertionPoint(0)
         except Exception as e:
             self.view.SetValue(f"Could not open this day: {e}")
+    def on_server_day(self, msg):
+        key = msg.get("day")
+        if not key or key != getattr(self, "_pending_day", None):
+            return
+        items = msg.get("messages") or []
+        if not items:
+            self._show_local(key)
+            return
+        lines = []
+        for item in items:
+            row = self.chat._history_row(item)
+            lines.append(self.chat._row_display(row))
+        self.view.SetValue("\n".join(lines) + "\n")
+        self.view.SetInsertionPoint(0)
     def on_select(self, event):
-        path = self._path_for(event.GetItem())
-        if path:
-            self._load(path)
+        key = self._selected_day()
+        if key:
+            self._show_day(key)
         event.Skip()
     def on_activate(self, event):
         item = event.GetItem()
-        path = self._path_for(item)
-        if path:
-            self._load(path)
+        data = self.tree.GetItemData(item) if item and item.IsOk() else None
+        if isinstance(data, str):
+            self._show_day(data)
             self.view.SetFocus()
         elif self.tree.ItemHasChildren(item):
             self.tree.Toggle(item)
@@ -8286,6 +8398,11 @@ class ChatPanel(wx.Panel):
         s.Add(self.btn_add_contact, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 5)
         if self.is_contact: self.btn_add_contact.Hide()
         self.logging_enabled = bool(logging_enabled)
+        self.btn_earlier = wx.Button(mp, label="Load &earlier messages")
+        self.btn_earlier.SetToolTip("Show the next older messages above. Up arrow on the first message does the same.")
+        self.btn_earlier.Bind(wx.EVT_BUTTON, lambda e: self.load_earlier())
+        self.btn_earlier.Hide()
+        s.Add(self.btn_earlier, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
         self.hist = wx.ListBox(mp, style=wx.LB_SINGLE, name="Messages")
         self._history_rows = []
         self.hist.Bind(wx.EVT_LISTBOX_DCLICK, self.on_history_item_activated)
@@ -8346,6 +8463,10 @@ class ChatPanel(wx.Panel):
         outer.Add(self.inner, 1, wx.EXPAND)
         self.SetSizer(outer)
         self.apply_call_permissions(self._can_call, self._show_call)
+        self._known_ids = set()
+        self._hist_state = {"loaded": False, "has_more": False, "pending": False}
+        if not self.is_remote_directory_chat and not bool(wx.GetApp().user_config.get('start_chats_fresh', False)):
+            wx.CallAfter(self.request_history)
         self._focus_input()
     def apply_call_permissions(self, can_call, show_call):
         self._can_call = bool(can_call)
@@ -8700,9 +8821,10 @@ class ChatPanel(wx.Panel):
     def append(self, text, sender, ts, is_error=False, announce=True, msg_id=None, client_id=None, files=None, voice=None):
         display, formatted_time = self._build_message_display(text, sender, ts, is_error=is_error)
         self.hist.Append(display)
-        row = {"sender": sender, "text": text, "time": ts, "error": is_error}
+        row = {"sender": sender, "text": text, "time": ts, "error": is_error, "epoch": timestamp_epoch(ts)}
         if msg_id:
             row["id"] = msg_id
+            self._known_ids.add(msg_id)
         if client_id:
             row["client_id"] = client_id
         if files:
@@ -8818,6 +8940,9 @@ class ChatPanel(wx.Panel):
         return f"{kind} from {who}, {format_seconds(v.get('duration', 0))}"
     def _play_voice_row(self, row, toggle=False):
         path = (row.get("voice") or {}).get("path")
+        if not path or not os.path.isfile(path):
+            self.fetch_voice(row)
+            return
         if toggle:
             self.voice_player.toggle(path, self._voice_label(row))
         else:
@@ -8952,12 +9077,7 @@ class ChatPanel(wx.Panel):
         return None
     def _refresh_row_display(self, idx):
         row = self._history_rows[idx]
-        text = row.get("text", "")
-        if row.get("edited"):
-            text = f"{text} (edited)"
-        if row.get("queued"):
-            text = f"{text} (not sent yet, will send when reconnected)"
-        display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
+        display = self._row_display(row)
         selected = self.hist.GetSelection()
         self.hist.SetString(idx, display)
         if selected != wx.NOT_FOUND:
@@ -8971,10 +9091,116 @@ class ChatPanel(wx.Panel):
     def set_row_message_id(self, client_id, msg_id):
         if not client_id or not msg_id:
             return
+        self._known_ids.add(msg_id)
         for r in reversed(self._history_rows):
             if r.get("client_id") == client_id:
                 r["id"] = msg_id
                 return
+    # --- server history -------------------------------------------------------------------
+    HISTORY_PAGE = 200
+    def request_history(self, before=None):
+        if self.is_remote_directory_chat or self._hist_state["pending"]:
+            return
+        payload = {"action": "history_request", "with": self.contact, "limit": self.HISTORY_PAGE,
+                   "tz_offset": local_utc_offset_minutes(), "request_id": uuid.uuid4().hex}
+        if before:
+            payload["before"] = before
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self._hist_state["pending"] = True
+        except Exception:
+            pass
+    def load_earlier(self):
+        seqs = [r.get("seq") for r in self._history_rows if r.get("seq")]
+        if not self._hist_state["has_more"] or not seqs:
+            speak_text("No earlier messages", interrupt=True)
+            return
+        self.request_history(before=min(seqs))
+    def _history_row(self, item):
+        me = str(self.user or "").lower()
+        sender = self.user if str(item.get("from", "")).lower() == me else item.get("from", "")
+        row = {"sender": sender, "text": item.get("msg", ""), "time": item.get("time"), "error": False,
+               "epoch": timestamp_epoch(item.get("time")), "id": item.get("id"), "seq": item.get("seq")}
+        if item.get("edited"):
+            row["edited"] = True
+        v = item.get("voice")
+        if isinstance(v, dict):
+            cached = os.path.join(voice_cache_dir(), f"{re.sub(r'[^A-Za-z0-9_-]', '', str(item.get('id')))}.mp3")
+            row["voice"] = {"path": cached if os.path.isfile(cached) else "", "duration": float(v.get("duration") or 0),
+                            "voicemail": bool(v.get("voicemail")), "server_id": item.get("id"), "stored": bool(v.get("stored"))}
+            if os.path.isfile(cached):
+                row["files"] = [cached]
+        return row
+    def _row_display(self, row):
+        text = row.get("text", "")
+        if row.get("edited"):
+            text = f"{text} (edited)"
+        if row.get("queued"):
+            text = f"{text} (not sent yet, will send when reconnected)"
+        display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
+        return display
+    def apply_history(self, msg):
+        """Merge server history in time order, skipping anything already shown (no duplicates)."""
+        self._hist_state["pending"] = False
+        items = [i for i in (msg.get("messages") or []) if i.get("id") not in self._known_ids]
+        earlier = bool(msg.get("before"))
+        if not earlier or not self._hist_state["loaded"]:
+            self._hist_state["has_more"] = bool(msg.get("has_more"))
+        elif earlier:
+            self._hist_state["has_more"] = bool(msg.get("has_more"))
+        self._hist_state["loaded"] = True
+        self.btn_earlier.Show(self._hist_state["has_more"]); self.msg_page.Layout()
+        if not items:
+            if earlier:
+                speak_text("No earlier messages", interrupt=True)
+            return
+        sel = self.hist.GetSelection()
+        was_at_end = sel == wx.NOT_FOUND or sel >= self.hist.GetCount() - 1
+        selected_row = self._history_rows[sel] if 0 <= sel < len(self._history_rows) else None
+        inserted = 0
+        for item in items:
+            row = self._history_row(item)
+            pos = len(self._history_rows)
+            while pos > 0 and self._history_rows[pos - 1].get("epoch", 0) > row["epoch"]:
+                pos -= 1
+            self._history_rows.insert(pos, row)
+            self.hist.Insert(self._row_display(row), pos)
+            self._known_ids.add(row["id"])
+            inserted += 1
+        if earlier:
+            # Land on the newest of the older messages, so Up keeps going back in time.
+            self.hist.SetSelection(max(0, inserted - 1))
+            speak_text(f"Loaded {inserted} earlier message{'s' if inserted != 1 else ''}", interrupt=True)
+        elif was_at_end and self.hist.GetCount():
+            self.hist.SetSelection(self.hist.GetCount() - 1)
+        elif selected_row in self._history_rows:
+            self.hist.SetSelection(self._history_rows.index(selected_row))
+    def fetch_voice(self, row):
+        v = row.get("voice") or {}
+        if not v.get("server_id") or not v.get("stored"):
+            speak_text("This voice message isn't available any more.", interrupt=True)
+            return
+        self._pending_voice_row = row
+        try:
+            self.sock.sendall((json.dumps({"action": "voice_fetch", "id": v["server_id"]}) + "\n").encode())
+            speak_text("Getting the voice message", interrupt=True)
+        except Exception:
+            pass
+    def on_voice_data(self, msg):
+        row = getattr(self, "_pending_voice_row", None)
+        if not row or (row.get("voice") or {}).get("server_id") != msg.get("id"):
+            return
+        self._pending_voice_row = None
+        if not msg.get("ok") or not msg.get("b64"):
+            speak_text("This voice message isn't available any more.", interrupt=True)
+            return
+        os.makedirs(voice_cache_dir(), exist_ok=True)
+        path = os.path.join(voice_cache_dir(), f"{re.sub(r'[^A-Za-z0-9_-]', '', str(msg.get('id')))}.mp3")
+        with open(path, "wb") as fh:
+            fh.write(base64.b64decode(msg["b64"]))
+        row["voice"]["path"] = path
+        row["files"] = [path]
+        self._play_voice_row(row)
     def apply_remote_edit(self, msg_id, text):
         idx = self._row_index_for_id(msg_id)
         if idx is None:
@@ -9105,6 +9331,10 @@ class ChatPanel(wx.Panel):
     def on_history_key(self, event):
         if event.GetKeyCode() in (ord('C'), ord('c')) and event.ControlDown() and not event.AltDown() and not event.ShiftDown():
             self.on_copy_selected_message()
+            return
+        if event.GetKeyCode() in (wx.WXK_UP, wx.WXK_PAGEUP) and not event.HasAnyModifiers() \
+                and self.hist.GetSelection() == 0 and self._hist_state.get("has_more"):
+            self.load_earlier()
             return
         voice_row = self._selected_voice_row()
         if voice_row and not event.HasAnyModifiers():
