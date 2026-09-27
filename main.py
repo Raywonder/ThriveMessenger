@@ -17,7 +17,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.14"
+VERSION_TAG = "v2026-alpha15.15"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -1579,8 +1579,8 @@ def apply_installer_update(installer_path):
     batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
     with open(batch_path, 'w') as f:
         f.write(f'@echo off\r\n')
+        # The installer (15.15+) upgrades in place in C:\Program Files, removes any other copy, and relaunches Thrive itself.
         f.write(f'start /wait "" "{installer_path}" /VERYSILENT /CLOSEAPPLICATIONS /NORESTART\r\n')
-        f.write(f'start "" "{exe_path}"\r\n')
         f.write(f'del "{installer_path}"\r\n')
         f.write(f'del "%~f0"\r\n')
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
@@ -1616,9 +1616,13 @@ def build_windows_zip_update_batch(zip_path, program_dir, exe_path, pid, temp_ex
 
 def apply_zip_update(zip_path):
     if sys.platform == 'darwin':
-        target_app = get_macos_app_bundle_path()
-        if not target_app:
+        running_app = get_macos_app_bundle_path()
+        if not running_app:
             raise RuntimeError("Could not determine installed app bundle path for macOS update.")
+        # One copy only: always /Applications (or ~/Applications if /Applications isn't writable).
+        target_app = "/Applications/Thrive Messenger.app"
+        if not os.access("/Applications", os.W_OK):
+            target_app = os.path.expanduser("~/Applications/Thrive Messenger.app")
         pid = os.getpid()
         temp_extract = os.path.join(tempfile.gettempdir(), 'thrive_update_extract')
         script_path = os.path.join(tempfile.gettempdir(), 'thrive_update.sh')
@@ -1637,8 +1641,16 @@ def apply_zip_update(zip_path):
             f.write("/usr/bin/ditto -x -k \"$ZIP\" \"$TEMP_EXTRACT\"\n")
             f.write("NEW_APP=$(/usr/bin/find \"$TEMP_EXTRACT\" -maxdepth 4 -type d -name '*.app' | /usr/bin/head -n 1)\n")
             f.write("if [ -z \"$NEW_APP\" ]; then exit 1; fi\n")
+            f.write("/bin/mkdir -p \"$TARGET_PARENT\"\n")
             f.write("/bin/rm -rf \"$TARGET_APP\"\n")
             f.write("/usr/bin/ditto \"$NEW_APP\" \"$TARGET_APP\"\n")
+            # Other copies (the one that was running from elsewhere, ~/Applications, Downloads, Desktop) go to the Trash.
+            others = [running_app, "/Applications/Thrive Messenger.app", os.path.expanduser("~/Applications/Thrive Messenger.app"),
+                      os.path.expanduser("~/Downloads/Thrive Messenger.app"), os.path.expanduser("~/Desktop/Thrive Messenger.app")]
+            for other in dict.fromkeys(others):
+                if os.path.realpath(other) == os.path.realpath(target_app):
+                    continue
+                f.write(f"if [ -d '{other}' ]; then /bin/mv '{other}' \"$HOME/.Trash/Thrive Messenger old $(date +%s).app\"; fi\n")
             f.write("/bin/rm -rf \"$TEMP_EXTRACT\"\n")
             f.write("/bin/rm -f \"$ZIP\"\n")
             f.write("/usr/bin/open -a \"$TARGET_APP\"\n")

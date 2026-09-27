@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Thrive Messenger"
-#define MyAppVersion "2026 Alpha 15.14"
+#define MyAppVersion "2026 Alpha 15.15"
 #define MyAppPublisher "G4p Studios"
 #define MyAppURL "https://github.com/Raywonder/ThriveMessenger"
 #define MyAppExeName "thrive_messenger.exe"
@@ -20,6 +20,14 @@ AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
 DefaultDirName={commonpf}\Thrive\Thrive Messenger
+; Thrive is a 64-bit app: always install in 64-bit mode (C:\Program Files, 64-bit registry view).
+; Without these lines Inno runs in 32-bit mode and {commonpf} becomes Program Files (x86), which is how
+; 15.10-15.14 ended up installed next to an older 64-bit copy.
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+; Always the one standard location, even when upgrading a copy that lives somewhere else.
+UsePreviousAppDir=no
+CloseApplications=yes
 DefaultGroupName=Thrive\Thrive Messenger
 AllowNoIcons=yes
 InfoAfterFile={#SourcePath}\README.md
@@ -43,7 +51,78 @@ Source: "{#SourcePath}\dist-windows\thrive_messenger\*"; DestDir: "{app}"; Flags
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:ProgramOnTheWeb,{#MyAppName}}"; Filename: "{#MyAppURL}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Check: WantDesktopIcon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; Silent installs (the in-app updater) relaunch Thrive as the signed-in user. /NOLAUNCH skips it.
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser skipifnotsilent; Check: ShouldLaunchAfterSilent
+
+[Code]
+const
+  UninstKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{98BD1985-BB56-4AF6-8A1A-8D8D5849933D}_is1';
+
+var
+  HadDesktopIcon: Boolean;
+
+function InitializeSetup(): Boolean;
+begin
+  { Remember an existing desktop shortcut: an old copy's uninstaller removes it, and we put it back. }
+  HadDesktopIcon := FileExists(ExpandConstant('{commondesktop}\{#MyAppName}.lnk')) or
+                    FileExists(ExpandConstant('{userdesktop}\{#MyAppName}.lnk'));
+  Result := True;
+end;
+
+function WantDesktopIcon(): Boolean;
+begin
+  Result := HadDesktopIcon or WizardIsTaskSelected('desktopicon');
+end;
+
+function ShouldLaunchAfterSilent(): Boolean;
+begin
+  Result := Pos('/NOLAUNCH', UpperCase(GetCmdTail)) = 0;
+end;
+
+function SameDir(const A, B: String): Boolean;
+begin
+  Result := CompareText(RemoveBackslashUnlessRoot(A), RemoveBackslashUnlessRoot(B)) = 0;
+end;
+
+procedure RemoveCopyRegisteredIn(RootKey: Integer; const ViewName: String);
+var
+  UninstStr, Loc: String;
+  ResultCode: Integer;
+begin
+  if not RegQueryStringValue(RootKey, UninstKey, 'UninstallString', UninstStr) then
+    Exit;
+  if not RegQueryStringValue(RootKey, UninstKey, 'InstallLocation', Loc) then
+    Loc := '';
+  { The copy in our own folder is upgraded in place; any other copy (older, or other architecture) goes. }
+  if (Loc <> '') and SameDir(Loc, ExpandConstant('{app}')) then
+    Exit;
+  UninstStr := RemoveQuotes(UninstStr);
+  if not FileExists(UninstStr) then
+  begin
+    Log('Stale ' + ViewName + ' registration without an uninstaller; removing the entry: ' + Loc);
+    RegDeleteKeyIncludingSubkeys(RootKey, UninstKey);
+    Exit;
+  end;
+  Log('Removing the other Thrive copy registered in the ' + ViewName + ' view: ' + Loc);
+  { User settings (%APPDATA%\ThriveMessenger) and saved sign-ins (Credential Manager) are not touched by the uninstaller. }
+  Exec(UninstStr, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+begin
+  if CurStep = ssInstall then
+  begin
+    { Close any running copy, wherever it was installed, so its files can be removed. }
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    RemoveCopyRegisteredIn(HKLM32, '32-bit');
+    RemoveCopyRegisteredIn(HKLM64, '64-bit');
+    RemoveCopyRegisteredIn(HKCU32, 'per-user 32-bit');
+    RemoveCopyRegisteredIn(HKCU64, 'per-user 64-bit');
+  end;
+end;
