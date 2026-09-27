@@ -684,7 +684,7 @@ def submit_logs_payload(config_dict, reason="manual"):
         method="PUT",
         headers={
             "Content-Type": "application/json",
-            "User-Agent": f"ThriveMessenger/{VERSION_TAG}",
+            "User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})",
             "X-Thrive-Client": "desktop",
         },
     )
@@ -1168,7 +1168,9 @@ def parse_github_tag(tag):
 def parse_update_feed(feed_data, local_tag, platform):
     """Normalize current and legacy update-feed keys for one client platform."""
     local = parse_github_tag(local_tag)
-    tag = str(feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
+    # A platform-specific tag (win_tag / mac_tag) wins, so a Windows-only release never re-offers the old Mac build.
+    platform_tag = feed_data.get("mac_tag") if platform == "darwin" else (feed_data.get("win_tag") if platform == "win32" else None)
+    tag = str(platform_tag or feed_data.get("tag") or feed_data.get("tag_name") or "").strip()
     remote = parse_github_tag(tag)
     if local is None or remote is None or remote <= local:
         return None
@@ -1315,7 +1317,7 @@ def get_soundpack_base_url(config_dict):
 
 def get_sound_fetch_headers():
     return {
-        "User-Agent": f"ThriveMessenger/{VERSION_TAG}",
+        "User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})",
         "X-Thrive-Client": "desktop",
         "Accept": "application/json, audio/wav, application/octet-stream, */*",
     }
@@ -1436,7 +1438,7 @@ def check_for_update(callback):
             feed_url = settings.get("feed_url")
             if feed_url:
                 try:
-                    feed_req = urllib.request.Request(feed_url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG, "Accept": "application/json"})
+                    feed_req = urllib.request.Request(feed_url, headers={"User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})", "Accept": "application/json"})
                     with urllib.request.urlopen(feed_req, timeout=15) as resp:
                         feed_data = json.loads(resp.read().decode())
                     update = parse_update_feed(feed_data, VERSION_TAG, sys.platform)
@@ -1451,7 +1453,7 @@ def check_for_update(callback):
             best = None
             for repo in settings.get("repos", []):
                 url = f"https://api.github.com/repos/{repo}/releases/latest"
-                req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
+                req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})"})
                 try:
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         data = json.loads(resp.read().decode())
@@ -1477,7 +1479,7 @@ def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
     def _download():
         import urllib.request
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "ThriveMessenger/" + VERSION_TAG})
+            req = urllib.request.Request(url, headers={"User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})"})
             with urllib.request.urlopen(req, timeout=120) as resp:
                 total = int(resp.headers.get('Content-Length', 0))
                 downloaded = 0
@@ -5588,7 +5590,7 @@ class MainFrame(wx.Frame):
             repo = UPDATE_CONTEXT.get("repo") if UPDATE_CONTEXT.get("repo") else "Raywonder/ThriveMessenger"
             api_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
             try:
-                req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "ThriveMessenger/" + VERSION_TAG})
+                req = urllib.request.Request(api_url, headers={"Accept": "application/vnd.github+json", "User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})"})
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read().decode())
             except Exception as e:
