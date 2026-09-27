@@ -25,6 +25,7 @@ if (Test-Path "assets") {
 }
 
 Copy-Item -Force "README.md" (Join-Path $AppDir "README.md")
+Copy-Item -Force "F1_HELP.md" (Join-Path $AppDir "F1_HELP.md")
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $PortableZip = Join-Path $OutputDir "thrive_messenger.zip"
