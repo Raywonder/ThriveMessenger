@@ -1647,10 +1647,10 @@ def apply_zip_update(zip_path):
             # Other copies (the one that was running from elsewhere, ~/Applications, Downloads, Desktop) go to the Trash.
             others = [running_app, "/Applications/Thrive Messenger.app", os.path.expanduser("~/Applications/Thrive Messenger.app"),
                       os.path.expanduser("~/Downloads/Thrive Messenger.app"), os.path.expanduser("~/Desktop/Thrive Messenger.app")]
-            for other in dict.fromkeys(others):
+            for n, other in enumerate(dict.fromkeys(others), start=1):
                 if os.path.realpath(other) == os.path.realpath(target_app):
                     continue
-                f.write(f"if [ -d '{other}' ]; then /bin/mv '{other}' \"$HOME/.Trash/Thrive Messenger old $(date +%s).app\"; fi\n")
+                f.write(f"if [ -d '{other}' ]; then /bin/mv '{other}' \"$HOME/.Trash/Thrive Messenger old {n} $(date +%s).app\"; fi\n")
             f.write("/bin/rm -rf \"$TEMP_EXTRACT\"\n")
             f.write("/bin/rm -f \"$ZIP\"\n")
             f.write("/usr/bin/open -a \"$TARGET_APP\"\n")
