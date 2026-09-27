@@ -5,7 +5,11 @@ import urllib.request, urllib.parse
 from email.mime.text import MIMEText
 try:
     from argon2 import PasswordHasher
-    from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+    from argon2.exceptions import VerifyMismatchError, VerificationError
+    try:
+        from argon2.exceptions import InvalidHashError
+    except ImportError:  # argon2-cffi < 23 (the last line for Python 3.6) calls it InvalidHash
+        from argon2.exceptions import InvalidHash as InvalidHashError
     _ph = PasswordHasher()
 except ImportError:
     PasswordHasher = None
@@ -3258,17 +3262,89 @@ def init_db():
     _seed_feature_defaults()
     conn.close()
 
+_PBKDF2_ITERATIONS = 390000
+
+def _hash_password(password):
+    """Hash a password for storage. argon2id when available, else salted PBKDF2-SHA256. Never plain text."""
+    password = str(password or "")
+    if _ph is not None:
+        return _ph.hash(password)
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return "$pbkdf2-sha256${}${}${}".format(
+        _PBKDF2_ITERATIONS, base64.b64encode(salt).decode("ascii"), base64.b64encode(digest).decode("ascii")
+    )
+
+def _is_password_hash(stored_password):
+    stored_password = str(stored_password or "")
+    return stored_password.startswith("$argon2") or stored_password.startswith("$pbkdf2-sha256$")
+
+def _password_needs_rehash(stored_password):
+    """True for legacy plain-text rows, PBKDF2 rows once argon2 is available, or outdated argon2 parameters."""
+    stored_password = str(stored_password or "")
+    if not _is_password_hash(stored_password):
+        return True
+    if stored_password.startswith("$pbkdf2-sha256$"):
+        return _ph is not None
+    if _ph is None:
+        return False
+    try:
+        return _ph.check_needs_rehash(stored_password)
+    except Exception:
+        return False
+
 def _verify_password_for_login(stored_password, supplied_password):
     stored_password = str(stored_password or "")
     supplied_password = str(supplied_password or "")
-    if stored_password == supplied_password:
-        return True
-    if _ph is None or not stored_password.startswith("$argon2"):
+    if not stored_password:
         return False
+    if stored_password.startswith("$argon2"):
+        if _ph is None:
+            print("WARNING: an argon2 password hash can't be checked because argon2-cffi is not installed.")
+            return False
+        try:
+            return _ph.verify(stored_password, supplied_password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False
+    if stored_password.startswith("$pbkdf2-sha256$"):
+        try:
+            _, _, iterations, salt_b64, digest_b64 = stored_password.split("$")
+            digest = hashlib.pbkdf2_hmac("sha256", supplied_password.encode("utf-8"), base64.b64decode(salt_b64), int(iterations))
+            return hmac.compare_digest(digest, base64.b64decode(digest_b64))
+        except Exception:
+            return False
+    # Legacy plain-text row (pre-migration). Constant-time compare; the caller rehashes on success.
+    return hmac.compare_digest(stored_password.encode("utf-8"), supplied_password.encode("utf-8"))
+
+def _rehash_password_if_needed(con, username, stored_password, supplied_password):
+    if not _password_needs_rehash(stored_password):
+        return False
+    con.execute("UPDATE users SET password=? WHERE username=?", (_hash_password(supplied_password), username))
+    con.commit()
+    return True
+
+def migrate_plaintext_passwords(db_path=None):
+    """Hash every stored password that isn't already hashed, in one transaction. Returns the count migrated.
+    Each new hash is verified against the old value before commit; nothing is printed except counts."""
+    con = sqlite3.connect(db_path or DB)
     try:
-        return _ph.verify(stored_password, supplied_password)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
-        return False
+        rows = con.execute("SELECT rowid, password FROM users").fetchall()
+        pending = [(rowid, pw) for rowid, pw in rows if pw is not None and not _is_password_hash(pw)]
+        if not pending:
+            return 0
+        con.execute("BEGIN")
+        for rowid, pw in pending:
+            new_hash = _hash_password(pw)
+            if not _verify_password_for_login(new_hash, pw):
+                raise RuntimeError("password hash self-check failed; migration rolled back")
+            con.execute("UPDATE users SET password=? WHERE rowid=?", (new_hash, rowid))
+        con.commit()
+        return len(pending)
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
 
 def _truthy_flag(value):
     if isinstance(value, bool):
@@ -3395,7 +3471,7 @@ def _handle_wordpress_sync(req):
             random_password = secrets.token_urlsafe(48)
             con.execute(
                 "INSERT INTO users(username, password, email, is_verified) VALUES(?,?,?,1)",
-                (canonical, random_password, email),
+                (canonical, _hash_password(random_password), email),
             )
             created = True
         con.execute(
@@ -3529,7 +3605,7 @@ def _handle_mastodon_login(req):
             random_password = secrets.token_urlsafe(48)
             con.execute(
                 "INSERT INTO users(username, password, email, is_verified) VALUES(?,?,?,1)",
-                (username, random_password, "",),
+                (username, _hash_password(random_password), "",),
             )
             for bot in _default_bot_contacts():
                 if bot != username:
@@ -3885,9 +3961,9 @@ def handle_client(cs, addr):
             code = EmailManager.generate_code() if not verified else None
             
             if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (_hash_password(new_pass), email, code, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, _hash_password(new_pass), email, code, verified))
                 for bot in _default_bot_contacts():
                     if bot != new_user:
                         con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (new_user, bot))
@@ -3967,7 +4043,7 @@ def handle_client(cs, addr):
             con = sqlite3.connect(DB)
             row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
             if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (_hash_password(new_p), t_user))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
@@ -4017,6 +4093,11 @@ def handle_client(cs, addr):
                 sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
                 db.close()
                 return
+            try:
+                # Legacy plain-text or weaker hashes are upgraded the first time the right password is used.
+                _rehash_password_if_needed(db, row[0], row[1], req.get("pass", ""))
+            except Exception as e:
+                print(f"Password rehash skipped for a user: {type(e).__name__}")
         else:
             passkey_token = str(req.get("passkey_token", "") or "").strip()
             if not passkey_token:
@@ -5787,13 +5868,9 @@ def handle_client(cs, addr):
                     stored = row[0] if row else None
                     ok = False
                     if stored:
-                        if stored.startswith("$argon2"):
-                            try: _ph.verify(stored, cur_pass); ok = True
-                            except (VerifyMismatchError, VerificationError, InvalidHashError): pass
-                        else:
-                            ok = (stored == cur_pass)
+                        ok = _verify_password_for_login(stored, cur_pass)
                     if ok:
-                        con.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(new_pass), user))
+                        con.execute("UPDATE users SET password=? WHERE username=?", (_hash_password(new_pass), user))
                         con.commit(); con.close()
                         sock.sendall((json.dumps({"action": "change_password_result", "ok": True}) + "\n").encode())
                     else:
@@ -5898,6 +5975,17 @@ def serve_loop(config):
     use_ssl = False
     
     print(f"Server Current Working Directory: {os.getcwd()}")
+    if _ph is None:
+        print("WARNING: argon2-cffi is not installed for this Python; new passwords use PBKDF2-SHA256 instead. "
+              "Install argon2-cffi (21.x for Python 3.6) for the user that runs the server.")
+    else:
+        print("Password hashing: argon2id")
+    try:
+        migrated = migrate_plaintext_passwords()
+        if migrated:
+            print(f"Hashed {migrated} stored password(s) that were not hashed yet.")
+    except Exception as e:
+        print(f"WARNING: password migration failed and was rolled back: {type(e).__name__}")
     try:
         context.load_cert_chain(certfile=config['certfile'], keyfile=config['keyfile'])
         use_ssl = True
@@ -5943,7 +6031,7 @@ def handle_create(user, password, email=""):
     con = sqlite3.connect(DB)
     existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
     if not existing:
-        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, password, email))
+        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, _hash_password(password), email))
         con.commit(); con.close()
         print(f"User '{user}' created.")
         return True

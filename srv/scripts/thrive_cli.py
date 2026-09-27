@@ -111,9 +111,12 @@ def write_agent_env(path: Path, values: Dict[str, str]) -> None:
 
 
 def hash_password(password: str) -> str:
-    if PasswordHasher is None:
-        return password
-    return PasswordHasher().hash(password)
+    """Hash for storage. Uses the server's own hasher so formats always match; never stores plain text."""
+    srv_dir = str(Path(__file__).resolve().parent.parent)
+    if srv_dir not in sys.path:
+        sys.path.insert(0, srv_dir)
+    import server as thrive_server  # noqa: WPS433 (local import keeps CLI start-up light)
+    return thrive_server._hash_password(password)
 
 
 def connect(host: str, port: int, use_ssl: bool, cafile: str = "", timeout: float = 12.0, insecure: bool = False) -> socket.socket:
