@@ -17,6 +17,7 @@ import socket
 import sqlite3
 import ssl
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -402,10 +403,35 @@ def cmd_admin_link_bot_contacts(args: argparse.Namespace) -> None:
     )
 
 
+def split_message(text: str, max_chars: int) -> List[str]:
+    """Split long text on paragraph/sentence/word boundaries, labelled for screen readers."""
+    if max_chars <= 0 or len(text) <= max_chars:
+        return [text]
+    chunks: List[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        cut = max(window.rfind(sep) for sep in ("\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " "))
+        cut = max_chars if cut < max_chars // 2 else cut + 1
+        chunk = remaining[:cut].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[cut:].lstrip()
+    if remaining.strip():
+        chunks.append(remaining.strip())
+    total = len(chunks)
+    return [f"Part {idx} of {total}: {chunk}" for idx, chunk in enumerate(chunks, start=1)]
+
+
 def cmd_send(args: argparse.Namespace) -> None:
+    message = args.message
+    if message == "-":
+        message = sys.stdin.read()
     sock = login(args)
     try:
-        send_json(sock, {"action": "msg", "from": args.username, "to": args.to, "msg": args.message})
+        for part in split_message(message, args.split_at):
+            send_json(sock, {"action": "msg", "from": args.username, "to": args.to, "msg": part, "time": datetime.now().isoformat()})
+            time.sleep(0.15)
         sock.settimeout(args.wait)
         responses = []
         try:
@@ -493,7 +519,7 @@ def _maybe_handle_voice_call_event(sock: socket.socket, event: Dict[str, Any], a
         send_json(sock, {"action": "voice_call_decline", "call_id": call_id})
     message = str(getattr(args, "call_decline_message", "") or "").strip()
     if message and caller:
-        send_json(sock, {"action": "msg", "to": caller, "from": args.username, "msg": message})
+        send_json(sock, {"action": "msg", "to": caller, "from": args.username, "msg": message, "time": datetime.now().isoformat()})
     return True
 
 
@@ -669,8 +695,9 @@ def build_parser() -> argparse.ArgumentParser:
     send = sub.add_parser("send", help="Send a direct message.")
     add_login_args(send)
     send.add_argument("--to", required=True, help="Recipient username or bot.")
-    send.add_argument("message", help="Message body.")
+    send.add_argument("message", help="Message body, or - to read it from stdin.")
     send.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for immediate server replies.")
+    send.add_argument("--split-at", type=int, default=20000, help="Split longer messages into labelled parts (0 disables).")
     send.set_defaults(func=cmd_send)
 
     send_file = sub.add_parser("send-file", help="Offer one or more files to a user and send after acceptance.")

@@ -1,4 +1,4 @@
-import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib, hmac, ipaddress
+import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, uuid, base64, time, subprocess, tempfile, glob, zipfile, hashlib, hmac, ipaddress, mimetypes
 import smtplib, secrets
 import re
 import urllib.request, urllib.parse
@@ -884,7 +884,7 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
                 to,
                 _canonical_chat_identity(frm),
                 _canonical_chat_identity(to),
-                body[:4000],
+                body[:max(4000, max_direct_message_length)],
                 str(source or "thrive")[:80],
                 _message_sensitivity(body),
                 1 if handled_by_bot else 0,
@@ -1887,9 +1887,212 @@ def _known_clawdia_reply(sender_user, bot_name, text):
         )
     return None
 
+_bot_reply_locks = {}
+_bot_reply_locks_guard = threading.Lock()
+
+def _bot_reply_lock(sender_user, bot_name):
+    key = (str(sender_user or "").lower(), str(bot_name or "").lower())
+    with _bot_reply_locks_guard:
+        return _bot_reply_locks.setdefault(key, threading.Lock())
+
+def _bot_reply_target_sock(sender_sock, sender_user):
+    """Prefer the device that sent the message; fall back to the user's current session."""
+    with lock:
+        if sender_sock in user_sessions.get(sender_user, set()):
+            return sender_sock
+        return clients.get(sender_user) or sender_sock
+
+def _send_bot_event(sender_sock, sender_user, payload):
+    target = _bot_reply_target_sock(sender_sock, sender_user)
+    try:
+        _send_json_line(target, payload)
+        return True
+    except Exception:
+        return False
+
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
+    """Answer virtual-bot DMs off the socket thread so slow agent turns never block the sender."""
     if not _is_virtual_bot(to_user):
         return False
+
+    def _worker():
+        with _bot_reply_lock(sender_user, to_user):
+            _send_bot_event(sender_sock, sender_user, {"action": "typing", "from": to_user, "typing": True})
+            try:
+                _run_bot_reply(sender_sock, sender_user, to_user, text)
+            except Exception as e:
+                print(f"Bot reply worker failed for {to_user}: {e}")
+            finally:
+                _send_bot_event(sender_sock, sender_user, {"action": "typing", "from": to_user, "typing": False})
+
+    threading.Thread(target=_worker, name=f"bot-reply-{to_user}", daemon=True).start()
+    return True
+
+def _openclaw_agent_for_bot(bot_name, sender_user):
+    """Return the OpenClaw agent id when this bot/user pair should reach the real agent."""
+    if not bot_runtime_config.get('openclaw_agent_enabled', False):
+        return ""
+    agent_map = bot_runtime_config.get('openclaw_agent_bots', {}) or {}
+    agent_id = ""
+    for name, value in agent_map.items():
+        if name.lower() == str(bot_name or "").strip().lower():
+            agent_id = value
+            break
+    if not agent_id:
+        return ""
+    # Exact Thrive usernames only: identity aliases are for continuity, not authorization.
+    allowed = bot_runtime_config.get('openclaw_agent_users', set()) or set()
+    if str(sender_user or "").strip().lower() not in allowed:
+        return ""
+    return agent_id
+
+def _openclaw_session_key(agent_id, sender_user):
+    user_key = re.sub(r"[^a-z0-9_.@+-]+", "-", str(sender_user or "").strip().lower()).strip("-") or "unknown"
+    template = str(bot_runtime_config.get('openclaw_session_key_template', '') or '') or 'agent:{agent}:thrive:direct:{user}'
+    return template.replace("{agent}", agent_id).replace("{user}", user_key)
+
+def _openclaw_media_path(ref):
+    """Resolve an agent media reference to a local file inside an approved media root."""
+    ref = str(ref or "").strip()
+    if ref.startswith("file://"):
+        ref = urllib.parse.unquote(urllib.parse.urlparse(ref).path)
+    if not ref.startswith("/"):
+        return ""
+    path = os.path.realpath(ref)
+    roots = [os.path.realpath(r) for r in bot_runtime_config.get('openclaw_media_roots', []) or []]
+    if not any(path == r or path.startswith(r.rstrip(os.sep) + os.sep) for r in roots):
+        return ""
+    return path if os.path.isfile(path) else ""
+
+def _openclaw_agent_bot_reply(sender_user, bot_name, text):
+    """Run one turn of the bot's real OpenClaw agent. Returns (text, [media paths]) or None."""
+    agent_id = _openclaw_agent_for_bot(bot_name, sender_user)
+    if not agent_id:
+        return None
+    openclaw_bin = str(bot_runtime_config.get('openclaw_bin', '') or '').strip()
+    if not openclaw_bin or not os.path.exists(openclaw_bin):
+        return None
+    timeout = max(30, int(bot_runtime_config.get('openclaw_agent_timeout', 420) or 420))
+    session_key = _openclaw_session_key(agent_id, sender_user)
+    canonical = _canonical_chat_identity(sender_user)
+    who = sender_user if canonical == sender_user else f"{sender_user} ({canonical})"
+    envelope = (
+        f"[Thrive Messenger direct message from verified Thrive account {who}. "
+        "Your final reply text is delivered to this Thrive chat automatically; media or voice you attach "
+        "is delivered there too.]\n\n"
+        + str(text or "")
+    )
+    msg_path = ""
+    try:
+        with tempfile.NamedTemporaryFile("w", prefix="thrive-openclaw-msg-", suffix=".txt", delete=False, encoding="utf-8") as fh:
+            fh.write(envelope)
+            msg_path = fh.name
+        env = os.environ.copy()
+        env.setdefault("HOME", os.path.expanduser("~"))
+        result = subprocess.run(
+            [
+                openclaw_bin, "agent",
+                "--agent", agent_id,
+                "--session-key", session_key,
+                "--message-file", msg_path,
+                "--json",
+                "--timeout", str(timeout),
+            ],
+            universal_newlines=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout + 30,
+            env=env,
+        )
+        raw = str(result.stdout or "").strip()
+        start = raw.find("{")
+        data = json.loads(raw[start:]) if start >= 0 else {}
+        if not data or data.get("ok") is False or (data.get("status") and data.get("status") != "ok"):
+            err = data.get("error") if isinstance(data, dict) else None
+            raise RuntimeError(_moderation_excerpt(json.dumps(err) if err else (result.stderr or raw or f"openclaw exited {result.returncode}"), 700))
+        payloads = (data.get("result") or {}).get("payloads") or []
+        texts, media = [], []
+        for item in payloads if isinstance(payloads, list) else []:
+            if not isinstance(item, dict):
+                continue
+            body = str(item.get("text") or "").strip()
+            if body:
+                texts.append(body)
+            refs = []
+            if item.get("mediaUrl"):
+                refs.append(item.get("mediaUrl"))
+            if isinstance(item.get("mediaUrls"), list):
+                refs.extend(item.get("mediaUrls"))
+            for ref in refs:
+                path = _openclaw_media_path(ref)
+                if path and path not in media:
+                    media.append(path)
+        reply = "\n\n".join(texts).strip()
+        for prefix in (f"{bot_name}:", "Clawdia:", "Claudia:"):
+            if reply.lower().startswith(prefix.lower()):
+                reply = reply[len(prefix):].lstrip()
+                break
+        if not reply and not media:
+            return None
+        return reply, media
+    except Exception as e:
+        _append_agent_task("model_repair_needed", {
+            "user": sender_user,
+            "bot": bot_name,
+            "provider": "openclaw-agent",
+            "agent": agent_id,
+            "session_key": session_key,
+            "error": _moderation_excerpt(str(e), 700),
+            "latest_user_message": _moderation_excerpt(text, 500),
+            "requested_action": "Check OpenClaw gateway and agent model health; the Thrive reply fell back to the local worker chain.",
+        })
+        return None
+    finally:
+        if msg_path:
+            try:
+                os.remove(msg_path)
+            except Exception:
+                pass
+
+def _offer_bot_files(sender_sock, sender_user, bot_name, paths):
+    """Offer agent-produced files through the normal accept/decline flow; the server holds the data."""
+    limit = int(file_config.get('size_limit', 0) or 0)
+    mesh_limit = int(bot_runtime_config.get('bot_mesh_max_file_size', 10485760) or 10485760)
+    files, sources = [], []
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            continue
+        if (limit > 0 and size > limit) or size > mesh_limit:
+            continue
+        name = os.path.basename(path).replace("/", "_").replace("\\", "_") or "file"
+        files.append({"filename": name, "size": size, "mime": mimetypes.guess_type(name)[0] or "application/octet-stream"})
+        sources.append(path)
+    if not files:
+        return False
+    transfer_id = str(uuid.uuid4())
+    with transfer_lock:
+        pending_transfers[transfer_id] = {
+            "from": bot_name, "to": sender_user, "files": files,
+            "client_transfer_id": "", "server_files": sources,
+        }
+    return _send_bot_event(sender_sock, sender_user, {"action": "file_offer", "from": bot_name, "files": files, "transfer_id": transfer_id})
+
+def _schedule_delivered_audio_cleanup(path, delay=90.0):
+    """Clawdia voice rule: delete delivered audio after a short grace period."""
+    if not bot_runtime_config.get('openclaw_delete_delivered_audio', True):
+        return
+    def _remove():
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    timer = threading.Timer(delay, _remove)
+    timer.daemon = True
+    timer.start()
+
+def _run_bot_reply(sender_sock, sender_user, to_user, text):
     text = _normalize_direct_bot_chat_text(text, to_user)
     sync_context = ""
     if bot_runtime_config.get("rule_sync_check_before_reply", True):
@@ -1898,8 +2101,14 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         _maybe_queue_clawdia_action_heartbeat(sender_user, to_user, text, sync_context)
     _record_bot_memory(sender_user, to_user, "user", text)
     reply = None
-    if _codex_primary_enabled_for_bot(to_user):
+    media_paths = []
+    agent_result = _openclaw_agent_bot_reply(sender_user, to_user, text)
+    if agent_result:
+        reply, media_paths = agent_result
+    if not reply and not media_paths and _codex_primary_enabled_for_bot(to_user):
         reply = _codex_bot_reply(sender_user, to_user, text, sync_context=sync_context)
+    if not reply and media_paths:
+        reply = "Voice message." if any((mimetypes.guess_type(p)[0] or "").startswith("audio/") for p in media_paths) else "I sent you a file."
     if not reply:
         reply = _gateway_natural_reply(sender_user, to_user, text)
     if not reply:
@@ -1944,11 +2153,27 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         if not reply:
             return True
     _record_bot_memory(sender_user, to_user, "assistant", reply)
+    voice_path = next((p for p in media_paths if (mimetypes.guess_type(p)[0] or "").startswith("audio/")), "")
+    voice_payload = None
+    if voice_path:
+        try:
+            with open(voice_path, "rb") as fh:
+                voice_payload = {
+                    "tts_audio_b64": base64.b64encode(fh.read()).decode("ascii"),
+                    "tts_mime": mimetypes.guess_type(voice_path)[0] or "audio/mpeg",
+                    "tts_voice": f"{to_user}-voice",
+                    "tts_engine": "openclaw",
+                }
+        except Exception:
+            voice_payload = None
     chunks = _split_outgoing_text(reply, max_bot_reply_length)
     total = len(chunks)
+    delivered = False
     for idx, chunk in enumerate(chunks, start=1):
         display_chunk = chunk if total == 1 else f"Part {idx} of {total}: {chunk}"
-        tts_payload = _build_bot_tts_payload(to_user, display_chunk, text) if idx == 1 else None
+        tts_payload = None
+        if idx == 1:
+            tts_payload = voice_payload or _build_bot_tts_payload(to_user, display_chunk, text)
         payload = {
             "action": "msg",
             "from": to_user,
@@ -1958,12 +2183,16 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         }
         if tts_payload:
             payload.update(tts_payload)
-        try:
-            sender_sock.sendall((json.dumps(payload) + "\n").encode())
-            if total > 1:
-                time.sleep(0.15)
-        except Exception:
+        if not _send_bot_event(sender_sock, sender_user, payload):
             break
+        delivered = True
+        if total > 1:
+            time.sleep(0.15)
+    if delivered and voice_payload:
+        _schedule_delivered_audio_cleanup(voice_path)
+    other_files = [p for p in media_paths if p != voice_path]
+    if delivered and other_files:
+        _offer_bot_files(sender_sock, sender_user, to_user, other_files)
     return True
 
 def _codex_primary_enabled_for_bot(bot_name):
@@ -2770,6 +2999,22 @@ def load_config():
         'codex_sandbox': config.get('bots', 'codex_sandbox', fallback='read-only'),
         'codex_add_dirs': config.get('bots', 'codex_add_dirs', fallback=''),
         'codex_approval_mode': config.get('bots', 'codex_approval_mode', fallback='enabled'),
+        'openclaw_agent_enabled': config.getboolean('bots', 'openclaw_agent_enabled', fallback=False),
+        'openclaw_agent_bots': _parse_bot_map(config.get('bots', 'openclaw_agent_bots', fallback='Clawdia:clawdia')),
+        'openclaw_agent_users': {
+            name.strip().lower()
+            for name in config.get('bots', 'openclaw_agent_users', fallback='').split(',')
+            if name.strip()
+        },
+        'openclaw_bin': config.get('bots', 'openclaw_bin', fallback='/home/tappedin/.local/bin/openclaw'),
+        'openclaw_agent_timeout': config.getint('bots', 'openclaw_agent_timeout', fallback=420),
+        'openclaw_session_key_template': config.get('bots', 'openclaw_session_key_template', fallback='agent:{agent}:thrive:direct:{user}'),
+        'openclaw_media_roots': [
+            os.path.abspath(os.path.expanduser(item.strip()))
+            for item in config.get('bots', 'openclaw_media_roots', fallback='/home/tappedin/.openclaw/media,/tmp').split(',')
+            if item.strip()
+        ],
+        'openclaw_delete_delivered_audio': config.getboolean('bots', 'openclaw_delete_delivered_audio', fallback=True),
         'piper_enabled': config.getboolean('bots', 'piper_enabled', fallback=False),
         'piper_bin': config.get('bots', 'piper_bin', fallback='/usr/local/bin/piper'),
         'piper_models_dir': config.get('bots', 'piper_models_dir', fallback='./voices'),
@@ -2947,7 +3192,7 @@ def _record_bot_memory(username, bot_name, role, content):
     try:
         con.execute(
             "INSERT INTO bot_chat_memory(username, bot, role, content, created_at) VALUES(?,?,?,?,?)",
-            (username, bot_name, role, content[:4000], datetime.datetime.utcnow().isoformat()),
+            (username, bot_name, role, content[:max(4000, max_bot_reply_length)], datetime.datetime.utcnow().isoformat()),
         )
         keep = int(bot_runtime_config.get('memory_messages_per_user', 80) or 80)
         con.execute(
@@ -5168,6 +5413,8 @@ def handle_client(cs, addr):
 
             elif action == "msg":
                 msg["from"] = user  # never trust the client-supplied sender
+                if not msg.get("time"):
+                    msg["time"] = datetime.datetime.now().isoformat()  # older clients drop messages without a time
                 to, frm = msg["to"], user
                 message_text = str(msg.get("msg", "") or "")
                 if _message_too_long(message_text, max_direct_message_length):
@@ -5326,6 +5573,22 @@ def handle_client(cs, addr):
                 transfer_id = msg["transfer_id"]
                 with transfer_lock: transfer = pending_transfers.get(transfer_id)
                 if not transfer: continue
+                if transfer.get("server_files"):
+                    # Server-held bot file offer: only the addressed user may accept it.
+                    if transfer.get("to") != user:
+                        continue
+                    with transfer_lock: pending_transfers.pop(transfer_id, None)
+                    out_files = []
+                    for finfo, path in zip(transfer["files"], transfer["server_files"]):
+                        try:
+                            with open(path, "rb") as fh:
+                                out_files.append({"filename": finfo["filename"], "data": base64.b64encode(fh.read()).decode("ascii")})
+                        except Exception:
+                            pass
+                    if out_files:
+                        try: sock.sendall((json.dumps({"action": "file_data", "from": transfer["from"], "files": out_files}) + "\n").encode())
+                        except: pass
+                    continue
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
@@ -5336,6 +5599,7 @@ def handle_client(cs, addr):
                 transfer_id = msg["transfer_id"]
                 with transfer_lock: transfer = pending_transfers.pop(transfer_id, None)
                 if not transfer: continue
+                if transfer.get("server_files"): continue
                 sender = transfer["from"]
                 with lock: sock_sender = clients.get(sender)
                 if sock_sender:
@@ -5415,14 +5679,19 @@ def handle_client(cs, addr):
         active_bot_sock = _bot_session_socket(user) if user and _is_registered_bot(user) else None
         bot_session_still_alive = bool(active_bot_sock and active_bot_sock is not sock)
         with lock:
-            if user and clients.get(user) is sock:
-                del clients[user]
             if user:
                 sessions = user_sessions.get(user)
                 if sessions is not None:
                     sessions.discard(sock)
                     if not sessions:
                         user_sessions.pop(user, None)
+            if user and clients.get(user) is sock:
+                # Hand routing back to another live session (e.g. a bot listener after a one-shot CLI send).
+                remaining = user_sessions.get(user)
+                if remaining:
+                    clients[user] = next(iter(remaining))
+                else:
+                    del clients[user]
             if not bot_session_still_alive and not user_sessions.get(user):
                 client_statuses.pop(user, None)
             session_preferences.pop(sock, None)
