@@ -2005,10 +2005,23 @@ def _openclaw_agent_for_bot(bot_name, sender_user):
         return ""
     return agent_id
 
-def _openclaw_session_key(agent_id, sender_user):
+def _openclaw_shared_session_key(agent_id, sender_user):
+    """Gateway session this Thrive user shares with another channel (e.g. their WhatsApp DM), if configured."""
+    shared = bot_runtime_config.get('openclaw_shared_sessions', {}) or {}
+    key = shared.get((str(agent_id or "").lower(), str(sender_user or "").strip().lower()), "")
+    # Never let a mapping cross into another agent's sessions.
+    return key if key.lower().startswith(f"agent:{str(agent_id or '').lower()}:") else ""
+
+def _openclaw_session_key_template_only(agent_id, sender_user):
     user_key = re.sub(r"[^a-z0-9_.@+-]+", "-", str(sender_user or "").strip().lower()).strip("-") or "unknown"
     template = str(bot_runtime_config.get('openclaw_session_key_template', '') or '') or 'agent:{agent}:thrive:direct:{user}'
     return template.replace("{agent}", agent_id).replace("{user}", user_key)
+
+def _openclaw_session_key(agent_id, sender_user):
+    shared_key = _openclaw_shared_session_key(agent_id, sender_user)
+    if shared_key:
+        return shared_key
+    return _openclaw_session_key_template_only(agent_id, sender_user)
 
 def _openclaw_media_path(ref):
     """Resolve an agent media reference to a local file inside an approved media root."""
@@ -2041,6 +2054,13 @@ def _openclaw_agent_bot_reply(sender_user, bot_name, text):
         "is delivered there too.]\n\n"
         + str(text or "")
     )
+    if _openclaw_shared_session_key(agent_id, sender_user):
+        default_key = _openclaw_session_key_template_only(agent_id, sender_user)
+        envelope = (
+            "[This session is shared with this person's other channel, so earlier turns may be from there. "
+            "Reply here in Thrive only; don't also send it on the other channel. "
+            f"Older Thrive-only turns are in session {default_key}.]\n" + envelope
+        )
     msg_path = ""
     try:
         with tempfile.NamedTemporaryFile("w", prefix="thrive-openclaw-msg-", suffix=".txt", delete=False, encoding="utf-8") as fh:
@@ -3072,6 +3092,12 @@ def load_config():
         'openclaw_bin': config.get('bots', 'openclaw_bin', fallback='/home/tappedin/.local/bin/openclaw'),
         'openclaw_agent_timeout': config.getint('bots', 'openclaw_agent_timeout', fallback=420),
         'openclaw_session_key_template': config.get('bots', 'openclaw_session_key_template', fallback='agent:{agent}:thrive:direct:{user}'),
+        # agent/thriveuser=agent:<agent>:<session key>, comma separated; shares one gateway session across channels.
+        'openclaw_shared_sessions': {
+            (pair.split('=', 1)[0].split('/', 1)[0].strip().lower(), pair.split('=', 1)[0].split('/', 1)[1].strip().lower()): pair.split('=', 1)[1].strip()
+            for pair in config.get('bots', 'openclaw_shared_sessions', fallback='').split(',')
+            if '=' in pair and '/' in pair.split('=', 1)[0]
+        },
         'openclaw_media_roots': [
             os.path.abspath(os.path.expanduser(item.strip()))
             for item in config.get('bots', 'openclaw_media_roots', fallback='/home/tappedin/.openclaw/media,/tmp').split(',')
