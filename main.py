@@ -80,9 +80,31 @@ def scale_pcm16(data, gain):
     return samples.tobytes()
 
 def _use_keyring_runtime():
-    # macOS Intel systems can hang during keychain calls before any UI is shown.
-    # Use the existing fallback credential storage path on macOS for responsiveness.
-    return sys.platform != "darwin"
+    # Credentials always live in the OS keychain (Windows Credential Manager, macOS Keychain).
+    # Keychain calls run behind a timeout (_kr_call) so a slow or locked keychain can't freeze the app.
+    return not _KEYRING_UNAVAILABLE[0]
+
+_KEYRING_UNAVAILABLE = [False]
+
+def _kr_call(fn, *args, timeout=8.0):
+    """Run one keyring call with a timeout. A hang marks the keychain unavailable for this session."""
+    if _KEYRING_UNAVAILABLE[0]:
+        raise RuntimeError("keychain unavailable")
+    result = {}
+    def run():
+        try:
+            result["value"] = fn(*args)
+        except Exception as e:
+            result["error"] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        _KEYRING_UNAVAILABLE[0] = True
+        raise TimeoutError("keychain did not respond")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
 _WinNotification = None
 _plyer_notification = None
 if sys.platform == 'win32':
@@ -276,13 +298,24 @@ def _load_password_from_keyring(username, settings):
     candidates = [(KEYRING_SERVICE, account), (KEYRING_SERVICE, username)]
     for service, key_account in candidates:
         try:
-            value = keyring.get_password(service, key_account)
+            value = _kr_call(keyring.get_password, service, key_account)
             if value:
                 return value
         except Exception as e:
-            print(f"Keyring error (load): {e}")
+            print(f"Keyring error (load): {type(e).__name__}")
             return ''
     return ''
+
+def _save_password_to_keyring(username, password, settings):
+    if not username or not password:
+        return False
+    try:
+        _kr_call(keyring.set_password, KEYRING_SERVICE, _keyring_account_for(username, settings), password)
+        return True
+    except Exception as e:
+        print(f"Keyring error (save): {type(e).__name__}")
+        log_event("warn", "keychain_save_failed", {"error": type(e).__name__})
+        return False
 
 def _delete_password_from_keyring(username, settings):
     if not username:
@@ -290,8 +323,8 @@ def _delete_password_from_keyring(username, settings):
     account = _keyring_account_for(username, settings)
     for service, key_account in ((KEYRING_SERVICE, account), (KEYRING_SERVICE, username)):
         try:
-            if keyring.get_password(service, key_account):
-                keyring.delete_password(service, key_account)
+            if _kr_call(keyring.get_password, service, key_account):
+                _kr_call(keyring.delete_password, service, key_account)
         except Exception:
             pass
 
@@ -324,42 +357,25 @@ def _load_passkey_from_keyring(username, settings=None, server_entry=None):
     account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
     if not account:
         return ""
-    if not _use_keyring_runtime():
-        cfg = settings or {}
-        tokens = cfg.get("passkey_tokens", {}) if isinstance(cfg, dict) else {}
-        if not isinstance(tokens, dict):
-            return ""
-        return _decode_password_fallback(tokens.get(account, ""))
     try:
-        return keyring.get_password(PASSKEY_KEYRING_SERVICE, account) or ""
+        return _kr_call(keyring.get_password, PASSKEY_KEYRING_SERVICE, account) or ""
     except Exception as e:
-        print(f"Keyring error (passkey load): {e}")
-        cfg = settings or {}
-        tokens = cfg.get("passkey_tokens", {}) if isinstance(cfg, dict) else {}
-        if isinstance(tokens, dict):
-            return _decode_password_fallback(tokens.get(account, ""))
+        print(f"Keyring error (passkey load): {type(e).__name__}")
         return ""
 
 def _save_passkey_to_keyring(username, passkey_token, settings=None, server_entry=None):
     account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
     if not account:
         return False
-    cfg = settings if isinstance(settings, dict) else None
     token_value = str(passkey_token or "")
-    if cfg is not None:
-        tokens = cfg.get("passkey_tokens")
-        if not isinstance(tokens, dict):
-            tokens = {}
-            cfg["passkey_tokens"] = tokens
-        tokens[account] = _encode_password_fallback(token_value)
-    if not _use_keyring_runtime():
-        return bool(token_value)
+    if not token_value:
+        return False
     try:
-        keyring.set_password(PASSKEY_KEYRING_SERVICE, account, token_value)
+        _kr_call(keyring.set_password, PASSKEY_KEYRING_SERVICE, account, token_value)
         return True
     except Exception as e:
-        print(f"Keyring error (passkey save): {e}")
-        return bool(token_value)
+        print(f"Keyring error (passkey save): {type(e).__name__}")
+        return False
 
 def _delete_passkey_from_keyring(username, settings=None, server_entry=None):
     account = _passkey_account_for(username, settings=settings, server_entry=server_entry)
@@ -368,11 +384,9 @@ def _delete_passkey_from_keyring(username, settings=None, server_entry=None):
     cfg = settings if isinstance(settings, dict) else None
     if cfg is not None and isinstance(cfg.get("passkey_tokens"), dict):
         cfg["passkey_tokens"].pop(account, None)
-    if not _use_keyring_runtime():
-        return
     try:
-        if keyring.get_password(PASSKEY_KEYRING_SERVICE, account):
-            keyring.delete_password(PASSKEY_KEYRING_SERVICE, account)
+        if _kr_call(keyring.get_password, PASSKEY_KEYRING_SERVICE, account):
+            _kr_call(keyring.delete_password, PASSKEY_KEYRING_SERVICE, account)
     except Exception:
         pass
 
@@ -548,16 +562,53 @@ def load_user_config():
 
     # 3. Load password from Keyring if "Remember me" is active
     if settings.get('username') and settings.get('remember'):
-        if _use_keyring_runtime():
-            stored_pass = _load_password_from_keyring(settings['username'], settings)
-            if stored_pass:
-                settings['password'] = stored_pass
-            elif settings.get('password_fallback'):
-                settings['password'] = _decode_password_fallback(settings.get('password_fallback', ''))
+        stored_pass = _load_password_from_keyring(settings['username'], settings)
+        if stored_pass:
+            settings['password'] = stored_pass
         elif settings.get('password_fallback'):
             settings['password'] = _decode_password_fallback(settings.get('password_fallback', ''))
-            
+    _migrate_file_secrets_to_keychain(settings)
+
     return settings
+
+def _migrate_file_secrets_to_keychain(settings):
+    """Older builds kept the saved password (and on macOS passkey tokens) base64-encoded in user_settings.json.
+    Move them into the OS keychain, then remove them from the file. If the keychain can't take them, leave them."""
+    changed = False
+    fallback = settings.get('password_fallback')
+    if fallback:
+        username = settings.get('username', '')
+        password = _decode_password_fallback(fallback)
+        if username and password and settings.get('remember'):
+            if _save_password_to_keyring(username, password, settings):
+                settings.pop('password_fallback', None); changed = True
+        else:
+            settings.pop('password_fallback', None); changed = True
+    tokens = settings.get('passkey_tokens')
+    if isinstance(tokens, dict) and tokens:
+        for account, encoded in list(tokens.items()):
+            token = _decode_password_fallback(encoded)
+            try:
+                if token:
+                    _kr_call(keyring.set_password, PASSKEY_KEYRING_SERVICE, account, token)
+                tokens.pop(account, None); changed = True
+            except Exception as e:
+                print(f"Keyring error (passkey migrate): {type(e).__name__}")
+    if changed:
+        _write_settings_file(settings)
+        log_event("info", "credentials_moved_to_keychain")
+    return changed
+
+def _write_settings_file(settings):
+    data = dict(settings)
+    data.pop('password', None)
+    if not data.get('password_fallback'):
+        data.pop('password_fallback', None)
+    try:
+        with open(get_settings_path(), 'w') as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"Error saving settings file: {e}")
 
 def save_user_config(settings):
     """
@@ -567,20 +618,19 @@ def save_user_config(settings):
     password = settings.get('password', '')
     remember = settings.get('remember', False)
     
-    # 1. Save non-sensitive data to JSON
-    data_to_save = settings.copy()
-    if 'password' in data_to_save:
-        del data_to_save['password'] # Never save password to file
-    if remember and password:
-        data_to_save['password_fallback'] = _encode_password_fallback(password)
-    else:
-        data_to_save.pop('password_fallback', None)
-
-    try:
-        with open(get_settings_path(), 'w') as f:
-            json.dump(data_to_save, f, indent=4)
-    except Exception as e:
-        print(f"Error saving settings file: {e}")
+    # 1. The saved password goes only to the OS keychain; the settings file never holds it.
+    settings.pop('password_fallback', None)
+    if isinstance(settings.get('passkey_tokens'), dict):
+        settings['passkey_tokens'] = {}
+    if username and remember and password:
+        cache_key = (KEYRING_SERVICE, _keyring_account_for(username, settings))
+        if _KEYRING_WRITE_CACHE.get(cache_key) != password and _save_password_to_keyring(username, password, settings):
+            _KEYRING_WRITE_CACHE[cache_key] = password
+    elif username and not remember:
+        _delete_password_from_keyring(username, settings)
+        _KEYRING_WRITE_CACHE.pop((KEYRING_SERVICE, _keyring_account_for(username, settings)), None)
+    # 2. Non-sensitive preferences to JSON.
+    _write_settings_file(settings)
 
 def _device_login_fields(settings):
     return {
@@ -590,27 +640,6 @@ def _device_login_fields(settings):
         "client_version": VERSION_TAG,
         "session_duration": str(settings.get("session_duration") or "month"),
     }
-
-    # 2. Manage Keyring
-    if username:
-        account = _keyring_account_for(username, settings)
-        if _use_keyring_runtime() and remember and password:
-            cache_key = (KEYRING_SERVICE, account)
-            if _KEYRING_WRITE_CACHE.get(cache_key) != password:
-                try:
-                    keyring.set_password(KEYRING_SERVICE, account, password)
-                    _KEYRING_WRITE_CACHE[cache_key] = password
-                except Exception as e:
-                    print(f"Keyring error (save): {e}")
-        elif _use_keyring_runtime():
-            # If remember is False, ensure we remove the credential from the OS manager
-            try:
-                if keyring.get_password(KEYRING_SERVICE, account):
-                    keyring.delete_password(KEYRING_SERVICE, account)
-                    _KEYRING_WRITE_CACHE.pop((KEYRING_SERVICE, account), None)
-            except Exception:
-                # Password might not exist, ignore
-                pass
 
 _IPC_PORT = 48951
 _LOG_FILE_NAME = "thrive_client.log"
@@ -3058,6 +3087,8 @@ class ClientApp(wx.App):
                     elif act == "file_data": wx.CallAfter(self.on_file_data, msg)
                     elif act == "invite_result": wx.CallAfter(self.frame.on_invite_result, msg)
                     elif act == "change_password_result": wx.CallAfter(self.frame.on_change_password_result, msg)
+                    elif act in ("passkey_register_result", "passkey_list", "passkey_revoke_result"):
+                        self.frame.on_passkey_response(msg)
                     elif act == "delete_account_result": wx.CallAfter(self.frame.on_delete_account_result, msg)
                     elif act == "authenticated_devices": wx.CallAfter(self.frame.on_authenticated_devices, msg)
                     elif act == "deauthenticate_device_result": wx.CallAfter(self.frame.on_deauthenticate_device_result, msg)
@@ -4651,6 +4682,10 @@ class MainFrame(wx.Frame):
         self._sort_mode = "name_asc"
         self._unread_counts = {}
         self._pending_display_names = {}
+        self._passkey_response_lock = threading.Lock()
+        self._passkey_request_lock = threading.Lock()
+        self._passkey_response_events = {}
+        self._passkey_responses = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window)
         self._chat_panels = []; self._tabs_window = None
         self.main_notebook = wx.Notebook(self)
@@ -5053,14 +5088,66 @@ class MainFrame(wx.Frame):
         active = normalize_server_entry(getattr(app, "active_server_entry", SERVER_CONFIG))
         return _passkey_account_for(self.user, settings=app.user_config, server_entry=active)
 
+    def on_passkey_response(self, msg):
+        action = str(msg.get("action", "") or "")
+        if not action:
+            return
+        with self._passkey_response_lock:
+            event = self._passkey_response_events.get(action)
+            if not event:
+                return
+            self._passkey_responses[action] = msg
+            event.set()
+
+    def _send_passkey_request(self, payload, expected_action, timeout=12):
+        expected_action = str(expected_action or "")
+        if not expected_action:
+            return None, "Internal passkey request error."
+        with self._passkey_request_lock:
+            last_error = ""
+            for attempt in range(2):
+                app = wx.GetApp()
+                if getattr(app, "reconnect_in_progress", False):
+                    deadline = time.time() + min(timeout, 8)
+                    while getattr(app, "reconnect_in_progress", False) and time.time() < deadline:
+                        time.sleep(0.2)
+                current_socket = getattr(app, "sock", None) or self.sock
+                self.sock = current_socket
+                event = threading.Event()
+                with self._passkey_response_lock:
+                    self._passkey_response_events[expected_action] = event
+                    self._passkey_responses.pop(expected_action, None)
+                try:
+                    current_socket.sendall((json.dumps(payload) + "\n").encode())
+                except OSError:
+                    last_error = "The connection was changing while Thrive sent the passkey request."
+                    with self._passkey_response_lock:
+                        self._passkey_response_events.pop(expected_action, None)
+                        self._passkey_responses.pop(expected_action, None)
+                    if attempt == 0:
+                        time.sleep(0.5)
+                        continue
+                    return None, last_error + " Thrive is reconnecting; try again after the contact list is back online."
+                except Exception as e:
+                    with self._passkey_response_lock:
+                        self._passkey_response_events.pop(expected_action, None)
+                        self._passkey_responses.pop(expected_action, None)
+                    return None, f"Could not send the passkey request: {e}"
+                if not event.wait(timeout):
+                    with self._passkey_response_lock:
+                        self._passkey_response_events.pop(expected_action, None)
+                        self._passkey_responses.pop(expected_action, None)
+                    return None, "The server did not answer the passkey request in time. The connection may be reconnecting; try again in a moment."
+                with self._passkey_response_lock:
+                    self._passkey_response_events.pop(expected_action, None)
+                    response = self._passkey_responses.pop(expected_action, None)
+                return response, ""
+            return None, last_error or "The passkey request could not be sent."
+
     def _list_passkeys(self):
-        try:
-            self.sock.sendall((json.dumps({"action": "list_passkeys"}) + "\n").encode())
-            resp = json.loads(wx.GetApp().sockfile.readline() or "{}")
-            if resp.get("action") == "passkey_list":
-                return resp.get("passkeys", [])
-        except Exception:
-            pass
+        resp, _ = self._send_passkey_request({"action": "list_passkeys"}, "passkey_list")
+        if resp and resp.get("action") == "passkey_list":
+            return resp.get("passkeys", [])
         return []
 
     def on_register_passkey(self, _):
@@ -5076,15 +5163,16 @@ class MainFrame(wx.Frame):
                 return
             label = dlg.GetValue().strip() or default_label
         token = secrets.token_urlsafe(48)
-        try:
-            self.sock.sendall((json.dumps({
-                "action": "register_passkey",
-                "label": label,
-                "passkey_token": token,
-            }) + "\n").encode())
-            resp = json.loads(app.sockfile.readline() or "{}")
-        except Exception as e:
-            wx.MessageBox(f"Could not register passkey: {e}", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
+        resp, error = self._send_passkey_request({
+            "action": "register_passkey",
+            "label": label,
+            "passkey_token": token,
+        }, "passkey_register_result")
+        if error:
+            wx.MessageBox(f"Could not register passkey. {error}", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not resp:
+            wx.MessageBox("Could not register passkey. The server response was empty.", "Passkey Error", wx.OK | wx.ICON_ERROR, self)
             return
         if not resp.get("ok"):
             wx.MessageBox(resp.get("reason", "Unknown error"), "Passkey Error", wx.OK | wx.ICON_ERROR, self)
@@ -5129,21 +5217,24 @@ class MainFrame(wx.Frame):
             for entry in entries:
                 if entry.get("revoked"):
                     continue
-                try:
-                    self.sock.sendall((json.dumps({"action": "revoke_passkey", "passkey_id": entry.get("id", "")}) + "\n").encode())
-                    _ = json.loads(app.sockfile.readline() or "{}")
-                except Exception:
-                    pass
+                self._send_passkey_request(
+                    {"action": "revoke_passkey", "passkey_id": entry.get("id", "")},
+                    "passkey_revoke_result",
+                )
             _delete_passkey_from_keyring(self.user, settings=app.user_config, server_entry=app.active_server_entry)
             show_notification("Devices Updated", "Signed out all devices.", timeout=5)
             wx.MessageBox("All devices were signed out.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
             return
         target = [e for e in entries if not e.get("revoked")][choice]
-        try:
-            self.sock.sendall((json.dumps({"action": "revoke_passkey", "passkey_id": target.get("id", "")}) + "\n").encode())
-            resp = json.loads(app.sockfile.readline() or "{}")
-        except Exception as e:
-            wx.MessageBox(f"Could not revoke selected device: {e}", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
+        resp, error = self._send_passkey_request(
+            {"action": "revoke_passkey", "passkey_id": target.get("id", "")},
+            "passkey_revoke_result",
+        )
+        if error:
+            wx.MessageBox(f"Could not revoke selected device. {error}", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
+            return
+        if not resp:
+            wx.MessageBox("Could not revoke selected device. The server response was empty.", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
             return
         if not resp.get("ok"):
             wx.MessageBox(resp.get("reason", "Unknown revoke error"), "Manage Devices", wx.OK | wx.ICON_ERROR, self)
