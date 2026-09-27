@@ -21,5 +21,5 @@ exec /usr/bin/python3 srv/scripts/thrive_cli.py \
   --accepts-files \
   --wait 10 \
   --auto-decline-calls \
-  --call-decline-message "I saw your Thrive call. My Thrive call audio bridge is not live yet, so I declined it instead of leaving it ringing. I am fixing that path now." \
+  --call-decline-message "I saw your call, but I can't take live Thrive calls yet, so I declined it rather than leave it ringing. Leave me a voicemail instead: in our chat press Control Shift R to record it, press it again to stop, then Send. I'll listen and reply." \
   --listen

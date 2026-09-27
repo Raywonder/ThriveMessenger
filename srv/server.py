@@ -620,6 +620,134 @@ def _remove_user_from_all_direct_calls(username):
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
 
+def _canonical_username(name):
+    """The stored spelling of an existing account (matched ignoring case), or '' if there is none."""
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    try:
+        con = sqlite3.connect(DB)
+        row = con.execute("SELECT username FROM users WHERE username=? COLLATE NOCASE LIMIT 1", (name,)).fetchone()
+        con.close()
+        return row[0] if row else ""
+    except Exception:
+        return ""
+
+VOICE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_messages")
+MAX_VOICE_BYTES = 6 * 1024 * 1024          # decoded upload limit (about 3 minutes of 16 kHz WAV)
+WHISPER_CLI = "/home/tappedin/.openclaw/workspace/scripts/faster_whisper_openclaw.py"
+
+def _format_duration(seconds):
+    seconds = int(round(float(seconds or 0)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+def _transcode_voice_to_mp3(raw, suffix=".bin"):
+    """Return (mp3_bytes, duration_seconds) for any audio ffmpeg can read; small mono MP3 for every client."""
+    with tempfile.TemporaryDirectory(prefix="thrive-voice-") as tmp:
+        src = os.path.join(tmp, "in" + suffix)
+        dst = os.path.join(tmp, "out.mp3")
+        with open(src, "wb") as fh:
+            fh.write(raw)
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", src, "-ac", "1", "-ar", "22050",
+                        "-c:a", "libmp3lame", "-b:a", "40k", dst], check=True, timeout=60,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", dst],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        try:
+            duration = float(out.stdout.decode().strip() or 0)
+        except Exception:
+            duration = 0.0
+        with open(dst, "rb") as fh:
+            return fh.read(), duration
+
+def _transcribe_audio_file(path):
+    """Local speech-to-text (the same faster-whisper adapter OpenClaw uses). '' when unavailable."""
+    if not os.path.isfile(WHISPER_CLI):
+        return ""
+    try:
+        out = subprocess.run([WHISPER_CLI, path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=180)
+        return out.stdout.decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+def _prepare_voice_message(msg):
+    """Validate and normalise msg["voice"] in place. Returns (ok, reason, mp3_bytes)."""
+    voice = msg.get("voice")
+    if not isinstance(voice, dict):
+        return False, "Voice message is missing its audio.", None
+    b64 = str(voice.get("b64") or "")
+    if len(b64) > (MAX_VOICE_BYTES * 4) // 3 + 16:
+        return False, "Voice message is too long. Keep it under about 3 minutes.", None
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        return False, "Voice message audio is not valid.", None
+    if not raw:
+        return False, "Voice message audio is empty.", None
+    mime = str(voice.get("mime") or "audio/wav").lower()
+    suffix = {"audio/wav": ".wav", "audio/x-wav": ".wav", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+              "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/webm": ".webm", "audio/mp4": ".m4a"}.get(mime, ".bin")
+    try:
+        mp3, duration = _transcode_voice_to_mp3(raw, suffix)
+    except Exception as e:
+        print(f"Voice transcode failed: {type(e).__name__}")
+        return False, "The server couldn't process that recording.", None
+    is_voicemail = bool(voice.get("voicemail"))
+    msg["voice"] = {"b64": base64.b64encode(mp3).decode("ascii"), "mime": "audio/mpeg",
+                    "duration": round(duration, 1), "voicemail": is_voicemail}
+    label = "Voicemail" if is_voicemail else "Voice message"
+    msg["msg"] = f"{label} ({_format_duration(duration)})"
+    return True, "", mp3
+
+def _store_voice_file(msg_uid, mp3):
+    try:
+        os.makedirs(VOICE_DIR, mode=0o700, exist_ok=True)
+        path = os.path.join(VOICE_DIR, f"{msg_uid}.mp3")
+        with open(path, "wb") as fh:
+            fh.write(mp3)
+        return path
+    except Exception as e:
+        print(f"Could not store voice message: {type(e).__name__}")
+        return None
+
+def _voice_payload_from_history(row_uid):
+    """Rebuild a stored voice message for delivery (pending voicemail)."""
+    con = sqlite3.connect(DB)
+    try:
+        row = con.execute("SELECT frm, to_user, body, created_at, attachment_path, deleted_at FROM direct_message_history "
+                          "WHERE msg_uid=? ORDER BY id DESC LIMIT 1", (row_uid,)).fetchone()
+    finally:
+        con.close()
+    if not row or row[5] or not row[4] or not os.path.isfile(row[4]):
+        return None
+    frm, to_user, body, created_at, path, _ = row
+    with open(path, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    duration = 0.0
+    m = re.search(r"\((\d+):(\d\d)\)", body or "")
+    if m:
+        duration = int(m.group(1)) * 60 + int(m.group(2))
+    return {"action": "msg", "from": frm, "to": to_user, "msg": body, "id": row_uid, "time": created_at,
+            "voice": {"b64": b64, "mime": "audio/mpeg", "duration": duration, "voicemail": True}}
+
+def _deliver_pending_voicemail(sock, username):
+    con = sqlite3.connect(DB)
+    try:
+        rows = con.execute("SELECT msg_uid FROM pending_voicemail WHERE lower(to_user)=lower(?) ORDER BY created_at", (username,)).fetchall()
+    finally:
+        con.close()
+    for (uid,) in rows:
+        payload = _voice_payload_from_history(uid)
+        try:
+            if payload:
+                _send_json_line(sock, payload)
+            con = sqlite3.connect(DB)
+            con.execute("DELETE FROM pending_voicemail WHERE msg_uid=?", (uid,))
+            con.execute("UPDATE direct_message_history SET delivered=1 WHERE msg_uid=?", (uid,))
+            con.commit(); con.close()
+        except Exception:
+            break
+
 def _send_to_all_sessions(usernames, payload):
     """Send one event to every signed-in device of each user (names matched ignoring case)."""
     wanted = {str(u or "").strip().lower() for u in usernames if str(u or "").strip()}
@@ -650,12 +778,12 @@ def _apply_direct_message_change(actor, msg_uid, is_edit, new_text=""):
     con = sqlite3.connect(DB)
     try:
         row = con.execute(
-            "SELECT id, frm, to_user, deleted_at FROM direct_message_history WHERE msg_uid=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, frm, to_user, deleted_at, attachment_path FROM direct_message_history WHERE msg_uid=? ORDER BY id DESC LIMIT 1",
             (msg_uid,),
         ).fetchone()
         if not row:
             return False, "That message wasn't found on the server.", None
-        row_id, frm_user, to_user, deleted_at = row
+        row_id, frm_user, to_user, deleted_at, attachment_path = row
         if deleted_at:
             return False, "That message was already deleted.", None
         is_sender = str(frm_user or "").lower() == str(actor or "").lower()
@@ -670,9 +798,15 @@ def _apply_direct_message_change(actor, msg_uid, is_edit, new_text=""):
             )
         else:
             con.execute(
-                "UPDATE direct_message_history SET body='', deleted_at=?, deleted_by=? WHERE id=?",
+                "UPDATE direct_message_history SET body='', deleted_at=?, deleted_by=?, attachment_path=NULL WHERE id=?",
                 (now_iso, actor, row_id),
             )
+            con.execute("DELETE FROM pending_voicemail WHERE msg_uid=?", (msg_uid,))
+            if attachment_path and os.path.realpath(attachment_path).startswith(os.path.realpath(VOICE_DIR) + os.sep):
+                try:
+                    os.remove(attachment_path)
+                except OSError:
+                    pass
         con.commit()
         return True, "", (frm_user, to_user)
     finally:
@@ -925,7 +1059,7 @@ def _message_sensitivity(text):
         return "sensitive"
     return "normal"
 
-def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, delivered=False, source="thrive", msg_uid=None):
+def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, delivered=False, source="thrive", msg_uid=None, attachment_path=None):
     frm = str(frm or "").strip()
     to = str(to or "").strip()
     body = str(body or "")
@@ -938,8 +1072,8 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
             """
             INSERT INTO direct_message_history(
                 frm, to_user, frm_canonical, to_canonical, body, source,
-                sensitivity, handled_by_bot, delivered, created_at, msg_uid
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                sensitivity, handled_by_bot, delivered, created_at, msg_uid, attachment_path
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 frm,
@@ -953,6 +1087,7 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
                 1 if delivered else 0,
                 _iso_utc_now(),
                 str(msg_uid) if msg_uid else None,
+                attachment_path,
             ),
         )
         con.commit()
@@ -1973,6 +2108,26 @@ def _send_bot_event(sender_sock, sender_user, payload):
     except Exception:
         return False
 
+class _BotVoiceText(object):
+    """A voice message for a bot: transcribed (in the reply worker, not the socket thread) into text for the agent."""
+    def __init__(self, mp3, label):
+        self.mp3 = mp3
+        self.label = label
+    def resolve(self):
+        with tempfile.NamedTemporaryFile(prefix="thrive-voice-", suffix=".mp3", delete=False) as fh:
+            fh.write(self.mp3)
+            path = fh.name
+        try:
+            transcript = _transcribe_audio_file(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if transcript:
+            return f"[{self.label}, transcribed] {transcript}"
+        return f"[{self.label} that couldn't be transcribed. Ask them to type it instead.]"
+
 def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
     """Answer virtual-bot DMs off the socket thread so slow agent turns never block the sender."""
     if not _is_virtual_bot(to_user):
@@ -1982,7 +2137,8 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
         with _bot_reply_lock(sender_user, to_user):
             _send_bot_event(sender_sock, sender_user, {"action": "typing", "from": to_user, "typing": True})
             try:
-                _run_bot_reply(sender_sock, sender_user, to_user, text)
+                body = text.resolve() if isinstance(text, _BotVoiceText) else text
+                _run_bot_reply(sender_sock, sender_user, to_user, body)
             except Exception as e:
                 print(f"Bot reply worker failed for {to_user}: {e}")
             finally:
@@ -2236,18 +2392,26 @@ def _run_bot_reply(sender_sock, sender_user, to_user, text):
         if not reply:
             return True
     _record_bot_memory(sender_user, to_user, "assistant", reply)
-    voice_path = next((p for p in media_paths if (mimetypes.guess_type(p)[0] or "").startswith("audio/")), "")
+    audio_exts = (".opus", ".ogg", ".oga", ".mp3", ".m4a", ".wav", ".webm", ".aac", ".flac")
+    voice_path = next((p for p in media_paths
+                       if (mimetypes.guess_type(p)[0] or "").startswith("audio/") or p.lower().endswith(audio_exts)), "")
     voice_payload = None
     if voice_path:
         try:
             with open(voice_path, "rb") as fh:
-                voice_payload = {
-                    "tts_audio_b64": base64.b64encode(fh.read()).decode("ascii"),
-                    "tts_mime": mimetypes.guess_type(voice_path)[0] or "audio/mpeg",
-                    "tts_voice": f"{to_user}-voice",
-                    "tts_engine": "openclaw",
-                }
-        except Exception:
+                raw_audio = fh.read()
+            # One small MP3 every client can play; delivered as a playable voice message.
+            mp3, duration = _transcode_voice_to_mp3(raw_audio, os.path.splitext(voice_path)[1] or ".bin")
+            b64 = base64.b64encode(mp3).decode("ascii")
+            voice_payload = {
+                "tts_audio_b64": b64,
+                "tts_mime": "audio/mpeg",
+                "tts_voice": f"{to_user}-voice",
+                "tts_engine": "openclaw",
+                "voice": {"b64": b64, "mime": "audio/mpeg", "duration": round(duration, 1), "voicemail": False},
+            }
+        except Exception as e:
+            print(f"Bot voice reply could not be prepared: {type(e).__name__}")
             voice_payload = None
     chunks = _split_outgoing_text(reply, max_bot_reply_length)
     total = len(chunks)
@@ -3224,10 +3388,11 @@ def init_db():
         created_at TEXT NOT NULL
     )''')
     dmh_cols = [row[1] for row in cur.execute("PRAGMA table_info(direct_message_history)")]
-    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by"):
+    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by", "attachment_path"):
         if col not in dmh_cols:
             cur.execute(f"ALTER TABLE direct_message_history ADD COLUMN {col} TEXT")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
+    cur.execute("CREATE TABLE IF NOT EXISTS pending_voicemail (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_message_cursors (
         bot TEXT NOT NULL,
         channel TEXT NOT NULL DEFAULT 'thrive',
@@ -4145,6 +4310,8 @@ def handle_client(cs, addr):
             socket_session_ids[sock] = session_id
             client_statuses[user] = "online"
             session_preferences[sock] = {}
+        # Voicemail left while this user was offline arrives shortly after sign-in.
+        threading.Timer(2.0, _deliver_pending_voicemail, args=(sock, user)).start()
 
         # Optional alert to the existing signed-in device when another login happens.
         if prior_sock and prior_sock is not sock:
@@ -5613,6 +5780,13 @@ def handle_client(cs, addr):
                     })
                     continue
                 msg["msg"] = message_text
+                voice_mp3 = None
+                if "voice" in msg:
+                    ok_voice, voice_reason, voice_mp3 = _prepare_voice_message(msg)
+                    if not ok_voice:
+                        _send_json_line(sock, {"action": "msg_failed", "to": to, "reason": voice_reason})
+                        continue
+                    message_text = msg["msg"]
                 if _is_registered_bot(to) and not _can_user_use_feature(user, "bots"):
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": "Bot messaging is disabled for your account."}).encode() + b"\n")
                     continue
@@ -5636,26 +5810,46 @@ def handle_client(cs, addr):
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
                 con.close()
                 
-                with lock: sock_to = clients.get(to)
+                with lock:
+                    sock_to = clients.get(to)
+                    # People (not bots) get the message on every signed-in device.
+                    all_socks_to = list(user_sessions.get(to, set())) if not _is_registered_bot(to) else []
+                if sock_to and sock_to not in all_socks_to:
+                    all_socks_to.append(sock_to)
                 reason = None
                 handled_by_bot = False
                 delivered_to_user = False
+                attachment_path = None
+                queued_voicemail = False
+                is_voicemail = bool(voice_mp3 is not None and msg.get("voice", {}).get("voicemail"))
+                bot_text = msg.get("msg", "")
+                if voice_mp3 is not None and _is_virtual_bot(to):
+                    bot_text = _BotVoiceText(voice_mp3, "Voicemail" if is_voicemail else "Voice message")
                 if recipient_has_blocked and recipient_has_blocked[0] == 1:
                     reason = f"Message couldn't be sent because {to} has you blocked."
                 elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
-                elif _maybe_send_bot_reply(sock, frm, to, msg.get("msg", "")):
+                elif _maybe_send_bot_reply(sock, frm, to, bot_text):
                     handled_by_bot = True
                     delivered_to_user = True
                     reason = None
-                elif not sock_to: 
-                    reason = f"{to} is offline."
+                elif not all_socks_to:
+                    if is_voicemail and _canonical_username(to):
+                        queued_voicemail = True
+                    else:
+                        reason = f"{to} is offline."
                 else:
-                    try: 
-                        sock_to.sendall((json.dumps(msg)+"\n").encode())
-                        delivered_to_user = True
-                        reason = None
-                    except: pass
+                    line = (json.dumps(msg)+"\n").encode()
+                    for target_sock in all_socks_to:
+                        try:
+                            target_sock.sendall(line)
+                            delivered_to_user = True
+                        except Exception:
+                            pass
+                    if not delivered_to_user:
+                        reason = f"{to} is offline."
+                if voice_mp3 is not None and not reason and not handled_by_bot:
+                    attachment_path = _store_voice_file(msg["id"], voice_mp3)
                 if not reason or handled_by_bot or _is_registered_bot(to):
                     _record_direct_message_history(
                         frm,
@@ -5665,7 +5859,14 @@ def handle_client(cs, addr):
                         delivered=delivered_to_user,
                         source="thrive",
                         msg_uid=msg["id"],
+                        attachment_path=attachment_path,
                     )
+                    if queued_voicemail:
+                        con = sqlite3.connect(DB)
+                        con.execute("INSERT OR REPLACE INTO pending_voicemail(msg_uid, to_user, created_at) VALUES(?,?,?)",
+                                    (msg["id"], to, _iso_utc_now()))
+                        con.commit(); con.close()
+                        _send_json_line(sock, {"action": "voicemail_saved", "to": to, "id": msg["id"]})
                     if client_msg_id:
                         try:
                             _send_json_line(sock, {"action": "msg_sent", "id": msg["id"], "client_id": client_msg_id, "to": to})
@@ -5673,6 +5874,37 @@ def handle_client(cs, addr):
                             pass
                 if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
+
+            elif action in ("file_rerequest", "file_rerequest_result"):
+                # "Get again": relay a request for a previously transferred file (or the answer) between two users.
+                # Only names, sizes and an opaque request id travel; the other client decides and never shares paths.
+                target = _canonical_username(msg.get("to"))
+                request_id = str(msg.get("request_id") or "")[:64]
+                if not target or not request_id or target.lower() == str(user).lower():
+                    continue
+                con = sqlite3.connect(DB)
+                blocked = con.execute(
+                    "SELECT 1 FROM contacts WHERE ((owner=? AND contact=?) OR (owner=? AND contact=?)) AND blocked=1",
+                    (target, user, user, target)).fetchone()
+                con.close()
+                payload = {"action": action, "from": user, "request_id": request_id,
+                           "filename": os.path.basename(str(msg.get("filename") or ""))[:255]}
+                if action == "file_rerequest":
+                    try:
+                        payload["size"] = int(msg.get("size") or 0)
+                    except Exception:
+                        payload["size"] = 0
+                else:
+                    payload["ok"] = bool(msg.get("ok"))
+                with lock:
+                    online = bool(user_sessions.get(target) or clients.get(target))
+                if blocked or not online:
+                    if action == "file_rerequest":
+                        _send_json_line(sock, {"action": "file_rerequest_result", "from": target, "request_id": request_id,
+                                               "ok": False, "filename": payload["filename"],
+                                               "reason": "offline" if not online else "blocked"})
+                    continue
+                _send_to_all_sessions({target}, payload)
 
             elif action in ("msg_edit", "msg_delete"):
                 is_edit = action == "msg_edit"
@@ -5795,8 +6027,11 @@ def handle_client(cs, addr):
                         "sent_at": datetime.datetime.utcnow().isoformat(),
                     })
 
+                offer_payload = {"action": "file_offer", "from": user, "files": files, "transfer_id": transfer_id}
+                if msg.get("rerequest_id"):
+                    offer_payload["rerequest_id"] = str(msg.get("rerequest_id"))[:64]
                 try:
-                    sock_to.sendall((json.dumps({"action": "file_offer", "from": user, "files": files, "transfer_id": transfer_id}) + "\n").encode())
+                    sock_to.sendall((json.dumps(offer_payload) + "\n").encode())
                 except:
                     sock.sendall((json.dumps({"action": "file_offer_failed", "to": to, "reason": f"Failed to send offer to {to}."}) + "\n").encode())
                     with transfer_lock: pending_transfers.pop(transfer_id, None)
