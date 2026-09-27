@@ -5167,7 +5167,8 @@ def handle_client(cs, addr):
                     _send_json_line(sock, {"action": "voice_call_result", "ok": True, "event": "voicemail_sent", "to": target})
 
             elif action == "msg":
-                to, frm = msg["to"], msg["from"]
+                msg["from"] = user  # never trust the client-supplied sender
+                to, frm = msg["to"], user
                 message_text = str(msg.get("msg", "") or "")
                 if _message_too_long(message_text, max_direct_message_length):
                     _send_json_line(sock, {
