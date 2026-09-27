@@ -25,7 +25,8 @@
 
 ## Chat Links
 - Links in chat messages are clickable.
-- Activate a message row (Enter or double-click) to open links.
+- Activate a message row (Enter or double-click) to open its link. If the message has no link, Enter opens the full message in a read-only text box you can read line by line; Escape closes it.
+- The context menu (Applications key or Shift+F10) on a message row also has "View Full Message".
 - If multiple links are present, the first one opens.
 
 ## File Transfers

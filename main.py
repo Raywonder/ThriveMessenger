@@ -2593,6 +2593,10 @@ class ClientApp(wx.App):
         except Exception:
             pass
         threading.Thread(target=self.listen_loop, daemon=True).start()
+        try:
+            self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
+        except Exception:
+            pass
 
     def _start_reconnect_loop(self):
         if self.intentional_disconnect or self.reconnect_in_progress:
@@ -3851,6 +3855,28 @@ class SavedMessagesDialog(wx.Dialog):
         btn.Bind(wx.EVT_BUTTON, lambda e: self.Close())
         s.Add(btn, 0, wx.ALIGN_CENTER | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         self.panel.SetSizer(s)
+
+class MessageViewerDialog(wx.Dialog):
+    """Read-only full view of one chat message, so long or multi-line messages can be read line by line."""
+    def __init__(self, parent, sender_label, text, time_label=""):
+        title = f"Message from {sender_label}" if sender_label else "Message"
+        super().__init__(parent, title=title, size=(760, 520), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        heading = f"{sender_label}, {time_label}" if time_label else sender_label
+        lbl = wx.StaticText(self.panel, label=f"&Message text ({heading}, {len(text)} characters):")
+        s.Add(lbl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.view = wx.TextCtrl(self.panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        self.view.SetName("Message text")
+        self.view.SetValue(str(text or ""))
+        self.view.SetInsertionPoint(0)
+        s.Add(self.view, 1, wx.EXPAND | wx.ALL, 8)
+        btn = wx.Button(self.panel, wx.ID_CLOSE, label="Close")
+        btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CLOSE))
+        self.SetEscapeId(wx.ID_CLOSE)
+        s.Add(btn, 0, wx.ALIGN_CENTER | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        self.panel.SetSizer(s)
+        self.view.SetFocus()
 
 class UserDirectoryDialog(wx.Dialog):
     def __init__(self, parent_frame, users, my_username, contact_states):
@@ -6028,7 +6054,14 @@ class MainFrame(wx.Frame):
         self.on_send(None)
     def receive_message(self, msg):
         app = wx.GetApp()
-        sender = msg["from"]
+        sender = str(msg.get("from") or "").strip()
+        if not sender:
+            return
+        text = str(msg.get("msg", "") or "")
+        # Some senders (relays, CLI tools) omit "time"; use the local receive time instead of dropping the message.
+        ts = msg.get("time") or datetime.datetime.now().isoformat()
+        if parse_timestamp_value(ts) is None:
+            ts = datetime.datetime.now().isoformat()
         is_logging_enabled = is_chat_logging_enabled(app.user_config, sender)
         is_contact = sender in self.contact_states
         dlg = self.get_chat(sender)
@@ -6046,7 +6079,7 @@ class MainFrame(wx.Frame):
         incoming_behavior = str(app.user_config.get('incoming_message_behavior', 'silent_count') or 'silent_count').strip().lower()
         if incoming_behavior == 'popup':
             dlg.Show()
-        dlg.append(msg["msg"], msg["from"], msg["time"])
+        dlg.append(text, sender, ts, announce=False)
         is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
         if not is_focused_chat:
             self._mark_unread(sender)
@@ -6057,9 +6090,10 @@ class MainFrame(wx.Frame):
         else:
             self._clear_unread(sender)
         played_bot_tts = play_tts_audio_from_message(msg)
-        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and is_focused_chat:
-            sender_label = self.format_user_label(msg['from'])
-            speak_text(f"{sender_label}: {msg['msg']}")
+        # Speak once here (append() is told not to), and not over a bot's own voice audio.
+        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
+            sender_label = self.format_user_label(sender)
+            speak_text(f"{sender_label} says {text}")
     def on_typing_event(self, msg):
         from_user = msg.get("from")
         is_typing = bool(msg.get("typing", False))
@@ -6953,6 +6987,11 @@ class ChatDialog(wx.Dialog):
                 self.sock.sendall(json.dumps(msg).encode()+b"\n")
             except Exception as e:
                 self.append_error(f"Message failed to send: {e}")
+                # A dead socket here means the connection dropped; start reconnecting rather than waiting for the keepalive.
+                try:
+                    wx.GetApp().on_server_disconnect()
+                except Exception:
+                    pass
                 return
         self.append(txt, self.user, ts)
         wx.GetApp().play_sound("send.wav")
@@ -7002,13 +7041,13 @@ class ChatDialog(wx.Dialog):
         self._pending_message_after_add = None
         self.input_ctrl.SetValue(pending)
         self.on_send(None)
-    def append(self, text, sender, ts, is_error=False):
+    def append(self, text, sender, ts, is_error=False, announce=True):
         display, formatted_time = self._build_message_display(text, sender, ts, is_error=is_error)
         self.hist.Append(display)
         self._history_rows.append({"sender": sender, "text": text, "time": ts, "error": is_error})
         self.hist.SetSelection(self.hist.GetCount() - 1)
         app = wx.GetApp()
-        if sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
+        if announce and sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
             parent = self.GetParent()
             sender_label = sender
             if parent and hasattr(parent, "format_user_label"):
@@ -7020,7 +7059,11 @@ class ChatDialog(wx.Dialog):
     def append_error(self, reason):
         ts = time.time()
         self.append(reason, "System", ts, is_error=True)
-        self.input_ctrl.SetFocus()
+        # Only move focus within this chat when it's already the active window; never pull focus from elsewhere.
+        if self.IsShown() and wx.GetActiveWindow() is self:
+            self.input_ctrl.SetFocus()
+        else:
+            speak_text(f"Chat with {self.contact}: {reason}")
     def _selected_history_index(self):
         idx = self.hist.GetSelection()
         if idx == wx.NOT_FOUND or idx < 0 or idx >= len(self._history_rows):
@@ -7056,16 +7099,35 @@ class ChatDialog(wx.Dialog):
         row = self._history_rows[idx]
         own_message = self._is_row_editable(row)
         menu = wx.Menu()
+        mi_view = menu.Append(wx.ID_ANY, "View Full Message")
         mi_edit = menu.Append(wx.ID_ANY, "Edit Message")
         mi_remove = menu.Append(wx.ID_ANY, "Remove Message")
         mi_undo = menu.Append(wx.ID_ANY, "Undo Delete")
         mi_edit.Enable(own_message)
         mi_undo.Enable(self._can_undo_delete())
+        self.Bind(wx.EVT_MENU, self.on_view_selected_message, mi_view)
         self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
         self.Bind(wx.EVT_MENU, self.on_remove_selected_message, mi_remove)
         self.Bind(wx.EVT_MENU, self.on_undo_last_deleted_message, mi_undo)
         self.PopupMenu(menu)
         menu.Destroy()
+    def on_view_selected_message(self, _=None):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        row = self._history_rows[idx]
+        sender = row.get("sender", "")
+        label = str(sender or "")
+        parent = self.GetParent()
+        if sender not in ("System", "") and parent and hasattr(parent, "format_user_label"):
+            try:
+                label = parent.format_user_label(sender)
+            except Exception:
+                pass
+        dlg = MessageViewerDialog(self, label, str(row.get("text", "")), format_timestamp(row.get("time", time.time())))
+        dlg.ShowModal()
+        dlg.Destroy()
+        self.hist.SetFocus()
     def on_edit_selected_message(self, _):
         idx = self._selected_history_index()
         if idx is None:
@@ -7109,6 +7171,7 @@ class ChatDialog(wx.Dialog):
         message_text = self._history_rows[idx].get("text", "")
         urls = extract_urls(message_text)
         if not urls:
+            self.on_view_selected_message()
             return
         if len(urls) == 1:
             open_path_or_url(urls[0])
