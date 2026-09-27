@@ -17,6 +17,8 @@ if (!(Test-Path $AppDir)) {
 New-Item -ItemType Directory -Force -Path (Join-Path $AppDir "sounds") | Out-Null
 Copy-Item -Recurse -Force "sounds\*" (Join-Path $AppDir "sounds")
 Copy-Item -Force "client.conf" (Join-Path $AppDir "client.conf")
+# NVDA controller client so announcements reach NVDA directly.
+Copy-Item -Force "native\windows\nvdaControllerClient*.dll" $AppDir
 
 if (Test-Path "assets") {
     Copy-Item -Recurse -Force "assets" (Join-Path $AppDir "assets")

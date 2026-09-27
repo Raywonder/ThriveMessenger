@@ -22,6 +22,7 @@ KEYRING_SERVICE = "ThriveMessenger"
 PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
 DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
+TYPING_IDLE_STOP_MS = 6000
 IDLE_KEEPALIVE_SECONDS = 15 * 60
 KEEPALIVE_CHECK_INTERVAL = 30
 KEEPALIVE_RESPONSE_TIMEOUT = 10
@@ -962,11 +963,59 @@ def ensure_help_docs():
         out[key] = path
     return out
 
+_nvda_controller = None
+
+def _nvda_controller_candidates():
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else sys.argv[0]))
+    source_dir = os.path.dirname(os.path.abspath(__file__))
+    roots = [exe_dir, getattr(sys, "_MEIPASS", None), source_dir, os.path.join(source_dir, "native", "windows"), os.getcwd()]
+    bits = "64" if sys.maxsize > 2**32 else "32"
+    names = [f"nvdaControllerClient{bits}.dll", "nvdaControllerClient.dll"]
+    for root in [r for r in roots if r]:
+        for name in names:
+            yield os.path.join(root, name)
+
+def _speak_with_nvda_controller(text, interrupt=False):
+    """Speak through the running NVDA via its controller client; False if NVDA or the DLL isn't available."""
+    global _nvda_controller
+    try:
+        import ctypes
+        if _nvda_controller is False:
+            return False
+        if _nvda_controller is None:
+            for candidate in _nvda_controller_candidates():
+                if not os.path.exists(candidate):
+                    continue
+                try:
+                    dll = ctypes.WinDLL(candidate)
+                    dll.nvdaController_speakText.argtypes = [ctypes.c_wchar_p]
+                    dll.nvdaController_speakText.restype = ctypes.c_int
+                    dll.nvdaController_testIfRunning.restype = ctypes.c_int
+                    dll.nvdaController_cancelSpeech.restype = ctypes.c_int
+                    _nvda_controller = dll
+                    break
+                except Exception:
+                    continue
+            if _nvda_controller is None:
+                _nvda_controller = False
+                return False
+        if _nvda_controller.nvdaController_testIfRunning() != 0:
+            return False
+        if interrupt:
+            _nvda_controller.nvdaController_cancelSpeech()
+        return _nvda_controller.nvdaController_speakText(str(text)) == 0
+    except Exception:
+        return False
+
 def speak_text(text, interrupt=None):
     try:
         if not text:
             return
         app = wx.GetApp() if wx.GetApp() else None
+        if sys.platform == 'win32':
+            nvda_interrupt = bool(getattr(app, "user_config", {}).get('interrupt_speech', True)) if (app and interrupt is None) else bool(interrupt)
+            if _speak_with_nvda_controller(text, interrupt=nvda_interrupt):
+                return
         if interrupt is None:
             interrupt = bool(getattr(app, "user_config", {}).get('interrupt_speech', True)) if app else True
         if interrupt and app:
@@ -5865,6 +5914,8 @@ class MainFrame(wx.Frame):
         if incoming_behavior == 'popup':
             dlg.Show()
         dlg.append(text, sender, ts, announce=False)
+        dlg.set_typing_label(sender, False)
+        self.clear_typing_state(sender)
         is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
         if not is_focused_chat:
             self._mark_unread(sender)
@@ -5879,16 +5930,68 @@ class MainFrame(wx.Frame):
         if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
             sender_label = self.format_user_label(sender)
             speak_text(f"{sender_label} says {text}")
+    TYPING_STOP_ANNOUNCE_DELAY_MS = 2500
+    def _typing_states(self):
+        if not hasattr(self, "_typing_state_by_user"):
+            self._typing_state_by_user = {}
+        return self._typing_state_by_user
     def on_typing_event(self, msg):
-        from_user = msg.get("from")
+        from_user = str(msg.get("from") or "").strip()
+        if not from_user:
+            return
         is_typing = bool(msg.get("typing", False))
+        app = wx.GetApp()
+        key = from_user.lower()
+        state = self._typing_states().setdefault(key, {"typing": False, "stop_call": None})
+        pending_stop = state.get("stop_call")
+        if pending_stop:
+            try:
+                pending_stop.Stop()
+            except Exception:
+                pass
+            state["stop_call"] = None
         chat = self.get_chat(from_user)
         if chat:
-            chat.set_typing_state(from_user, is_typing)
+            chat.set_typing_label(from_user, is_typing)
+        if not app.user_config.get('typing_indicators', True):
+            state["typing"] = False
+            return
+        announce = bool(app.user_config.get('announce_typing', True))
+        label = self.format_user_label(from_user)
+        if is_typing:
+            # Announce only the change to "typing"; repeats while they keep typing stay quiet.
+            if not state["typing"] and announce:
+                speak_text(f"{label} is typing", interrupt=False)
+            state["typing"] = True
+        elif state["typing"]:
+            # Wait briefly: if their message or more typing arrives first, "stopped typing" is just noise.
+            def _announce_stop():
+                state["stop_call"] = None
+                if state["typing"]:
+                    state["typing"] = False
+                    if announce:
+                        speak_text(f"{label} stopped typing", interrupt=False)
+            state["stop_call"] = wx.CallLater(self.TYPING_STOP_ANNOUNCE_DELAY_MS, _announce_stop)
+    def clear_typing_state(self, username):
+        """A message from this user means they're done typing; drop any pending "stopped typing"."""
+        state = self._typing_states().get(str(username or "").strip().lower())
+        if not state:
+            return
+        pending_stop = state.get("stop_call")
+        if pending_stop:
+            try:
+                pending_stop.Stop()
+            except Exception:
+                pass
+        state["stop_call"] = None
+        state["typing"] = False
     def on_message_failed(self, to, reason): chat_dlg = self.get_chat(to); (chat_dlg.append_error(reason) if chat_dlg else wx.MessageBox(reason, "Message Failed", wx.OK | wx.ICON_ERROR))
     def get_chat(self, contact):
+        wanted = str(contact or "").strip().lower()
+        if not wanted:
+            return None
         for child in self.GetChildren():
-            if isinstance(child, ChatDialog) and child.contact == contact: return child
+            if isinstance(child, ChatDialog) and str(child.contact or "").strip().lower() == wanted: return child
         return None
 
 def get_day_with_suffix(d): return str(d) + "th" if 11 <= d <= 13 else str(d) + {1: "st", 2: "nd", 3: "rd"}.get(d % 10, "th")
@@ -7103,7 +7206,7 @@ class ChatDialog(wx.Dialog):
                 except Exception:
                     pass
             if txt:
-                self._typing_timer.Start(1500, oneShot=True)
+                self._typing_timer.Start(TYPING_IDLE_STOP_MS, oneShot=True)
             elif self._sent_typing:
                 self._send_stop_typing()
         event.Skip()
@@ -7398,19 +7501,16 @@ class ChatDialog(wx.Dialog):
                 self.on_history_item_activated(event)
             return
         event.Skip()
-    def set_typing_state(self, username, is_typing):
+    def set_typing_label(self, username, is_typing):
         app = wx.GetApp()
-        if not app.user_config.get('typing_indicators', True):
-            self.typing_lbl.SetLabel("")
-            return
-        if is_typing:
-            self.typing_lbl.SetLabel(f"{username} is typing...")
-            if app.user_config.get('announce_typing', True):
-                speak_text(f"{username} started typing")
+        if is_typing and app.user_config.get('typing_indicators', True):
+            label = username
+            parent = self.GetParent()
+            if parent and hasattr(parent, "format_user_label"):
+                label = parent.format_user_label(username)
+            self.typing_lbl.SetLabel(f"{label} is typing...")
         else:
             self.typing_lbl.SetLabel("")
-            if app.user_config.get('announce_typing', True):
-                speak_text(f"{username} stopped typing")
     def on_close(self, event):
         # Guard against focus-switch side effects (e.g., Alt-Tab) closing chats.
         if not self._allow_close_once and not wx.GetApp().IsActive():
