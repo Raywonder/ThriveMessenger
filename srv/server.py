@@ -730,6 +730,32 @@ def _voice_payload_from_history(row_uid):
     return {"action": "msg", "from": frm, "to": to_user, "msg": body, "id": row_uid, "time": created_at,
             "voice": {"b64": b64, "mime": "audio/mpeg", "duration": duration, "voicemail": True}}
 
+def _deliver_pending_bot_messages(sock, username):
+    """Messages kept while an outside bot was disconnected, delivered in order when it signs in."""
+    con = sqlite3.connect(DB)
+    try:
+        rows = con.execute(
+            "SELECT p.msg_uid, h.frm, h.to_user, h.body, h.created_at, h.deleted_at FROM pending_bot_messages p "
+            "JOIN direct_message_history h ON h.msg_uid = p.msg_uid WHERE lower(p.to_user)=lower(?) ORDER BY h.id", (username,)).fetchall()
+    finally:
+        con.close()
+    delivered = 0
+    for uid, frm, to_user, body, created_at, deleted_at in rows:
+        try:
+            if not deleted_at:
+                _send_json_line(sock, {"action": "msg", "from": frm, "to": to_user, "msg": body, "id": uid,
+                                       "time": created_at + "Z", "server_time": created_at + "Z", "delayed": True})
+                delivered += 1
+            con = sqlite3.connect(DB)
+            con.execute("DELETE FROM pending_bot_messages WHERE msg_uid=?", (uid,))
+            con.execute("UPDATE direct_message_history SET delivered=1 WHERE msg_uid=?", (uid,))
+            con.commit(); con.close()
+        except Exception:
+            break
+    if delivered:
+        _clear_unreachable_notices(username)
+    return delivered
+
 def _deliver_pending_voicemail(sock, username):
     con = sqlite3.connect(DB)
     try:
@@ -2008,6 +2034,23 @@ def _natural_blocked_reply(sender_user, bot_name, reason):
         )
     return "That reply tried to come out as code. I stopped it and queued cleanup so the chat stays readable."
 
+_unreachable_notified = {}
+
+def _first_unreachable_notice(sender_user, bot_name, window=1800):
+    """True only for the first 'not connected' notice per sender and bot within the window (say it once)."""
+    key = (str(sender_user or "").lower(), str(bot_name or "").lower())
+    now = time.time()
+    last = _unreachable_notified.get(key, 0)
+    if now - last < window:
+        return False
+    _unreachable_notified[key] = now
+    return True
+
+def _clear_unreachable_notices(bot_name):
+    b = str(bot_name or "").lower()
+    for key in [k for k in _unreachable_notified if k[1] == b]:
+        _unreachable_notified.pop(key, None)
+
 def _natural_no_model_reply(sender_user, bot_name, text):
     lower = str(text or "").strip().lower()
     if not lower:
@@ -2431,28 +2474,18 @@ def _run_bot_reply(sender_sock, sender_user, to_user, text):
     if not reply:
         reply = _ollama_bot_reply(sender_user, to_user, text, sync_context=sync_context)
     if not reply:
-        lower = (text or "").strip().lower()
-        if not lower:
-            reply = _natural_no_model_reply(sender_user, to_user, text)
-        elif any(w in lower for w in ("hi", "hello", "hey")):
-            reply = _natural_no_model_reply(sender_user, to_user, text)
-        elif "help" in lower:
-            reply = "Tell me what you want to do, and I will either help directly or route the heavier work quietly."
-        elif "status" in lower:
-            reply = "I can check status when the worker route is available. I will keep the answer plain and evidence-based."
-        elif "file" in lower:
-            reply = "File sharing is available from the chat actions and the File Transfers view."
-        elif "admin" in lower:
-            reply = "Admin tools are available from the server/admin menus when your account role allows them."
-        else:
-            _append_agent_task("model_followup_needed", {
-                "user": sender_user,
-                "bot": to_user,
-                "reason": "No model reply or known intent matched. Re-read recent messages, repair model/gateway if needed, and continue the chat.",
-                "latest_user_message": _moderation_excerpt(text, 500),
-                "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
-            })
-            reply = _natural_no_model_reply(sender_user, to_user, text)
+        # Nothing actually answered. Never pretend otherwise with a canned acknowledgement.
+        _append_agent_task("model_followup_needed", {
+            "user": sender_user,
+            "bot": to_user,
+            "reason": "No model or agent answered. Re-read recent messages, repair the route, and reply for real.",
+            "latest_user_message": _moderation_excerpt(text, 500),
+            "recent_context": _bot_memory_context(sender_user, to_user, limit=6),
+        })
+        if not _first_unreachable_notice(sender_user, to_user):
+            return True
+        reply = (f"{to_user} couldn't answer just now: nothing is connected to reply for this account. "
+                 "Your message is saved in the chat history, and I won't send automatic replies in its place.")
     original_reply = str(reply or "")
     reply, blocked, reason = _user_facing_bot_output(original_reply)
     if blocked or not reply:
@@ -3469,6 +3502,7 @@ def init_db():
             cur.execute(f"ALTER TABLE direct_message_history ADD COLUMN {col} TEXT")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
     cur.execute("CREATE TABLE IF NOT EXISTS pending_voicemail (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS pending_bot_messages (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_message_cursors (
         bot TEXT NOT NULL,
         channel TEXT NOT NULL DEFAULT 'thrive',
@@ -4388,6 +4422,7 @@ def handle_client(cs, addr):
             session_preferences[sock] = {}
         # Voicemail left while this user was offline arrives shortly after sign-in.
         threading.Timer(2.0, _deliver_pending_voicemail, args=(sock, user)).start()
+        threading.Timer(2.5, _deliver_pending_bot_messages, args=(sock, user)).start()
 
         # Optional alert to the existing signed-in device when another login happens.
         if prior_sock and prior_sock is not sock:
@@ -5913,6 +5948,7 @@ def handle_client(cs, addr):
                 delivered_to_user = False
                 attachment_path = None
                 queued_voicemail = False
+                queued_for_bot = False
                 is_voicemail = bool(voice_mp3 is not None and msg.get("voice", {}).get("voicemail"))
                 bot_text = msg.get("msg", "")
                 if voice_mp3 is not None and _is_virtual_bot(to):
@@ -5928,6 +5964,9 @@ def handle_client(cs, addr):
                 elif not all_socks_to:
                     if is_voicemail and _canonical_username(to):
                         queued_voicemail = True
+                    elif _is_registered_bot(to) and not _is_virtual_bot(to):
+                        # An outside bot/agent that signs in by itself (e.g. Adam): keep it for when it's back.
+                        queued_for_bot = True
                     else:
                         reason = f"{to} is offline."
                 else:
@@ -5953,6 +5992,14 @@ def handle_client(cs, addr):
                         msg_uid=msg["id"],
                         attachment_path=attachment_path,
                     )
+                    if queued_for_bot:
+                        con = sqlite3.connect(DB)
+                        con.execute("INSERT OR REPLACE INTO pending_bot_messages(msg_uid, to_user, created_at) VALUES(?,?,?)",
+                                    (msg["id"], to, _iso_utc_now()))
+                        con.commit(); con.close()
+                        if _first_unreachable_notice(frm, to):
+                            _send_json_line(sock, {"action": "msg_failed", "to": to, "queued": True,
+                                                   "reason": f"{to} isn't connected right now; your message will be delivered when {to} is back."})
                     if queued_voicemail:
                         con = sqlite3.connect(DB)
                         con.execute("INSERT OR REPLACE INTO pending_voicemail(msg_uid, to_user, created_at) VALUES(?,?,?)",
