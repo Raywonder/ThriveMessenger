@@ -1707,6 +1707,27 @@ class AuthenticatedDevicesDialog(wx.Dialog):
         if wx.MessageBox(f"Sign out {label}?", "Confirm Device Sign Out", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES: return
         self.frame.sock.sendall((json.dumps({"action": "deauthenticate_device", "session_id": item.get("session_id", "")}) + "\n").encode())
 
+def apply_toggle_semantics(window):
+    """Every on/off control is a wx.CheckBox (NVDA: "check box, checked"). On macOS, mark them as switches so
+    VoiceOver says "switch, on/off" (the AXSwitch subrole NSSwitch uses); the control stays a native checkbox."""
+    if sys.platform != 'darwin':
+        return
+    try:
+        import objc
+    except Exception:
+        return
+    def walk(w):
+        for child in w.GetChildren():
+            if isinstance(child, wx.CheckBox):
+                try:
+                    view = objc.objc_object(c_void_p=child.GetHandle())
+                    if view.respondsToSelector_("setAccessibilitySubrole:"):
+                        view.setAccessibilitySubrole_("AXSwitch")
+                except Exception:
+                    pass
+            walk(child)
+    walk(window)
+
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config, can_admin=False):
         super().__init__(parent, title="Settings", size=(560, 650)); self.config = current_config
@@ -2075,7 +2096,11 @@ class SettingsDialog(wx.Dialog):
 
         main_sizer.Add(notebook, 1, wx.EXPAND | wx.ALL, 6)
         btn_sizer = wx.StdDialogButtonSizer()
-        ok_btn = wx.Button(panel, wx.ID_OK, label="&Apply"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        ok_btn = wx.Button(panel, wx.ID_OK, label="OK"); ok_btn.SetDefault(); cancel_btn = wx.Button(panel, wx.ID_CANCEL)
+        self.apply_btn = wx.Button(panel, wx.ID_APPLY, label="&Apply")
+        self.apply_btn.SetToolTip("Save these settings and keep Settings open.")
+        self.apply_btn.Bind(wx.EVT_BUTTON, self.on_apply)
+        self.SetEscapeId(wx.ID_CANCEL)
         
         if dark_mode_on:
             self.choice.SetBackgroundColour(dark_color); self.choice.SetForegroundColour(light_text_color)
@@ -2112,7 +2137,8 @@ class SettingsDialog(wx.Dialog):
             ok_btn.SetBackgroundColour(dark_color); ok_btn.SetForegroundColour(light_text_color)
             cancel_btn.SetBackgroundColour(dark_color); cancel_btn.SetForegroundColour(light_text_color)
             
-        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+        btn_sizer.AddButton(ok_btn); btn_sizer.AddButton(self.apply_btn); btn_sizer.AddButton(cancel_btn); btn_sizer.Realize(); main_sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10); panel.SetSizer(main_sizer)
+        apply_toggle_semantics(self)
         self.on_sound_pack_changed(None)
     def on_sound_pack_changed(self, _):
         selected = self.choice.GetStringSelection().strip().lower()
@@ -2248,6 +2274,10 @@ class SettingsDialog(wx.Dialog):
         except Exception as e:
             return False, str(e)
         return True, None
+    def on_apply(self, _):
+        parent = self.GetParent()
+        if parent and hasattr(parent, "apply_settings_dialog"):
+            parent.apply_settings_dialog(self)
     def restart_requested(self):
         if not self.restart_after_save_cb.IsChecked():
             return False, 0
@@ -2504,6 +2534,7 @@ class ClientApp(wx.App):
         self.transfer_history = []
         self.pending_rerequests = {}
         self.load_transfer_history()
+        self.outbox, self.pending_acks = [], {}
         has_invite_launch = bool(self.launch_invite_context.get("invite_token"))
         if self.user_config.get('autologin') and self.user_config.get('username') and not has_invite_launch:
             print("Attempting auto-login...")
@@ -2802,6 +2833,7 @@ class ClientApp(wx.App):
             self.frame.refresh_connection_title(connected=True)
         show_notification("Reconnected", f"Connected to {self._current_server_label()}.", timeout=5)
         self.play_sound("reconnected.wav")
+        speak_text("Reconnected", interrupt=False)
         try:
             if getattr(self, 'frame', None) and self.frame.current_status != "online":
                 self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
@@ -2812,6 +2844,7 @@ class ClientApp(wx.App):
             self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
         except Exception:
             pass
+        wx.CallLater(800, self._flush_outbox)
 
     def _start_reconnect_loop(self):
         if self.intentional_disconnect or self.reconnect_in_progress:
@@ -2854,6 +2887,10 @@ class ClientApp(wx.App):
                 return
             if attempt == 1 or attempt % 3 == 0:
                 wx.CallAfter(show_notification, "Reconnecting", f"Connection lost. Retrying ({attempt})...", 5)
+            if attempt == 4:
+                waiting = len(getattr(self, "outbox", []))
+                note = f" {waiting} message{'s' if waiting != 1 else ''} will be sent when it's back." if waiting else ""
+                wx.CallAfter(speak_text, f"Still reconnecting.{note}", False)
             delay = min(30, max(2, attempt * 2))
             for _ in range(delay):
                 if self.intentional_disconnect or self.reconnect_stop_event.is_set():
@@ -3167,8 +3204,71 @@ class ClientApp(wx.App):
     def on_banned(self):
         self._return_to_login("You have been banned.", "Banned")
 
+    # --- message delivery: queue while offline, confirm by server ack ------------------------
+    ACK_TIMEOUT_SECONDS = 12
+    def send_chat_payload(self, panel, payload):
+        """Send a chat message, or queue it while reconnecting. Returns 'sent' or 'queued'."""
+        if not hasattr(self, "outbox"):
+            self.outbox, self.pending_acks = [], {}
+        cid = payload.get("client_id")
+        if self.reconnect_in_progress or not getattr(self, "sock", None):
+            self.outbox.append({"panel": panel, "payload": payload})
+            return "queued"
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+        except Exception:
+            self.outbox.append({"panel": panel, "payload": payload})
+            wx.CallAfter(self.on_server_disconnect)
+            return "queued"
+        if cid:
+            self.pending_acks[cid] = {"panel": panel, "payload": payload, "sent_at": time.time()}
+            self._ensure_ack_watchdog()
+        return "sent"
+    def message_acknowledged(self, client_id):
+        getattr(self, "pending_acks", {}).pop(str(client_id or ""), None)
+    def message_rejected(self, to):
+        """The server answered msg_failed for this recipient: its oldest unconfirmed message isn't lost, it failed."""
+        pend = getattr(self, "pending_acks", {})
+        for cid, item in sorted(pend.items(), key=lambda kv: kv[1]["sent_at"]):
+            if str(item["payload"].get("to", "")).lower() == str(to or "").lower():
+                pend.pop(cid, None)
+                return
+    def _ensure_ack_watchdog(self):
+        if not getattr(self, "_ack_watchdog_running", False):
+            self._ack_watchdog_running = True
+            wx.CallLater(3000, self._ack_watchdog)
+    def _ack_watchdog(self):
+        pend = getattr(self, "pending_acks", {})
+        now = time.time()
+        stale = [cid for cid, item in pend.items() if now - item["sent_at"] > self.ACK_TIMEOUT_SECONDS]
+        if stale and not self.reconnect_in_progress and not self.intentional_disconnect:
+            # The server never confirmed these: the connection is dead even if the socket didn't say so.
+            for cid in sorted(stale, key=lambda c: pend[c]["sent_at"]):
+                item = pend.pop(cid)
+                self.outbox.append({"panel": item["panel"], "payload": item["payload"]})
+                if item["panel"]:
+                    item["panel"].mark_row_queued(cid, True)
+            log_event("warn", "message_ack_timeout", {"count": len(stale)})
+            self.on_server_disconnect()
+        if pend:
+            wx.CallLater(3000, self._ack_watchdog)
+        else:
+            self._ack_watchdog_running = False
+    def _flush_outbox(self):
+        queued, self.outbox = list(getattr(self, "outbox", [])), []
+        sent = 0
+        for item in queued:
+            payload = item["payload"]
+            panel = item["panel"]
+            if self.send_chat_payload(panel, payload) == "sent":
+                sent += 1
+                if panel:
+                    panel.mark_row_queued(payload.get("client_id"), False)
+        if sent:
+            speak_text(f"Sent {sent} message{'s' if sent != 1 else ''} that were waiting", interrupt=False)
+
     def on_server_disconnect(self):
-        if self.intentional_disconnect:
+        if self.intentional_disconnect or self.reconnect_in_progress:
             return
         try:
             self._keepalive_stop.set()
@@ -3182,6 +3282,7 @@ class ClientApp(wx.App):
             self.frame.refresh_connection_title(connected=False)
         show_notification("Connection lost", "Reconnecting in the background...", timeout=6)
         self.play_sound("connection_lost.wav")
+        speak_text("Reconnecting", interrupt=False)
         self._start_reconnect_loop()
 
     def _return_to_login(self, message, title):
@@ -4675,6 +4776,8 @@ class MainFrame(wx.Frame):
 
     def set_socket(self, sock):
         self.sock = sock
+        for panel in self.all_chats():
+            panel._sock = sock
         for child in self.GetChildren():
             if hasattr(child, 'sock'):
                 try:
@@ -5282,75 +5385,101 @@ class MainFrame(wx.Frame):
     def on_settings(self, event):
         app = wx.GetApp()
         can_admin_settings = self._feature_can_use("admin_console") and self._feature_ui_visible("admin_console")
+        came_from = wx.Window.FindFocus()
         with SettingsDialog(self, app.user_config, can_admin=can_admin_settings) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
-                selected_pack = dlg.choice.GetStringSelection()
-                app.user_config['soundpack'] = selected_pack
-                app.user_config['call_soundpack'] = "same" if dlg.call_pack_choice.GetSelection() <= 0 else dlg.call_pack_choice.GetStringSelection()
-                app.user_config['auto_play_voice_messages'] = dlg.auto_play_voice_cb.IsChecked()
-                if dlg.set_selected_default_cb.IsChecked() and selected_pack not in ("default", "none"):
-                    app.user_config['default_soundpack'] = selected_pack
-                app.user_config['sound_volume'] = int(dlg.sound_volume_slider.GetValue())
-                app.user_config['call_input_volume'] = int(dlg.call_input_slider.GetValue())
-                app.user_config['call_output_volume'] = int(dlg.call_output_slider.GetValue())
-                app.user_config['call_input_device'] = dlg.call_input_devices[dlg.call_input_device_choice.GetSelection()][0]
-                app.user_config['call_output_device'] = dlg.call_output_devices[dlg.call_output_device_choice.GetSelection()][0]
-                app.user_config['auto_open_received_files'] = dlg.auto_open_files_cb.IsChecked()
-                app.user_config['read_messages_aloud'] = dlg.read_aloud_cb.IsChecked()
-                app.user_config['interrupt_speech'] = dlg.interrupt_speech_cb.IsChecked()
-                app.user_config['save_chat_history_default'] = dlg.global_chat_logging_cb.IsChecked()
-                app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
-                app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
-                app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
-                app.user_config['prefer_contact_display_names'] = dlg.prefer_display_names_cb.IsChecked()
-                app.user_config['notify_on_other_device_login'] = dlg.notify_other_device_login_cb.IsChecked()
-                app.user_config['session_duration'] = ['hour', 'day', 'week', 'month', 'year', 'forever'][dlg.session_duration_choice.GetSelection()]
-                incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
-                incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
-                app.user_config['incoming_message_behavior'] = incoming_behavior
-                app.user_config['incoming_popup_on_message'] = (incoming_behavior == 'popup')
-                app.user_config['incoming_alert_on_message'] = incoming_behavior in ('notify', 'play_sound')
-                ts_mode_map = {0: 'start', 1: 'end', 2: 'off'}
-                app.user_config['message_timestamp_mode'] = ts_mode_map.get(dlg.timestamp_mode_choice.GetSelection(), 'start')
-                date_order_map = {0: 'mdy', 1: 'dmy', 2: 'ymd', 3: 'ydm'}
-                app.user_config['saved_history_date_order'] = date_order_map.get(dlg.saved_date_order_choice.GetSelection(), 'mdy')
-                enter_map = {0: 'none', 1: 'send', 2: 'place_call'}
-                app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'none')
-                app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
-                app.user_config['double_escape_to_close_chat'] = dlg.double_escape_chat_cb.IsChecked()
-                app.user_config['delete_messages_for_everyone'] = dlg.delete_for_everyone_cb.IsChecked()
-                app.user_config['chat_tabs'] = dlg.chat_tabs_cb.IsChecked()
-                app.user_config['keep_contact_list_open'] = dlg.keep_contact_list_cb.IsChecked()
-                app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
-                edit_window, undo_window = dlg.message_policy()
-                app.user_config['message_edit_window_seconds'] = edit_window
-                app.user_config['message_undo_window_seconds'] = undo_window
-                app.user_config['allow_cross_server_directory_message'] = dlg.allow_cross_server_dm_cb.IsChecked()
-                app.user_config['bot_mesh_agent_enabled'] = dlg.bot_agent_enabled_cb.IsChecked()
-                app.user_config['bot_mesh_agent_moderation'] = dlg.bot_agent_moderation_cb.IsChecked()
-                app.user_config['bot_mesh_agent_backend'] = dlg.bot_agent_backend_choice.GetStringSelection().strip().lower() or 'ollama'
-                app.user_config['bot_mesh_agent_auth_type'] = dlg.bot_agent_auth_choice.GetStringSelection().strip().lower() or 'codex'
-                app.user_config['bot_mesh_agent_delegate_to'] = dlg.bot_agent_delegate_txt.GetValue().strip()
-                app.user_config['bot_mesh_agent_notify_user'] = dlg.bot_agent_notify_txt.GetValue().strip()
-                app.user_config['bot_mesh_agent_user'] = dlg.bot_agent_user_txt.GetValue().strip()
-                app.user_config['bot_mesh_agent_host_label'] = dlg.bot_agent_host_label_txt.GetValue().strip()
-                ok_admin, admin_err = (True, None)
-                if can_admin_settings:
-                    ok_admin, admin_err = dlg.apply_admin_config()
-                save_user_config(app.user_config)
-                app.sync_session_preferences()
-                self.apply_action_button_layout()
-                self._apply_search_filter()
-                restart_req, restart_delay = dlg.restart_requested()
-                if restart_req:
-                    try:
-                        self.sock.sendall((json.dumps({"action": "schedule_restart", "seconds": int(restart_delay)}) + "\n").encode())
-                    except Exception:
-                        pass
-                if not ok_admin:
-                    wx.MessageBox(f"Settings saved, but advanced client config could not be written:\n{admin_err}", "Settings Saved With Warning", wx.OK | wx.ICON_WARNING)
-                else:
-                    wx.MessageBox("Settings have been applied.", "Settings Saved", wx.OK | wx.ICON_INFORMATION)
+                self.apply_settings_dialog(dlg)
+        wx.CallAfter(self._return_focus, came_from)
+    def _return_focus(self, window):
+        """After Settings closes, put focus back in the chat, contact list or other window it was opened from."""
+        try:
+            if window and window.IsShownOnScreen():
+                top = window.GetTopLevelParent()
+                if top:
+                    top.Raise()
+                window.SetFocus()
+                return
+        except Exception:
+            pass
+        self.focus_contact_list(announce=False)
+    def apply_settings_dialog(self, dlg):
+        """Save everything in the Settings dialog (used by OK and by Apply)."""
+        app = wx.GetApp()
+        can_admin = bool(getattr(dlg, "_can_admin", False))
+        selected_pack = dlg.choice.GetStringSelection()
+        app.user_config['soundpack'] = selected_pack
+        app.user_config['call_soundpack'] = "same" if dlg.call_pack_choice.GetSelection() <= 0 else dlg.call_pack_choice.GetStringSelection()
+        app.user_config['auto_play_voice_messages'] = dlg.auto_play_voice_cb.IsChecked()
+        if dlg.set_selected_default_cb.IsChecked() and selected_pack not in ("default", "none"):
+            app.user_config['default_soundpack'] = selected_pack
+        app.user_config['sound_volume'] = int(dlg.sound_volume_slider.GetValue())
+        app.user_config['call_input_volume'] = int(dlg.call_input_slider.GetValue())
+        app.user_config['call_output_volume'] = int(dlg.call_output_slider.GetValue())
+        app.user_config['call_input_device'] = dlg.call_input_devices[dlg.call_input_device_choice.GetSelection()][0]
+        app.user_config['call_output_device'] = dlg.call_output_devices[dlg.call_output_device_choice.GetSelection()][0]
+        app.user_config['auto_open_received_files'] = dlg.auto_open_files_cb.IsChecked()
+        app.user_config['read_messages_aloud'] = dlg.read_aloud_cb.IsChecked()
+        app.user_config['interrupt_speech'] = dlg.interrupt_speech_cb.IsChecked()
+        app.user_config['save_chat_history_default'] = dlg.global_chat_logging_cb.IsChecked()
+        app.user_config['show_main_action_buttons'] = dlg.show_main_actions_cb.IsChecked()
+        app.user_config['typing_indicators'] = dlg.typing_indicator_cb.IsChecked()
+        app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
+        app.user_config['prefer_contact_display_names'] = dlg.prefer_display_names_cb.IsChecked()
+        app.user_config['notify_on_other_device_login'] = dlg.notify_other_device_login_cb.IsChecked()
+        app.user_config['session_duration'] = ['hour', 'day', 'week', 'month', 'year', 'forever'][dlg.session_duration_choice.GetSelection()]
+        incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
+        incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
+        app.user_config['incoming_message_behavior'] = incoming_behavior
+        app.user_config['incoming_popup_on_message'] = (incoming_behavior == 'popup')
+        app.user_config['incoming_alert_on_message'] = incoming_behavior in ('notify', 'play_sound')
+        ts_mode_map = {0: 'start', 1: 'end', 2: 'off'}
+        app.user_config['message_timestamp_mode'] = ts_mode_map.get(dlg.timestamp_mode_choice.GetSelection(), 'start')
+        date_order_map = {0: 'mdy', 1: 'dmy', 2: 'ymd', 3: 'ydm'}
+        app.user_config['saved_history_date_order'] = date_order_map.get(dlg.saved_date_order_choice.GetSelection(), 'mdy')
+        enter_map = {0: 'none', 1: 'send', 2: 'place_call'}
+        app.user_config['enter_key_action'] = enter_map.get(dlg.enter_action_choice.GetSelection(), 'none')
+        app.user_config['escape_main_action'] = ('none' if dlg.escape_action_choice.GetSelection() == 0 else ('minimize' if dlg.escape_action_choice.GetSelection() == 1 else 'quit'))
+        app.user_config['double_escape_to_close_chat'] = dlg.double_escape_chat_cb.IsChecked()
+        app.user_config['delete_messages_for_everyone'] = dlg.delete_for_everyone_cb.IsChecked()
+        app.user_config['chat_tabs'] = dlg.chat_tabs_cb.IsChecked()
+        app.user_config['keep_contact_list_open'] = dlg.keep_contact_list_cb.IsChecked()
+        app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
+        edit_window, undo_window = dlg.message_policy()
+        app.user_config['message_edit_window_seconds'] = edit_window
+        app.user_config['message_undo_window_seconds'] = undo_window
+        app.user_config['allow_cross_server_directory_message'] = dlg.allow_cross_server_dm_cb.IsChecked()
+        app.user_config['bot_mesh_agent_enabled'] = dlg.bot_agent_enabled_cb.IsChecked()
+        app.user_config['bot_mesh_agent_moderation'] = dlg.bot_agent_moderation_cb.IsChecked()
+        app.user_config['bot_mesh_agent_backend'] = dlg.bot_agent_backend_choice.GetStringSelection().strip().lower() or 'ollama'
+        app.user_config['bot_mesh_agent_auth_type'] = dlg.bot_agent_auth_choice.GetStringSelection().strip().lower() or 'codex'
+        app.user_config['bot_mesh_agent_delegate_to'] = dlg.bot_agent_delegate_txt.GetValue().strip()
+        app.user_config['bot_mesh_agent_notify_user'] = dlg.bot_agent_notify_txt.GetValue().strip()
+        app.user_config['bot_mesh_agent_user'] = dlg.bot_agent_user_txt.GetValue().strip()
+        app.user_config['bot_mesh_agent_host_label'] = dlg.bot_agent_host_label_txt.GetValue().strip()
+        ok_admin, admin_err = (True, None)
+        if can_admin:
+            ok_admin, admin_err = dlg.apply_admin_config()
+        save_user_config(app.user_config)
+        app.sync_session_preferences()
+        self.apply_action_button_layout()
+        self._apply_search_filter()
+        restart_req, restart_delay = dlg.restart_requested()
+        if restart_req:
+            try:
+                self.sock.sendall((json.dumps({"action": "schedule_restart", "seconds": int(restart_delay)}) + "\n").encode())
+            except Exception:
+                pass
+        if restart_req:
+            # Only schedule once, even if Apply is followed by OK.
+            try:
+                dlg.restart_after_save_cb.SetValue(False)
+            except Exception:
+                pass
+        if not ok_admin:
+            wx.MessageBox(f"Settings saved, but advanced client config could not be written:\n{admin_err}", "Settings Saved With Warning", wx.OK | wx.ICON_WARNING, dlg)
+        else:
+            app.play_sound("copied.wav")
+            speak_text("Settings saved", interrupt=True)
 
     def show_authenticated_devices(self):
         dialog = getattr(self, "_authenticated_devices_dialog", None)
@@ -6350,6 +6479,7 @@ class MainFrame(wx.Frame):
         other = to if frm.lower() == me else frm
         return self.get_chat(other)
     def on_message_sent_ack(self, msg):
+        wx.GetApp().message_acknowledged(msg.get("client_id"))
         chat = self.get_chat(msg.get("to"))
         if chat:
             chat.set_row_message_id(str(msg.get("client_id") or ""), str(msg.get("id") or ""))
@@ -6438,6 +6568,7 @@ class MainFrame(wx.Frame):
         state["stop_call"] = None
         state["typing"] = False
     def on_message_failed(self, to, reason):
+        wx.GetApp().message_rejected(to)
         if "offline" in str(reason).lower():
             reason = f"{reason} Press Control Shift R to leave a voicemail they'll get when they sign in."
         chat_dlg = self.get_chat(to)
@@ -6575,24 +6706,37 @@ class ModuleManagerDialog(wx.Dialog):
         self.sock, self.modules = sock, []
         self.Bind(wx.EVT_CLOSE, self.on_close)
         panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
-        s.Add(wx.StaticText(panel, label="Bundled modules are already installed. Enable or disable the selected module for this server:"), 0, wx.EXPAND | wx.ALL, 8)
-        self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        s.Add(wx.StaticText(panel, label="Modules for this server. Each one has a checkbox: press Space to turn it on or off."), 0, wx.EXPAND | wx.ALL, 8)
+        self.list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL, name="Server modules")
+        self._populating = False
+        try:
+            self.list.EnableCheckBoxes(True)
+        except Exception:
+            pass
         self.list.InsertColumn(0, "Module", width=170); self.list.InsertColumn(1, "State", width=90); self.list.InsertColumn(2, "Description", width=410)
         self.list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_toggle)
+        self.list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_checked)
+        self.list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_checked)
         s.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         row = wx.BoxSizer(wx.HORIZONTAL)
-        toggle = wx.Button(panel, label="&Enable or disable"); toggle.Bind(wx.EVT_BUTTON, self.on_toggle)
         refresh = wx.Button(panel, label="&Refresh"); refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
         close = wx.Button(panel, wx.ID_CLOSE); close.Bind(wx.EVT_BUTTON, lambda event: self.Close())
-        for button in (toggle, refresh, close): row.Add(button, 1, wx.RIGHT, 5)
+        for button in (refresh, close): row.Add(button, 1, wx.RIGHT, 5)
         s.Add(row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8); panel.SetSizer(s)
     def on_close(self, event):
         parent = self.GetParent()
         if parent: parent._module_dialog = None
         event.Skip()
     def on_refresh(self, _): self.sock.sendall((json.dumps({"action": "module_list"}) + "\n").encode())
+    def on_checked(self, event):
+        if self._populating:
+            return
+        self._toggle_index(event.GetIndex())
     def on_toggle(self, _):
         index = self.list.GetFirstSelected()
+        if index < 0 or index >= len(self.modules): return
+        self._toggle_index(index)
+    def _toggle_index(self, index):
         if index < 0 or index >= len(self.modules): return
         module = self.modules[index]
         if not module.get("installed", False):
@@ -6606,13 +6750,21 @@ class ModuleManagerDialog(wx.Dialog):
             elif msg.get("event") == "installed": show_notification("Server modules", "Module installed. Restart the Thrive server to load it.", timeout=7)
             self.on_refresh(None); return
         if not msg.get("ok"): return
-        self.modules = list(msg.get("modules", [])); self.list.DeleteAllItems()
-        for module in self.modules:
-            index = self.list.InsertItem(self.list.GetItemCount(), module.get("name", module.get("module_id", "")))
-            state = "not installed" if not module.get("installed") else ("enabled" if module.get("enabled") else "disabled")
-            if module.get("experimental"): state += ", experimental"
-            self.list.SetItem(index, 1, state)
-            self.list.SetItem(index, 2, module.get("description", ""))
+        self.modules = list(msg.get("modules", [])); self._populating = True
+        try:
+            self.list.DeleteAllItems()
+            for module in self.modules:
+                index = self.list.InsertItem(self.list.GetItemCount(), module.get("name", module.get("module_id", "")))
+                state = "not installed" if not module.get("installed") else ("enabled" if module.get("enabled") else "disabled")
+                if module.get("experimental"): state += ", experimental"
+                self.list.SetItem(index, 1, state)
+                self.list.SetItem(index, 2, module.get("description", ""))
+                try:
+                    self.list.CheckItem(index, bool(module.get("installed") and module.get("enabled")))
+                except Exception:
+                    pass
+        finally:
+            self._populating = False
 
 
 class AdminDialog(wx.Dialog):
@@ -7268,16 +7420,18 @@ class GroupCallDialog(wx.Dialog):
         self.btn_leave = wx.Button(panel, label="Leave")
         self.btn_refresh = wx.Button(panel, label="Refresh")
         self.btn_ping = wx.Button(panel, label="Send Test Signal")
-        self.btn_mute = wx.Button(panel, label="&Mute microphone")
-        self.btn_deafen = wx.Button(panel, label="&Deafen speakers")
+        # On/off controls are checkboxes, so screen readers say "checked" / "not checked" (switches on macOS).
+        self.btn_mute = wx.CheckBox(panel, label="&Mute microphone")
+        self.btn_deafen = wx.CheckBox(panel, label="&Deafen speakers")
         for b in [self.btn_join, self.btn_leave, self.btn_refresh, self.btn_ping, self.btn_mute, self.btn_deafen]:
             btn_row.Add(b, 1, wx.EXPAND | wx.ALL, 3)
         self.btn_join.Bind(wx.EVT_BUTTON, self.on_join)
         self.btn_leave.Bind(wx.EVT_BUTTON, self.on_leave)
         self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh)
         self.btn_ping.Bind(wx.EVT_BUTTON, self.on_ping)
-        self.btn_mute.Bind(wx.EVT_BUTTON, self.on_toggle_mute)
-        self.btn_deafen.Bind(wx.EVT_BUTTON, self.on_toggle_deafen)
+        self.btn_mute.Bind(wx.EVT_CHECKBOX, self.on_toggle_mute)
+        self.btn_deafen.Bind(wx.EVT_CHECKBOX, self.on_toggle_deafen)
+        apply_toggle_semantics(self)
 
         self.calls_list = wx.ListBox(panel, style=wx.LB_SINGLE)
         self.calls_list.Bind(wx.EVT_LISTBOX, self.on_select_call)
@@ -7403,13 +7557,11 @@ class GroupCallDialog(wx.Dialog):
             self._append_log(f"Signal failed: {e}")
 
     def on_toggle_mute(self, _):
-        self.muted = not self.muted
-        self.btn_mute.SetLabel("&Unmute microphone" if self.muted else "&Mute microphone")
+        self.muted = bool(self.btn_mute.GetValue())
         self._append_log("Microphone muted." if self.muted else "Microphone unmuted.")
 
     def on_toggle_deafen(self, _):
-        self.deafened = not self.deafened
-        self.btn_deafen.SetLabel("&Undeafen speakers" if self.deafened else "&Deafen speakers")
+        self.deafened = bool(self.btn_deafen.GetValue())
         self._append_log("Speakers deafened." if self.deafened else "Speakers enabled.")
 
     def handle_call_event(self, msg):
@@ -8098,7 +8250,8 @@ class ChatPanel(wx.Panel):
         self.window = None
         self.unread_count = 0
         self.SetName(f"Conversation with {contact}")
-        self.contact, self.sock, self.user = contact, sock, user
+        self._sock = sock
+        self.contact, self.user = contact, user
         self.is_contact = bool(is_contact)
         self.remote_server_entry = remote_server_entry
         self.remote_target_user = str(remote_target_user or contact)
@@ -8213,6 +8366,14 @@ class ChatPanel(wx.Panel):
     def _focus_input(self):
         wx.CallAfter(self.input_ctrl.SetFocus)
         wx.CallLater(120, self.input_ctrl.SetFocus)
+    @property
+    def sock(self):
+        # Always the app's current connection, so a reconnect can never leave a chat on a dead socket.
+        app = wx.GetApp()
+        return getattr(app, "sock", None) or self._sock
+    @sock.setter
+    def sock(self, value):
+        self._sock = value
     # --- hosting (ChatWindow) -------------------------------------------------
     def display_name(self):
         try:
@@ -8480,17 +8641,15 @@ class ChatPanel(wx.Panel):
                 return
             client_id = uuid.uuid4().hex
             msg = {"action":"msg","to":self.contact,"from":self.user,"msg":txt,"time":ts,"client_id":client_id}
-            try:
-                self.sock.sendall(json.dumps(msg).encode()+b"\n")
-            except Exception as e:
-                self.append_error(f"Message failed to send: {e}")
-                # A dead socket here means the connection dropped; start reconnecting rather than waiting for the keepalive.
-                try:
-                    wx.GetApp().on_server_disconnect()
-                except Exception:
-                    pass
-                return
-        self.append(txt, self.user, ts, client_id=(client_id if not self.is_remote_directory_chat else None))
+            state = wx.GetApp().send_chat_payload(self, msg)
+            self.append(txt, self.user, ts, client_id=client_id)
+            if state == "queued":
+                self.mark_row_queued(client_id, True)
+                speak_text("Offline. The message will be sent when Thrive reconnects.", interrupt=False)
+            wx.GetApp().play_sound("send.wav")
+            self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
+            return
+        self.append(txt, self.user, ts, client_id=None)
         wx.GetApp().play_sound("send.wav")
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
@@ -8796,11 +8955,19 @@ class ChatPanel(wx.Panel):
         text = row.get("text", "")
         if row.get("edited"):
             text = f"{text} (edited)"
+        if row.get("queued"):
+            text = f"{text} (not sent yet, will send when reconnected)"
         display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
         selected = self.hist.GetSelection()
         self.hist.SetString(idx, display)
         if selected != wx.NOT_FOUND:
             self.hist.SetSelection(selected)
+    def mark_row_queued(self, client_id, queued):
+        for i, r in enumerate(self._history_rows):
+            if client_id and r.get("client_id") == client_id:
+                r["queued"] = bool(queued)
+                self._refresh_row_display(i)
+                return
     def set_row_message_id(self, client_id, msg_id):
         if not client_id or not msg_id:
             return
