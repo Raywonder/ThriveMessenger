@@ -28,6 +28,7 @@ PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
 DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
 TYPING_IDLE_STOP_MS = 6000
+LOGIN_RESPONSE_TIMEOUT = 20
 IDLE_KEEPALIVE_SECONDS = 15 * 60
 KEEPALIVE_CHECK_INTERVAL = 30
 KEEPALIVE_RESPONSE_TIMEOUT = 10
@@ -2644,9 +2645,15 @@ class ClientApp(wx.App):
                 set_active_server_config(server_entry)
             ssock = create_secure_socket(server_entry)
             login_request = {"action":"login","user":username,"pass":password, **_device_login_fields(self.user_config)}
+            # Never wait forever for a server that accepts the connection but doesn't answer.
+            ssock.settimeout(LOGIN_RESPONSE_TIMEOUT)
             ssock.sendall(json.dumps(login_request).encode()+b"\n")
             sf = ssock.makefile()
-            resp = json.loads(sf.readline() or "{}")
+            try:
+                resp = json.loads(sf.readline() or "{}")
+            except (socket.timeout, TimeoutError):
+                resp = {"status": "error", "reason": "The server didn't answer the sign-in request. Check the server address in Server Manager."}
+            ssock.settimeout(None)
             if resp.get("status") == "ok":
                 self.session_password = password
                 self.active_server_entry = normalize_server_entry(server_entry or SERVER_CONFIG)
