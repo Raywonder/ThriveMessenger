@@ -506,7 +506,7 @@ def _feature_caps_for_user(username):
 
 def _send_feature_caps(sock, username):
     try:
-        sock.sendall((json.dumps({"action": "feature_caps", "caps": _feature_caps_for_user(username)}) + "\n").encode())
+        sock.sendall((json.dumps({"action": "feature_caps", "caps": _feature_caps_for_user(username), "is_admin": _is_admin(username)}) + "\n").encode())
     except Exception:
         pass
 
@@ -615,6 +615,64 @@ def _remove_user_from_all_direct_calls(username):
 
 def _is_admin(username):
     return str(username or "").strip() in get_admins()
+
+def _send_to_all_sessions(usernames, payload):
+    """Send one event to every signed-in device of each user (names matched ignoring case)."""
+    wanted = {str(u or "").strip().lower() for u in usernames if str(u or "").strip()}
+    with lock:
+        targets = []
+        for uname, socks in user_sessions.items():
+            if uname.lower() in wanted:
+                targets.extend(socks)
+        for uname, s in clients.items():
+            if uname.lower() in wanted and s not in targets:
+                targets.append(s)
+    for target in targets:
+        try:
+            _send_json_line(target, payload)
+        except Exception:
+            pass
+
+def _apply_direct_message_change(actor, msg_uid, is_edit, new_text=""):
+    """Edit or delete-for-everyone one direct message. Only its sender or an admin may do this.
+    Returns (ok, reason, (from, to))."""
+    if not msg_uid:
+        return False, "That message can't be changed because it has no server ID.", None
+    if is_edit:
+        if not new_text.strip():
+            return False, "An edited message can't be empty.", None
+        if _message_too_long(new_text, max_direct_message_length):
+            return False, f"Message is too long. This server allows up to {max_direct_message_length} characters.", None
+    con = sqlite3.connect(DB)
+    try:
+        row = con.execute(
+            "SELECT id, frm, to_user, deleted_at FROM direct_message_history WHERE msg_uid=? ORDER BY id DESC LIMIT 1",
+            (msg_uid,),
+        ).fetchone()
+        if not row:
+            return False, "That message wasn't found on the server.", None
+        row_id, frm_user, to_user, deleted_at = row
+        if deleted_at:
+            return False, "That message was already deleted.", None
+        is_sender = str(frm_user or "").lower() == str(actor or "").lower()
+        if not is_sender and not _is_admin(actor):
+            verb = "edit" if is_edit else "delete"
+            return False, f"Only the person who sent a message, or an admin, can {verb} it.", None
+        now_iso = _iso_utc_now()
+        if is_edit:
+            con.execute(
+                "UPDATE direct_message_history SET body=?, sensitivity=?, edited_at=?, edited_by=? WHERE id=?",
+                (new_text[:max(4000, max_direct_message_length)], _message_sensitivity(new_text), now_iso, actor, row_id),
+            )
+        else:
+            con.execute(
+                "UPDATE direct_message_history SET body='', deleted_at=?, deleted_by=? WHERE id=?",
+                (now_iso, actor, row_id),
+            )
+        con.commit()
+        return True, "", (frm_user, to_user)
+    finally:
+        con.close()
 
 def _is_virtual_bot(username):
     uname = str(username or "").strip()
@@ -863,7 +921,7 @@ def _message_sensitivity(text):
         return "sensitive"
     return "normal"
 
-def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, delivered=False, source="thrive"):
+def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, delivered=False, source="thrive", msg_uid=None):
     frm = str(frm or "").strip()
     to = str(to or "").strip()
     body = str(body or "")
@@ -876,8 +934,8 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
             """
             INSERT INTO direct_message_history(
                 frm, to_user, frm_canonical, to_canonical, body, source,
-                sensitivity, handled_by_bot, delivered, created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                sensitivity, handled_by_bot, delivered, created_at, msg_uid
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 frm,
@@ -890,6 +948,7 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
                 1 if handled_by_bot else 0,
                 1 if delivered else 0,
                 _iso_utc_now(),
+                str(msg_uid) if msg_uid else None,
             ),
         )
         con.commit()
@@ -961,7 +1020,7 @@ def _missed_bot_messages(bot_name, channel="thrive", limit=None):
             """
             SELECT id, frm, frm_canonical, body, source, sensitivity, created_at, handled_by_bot
             FROM direct_message_history
-            WHERE to_user=? AND id>? AND source=?
+            WHERE to_user=? AND id>? AND source=? AND deleted_at IS NULL
             ORDER BY id ASC
             LIMIT ?
             """,
@@ -3130,6 +3189,11 @@ def init_db():
         delivered INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
     )''')
+    dmh_cols = [row[1] for row in cur.execute("PRAGMA table_info(direct_message_history)")]
+    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by"):
+        if col not in dmh_cols:
+            cur.execute(f"ALTER TABLE direct_message_history ADD COLUMN {col} TEXT")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_message_cursors (
         bot TEXT NOT NULL,
         channel TEXT NOT NULL DEFAULT 'thrive',
@@ -5415,6 +5479,8 @@ def handle_client(cs, addr):
                 msg["from"] = user  # never trust the client-supplied sender
                 if not msg.get("time"):
                     msg["time"] = datetime.datetime.now().isoformat()  # older clients drop messages without a time
+                client_msg_id = str(msg.pop("client_id", "") or "")[:80]
+                msg["id"] = uuid.uuid4().hex  # server-assigned, used for edit/delete-for-everyone
                 to, frm = msg["to"], user
                 message_text = str(msg.get("msg", "") or "")
                 if _message_too_long(message_text, max_direct_message_length):
@@ -5477,9 +5543,34 @@ def handle_client(cs, addr):
                         handled_by_bot=handled_by_bot,
                         delivered=delivered_to_user,
                         source="thrive",
+                        msg_uid=msg["id"],
                     )
+                    if client_msg_id:
+                        try:
+                            _send_json_line(sock, {"action": "msg_sent", "id": msg["id"], "client_id": client_msg_id, "to": to})
+                        except Exception:
+                            pass
                 if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
+
+            elif action in ("msg_edit", "msg_delete"):
+                is_edit = action == "msg_edit"
+                result_action = "msg_edit_result" if is_edit else "msg_delete_result"
+                msg_uid = str(msg.get("id") or "").strip()
+                new_text = str(msg.get("msg", "") or "") if is_edit else ""
+                ok, reason, row = _apply_direct_message_change(user, msg_uid, is_edit, new_text)
+                if not ok:
+                    _send_json_line(sock, {"action": result_action, "ok": False, "id": msg_uid, "reason": reason})
+                    continue
+                frm_user, to_user = row
+                now_iso = _iso_utc_now()
+                if is_edit:
+                    event = {"action": "msg_edited", "id": msg_uid, "from": frm_user, "to": to_user, "msg": new_text, "edited_by": user, "edited_at": now_iso}
+                else:
+                    event = {"action": "msg_deleted", "id": msg_uid, "from": frm_user, "to": to_user, "deleted_by": user, "deleted_at": now_iso}
+                # Both people in the conversation (every device), plus the acting admin's own devices.
+                _send_to_all_sessions({frm_user, to_user, user}, event)
+                _send_json_line(sock, {"action": result_action, "ok": True, "id": msg_uid})
 
             elif action == "typing":
                 to = str(msg.get("to") or "").strip()
