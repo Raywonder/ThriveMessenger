@@ -1052,6 +1052,34 @@ def _speak_with_nvda_controller(text, interrupt=False):
     except Exception:
         return False
 
+def _voiceover_enabled():
+    try:
+        from AppKit import NSWorkspace
+        return bool(NSWorkspace.sharedWorkspace().isVoiceOverEnabled())
+    except Exception:
+        return False
+
+def _speak_with_voiceover(text, interrupt=False):
+    """macOS: hand the text to VoiceOver as an accessibility announcement (like NVDA on Windows).
+    False when VoiceOver is off or AppKit isn't available, so the caller can fall back to 'say'."""
+    try:
+        from AppKit import (NSApplication, NSWorkspace, NSAccessibilityPostNotificationWithUserInfo,
+                            NSAccessibilityAnnouncementRequestedNotification, NSAccessibilityAnnouncementKey,
+                            NSAccessibilityPriorityKey, NSAccessibilityPriorityHigh, NSAccessibilityPriorityMedium)
+    except Exception:
+        return False
+    try:
+        if not NSWorkspace.sharedWorkspace().isVoiceOverEnabled():
+            return False
+        app = NSApplication.sharedApplication()
+        element = app.keyWindow() or app.mainWindow() or app
+        info = {NSAccessibilityAnnouncementKey: str(text),
+                NSAccessibilityPriorityKey: NSAccessibilityPriorityHigh if interrupt else NSAccessibilityPriorityMedium}
+        NSAccessibilityPostNotificationWithUserInfo(element, NSAccessibilityAnnouncementRequestedNotification, info)
+        return True
+    except Exception:
+        return False
+
 def speak_text(text, interrupt=None):
     try:
         if not text:
@@ -1071,6 +1099,13 @@ def speak_text(text, interrupt=None):
                 except Exception:
                     pass
         if sys.platform == 'darwin':
+            vo_interrupt = bool(interrupt) if interrupt is not None else bool(getattr(app, "user_config", {}).get('interrupt_speech', True)) if app else True
+            if threading.current_thread() is threading.main_thread():
+                if _speak_with_voiceover(text, interrupt=vo_interrupt):
+                    return
+            elif _voiceover_enabled():
+                wx.CallAfter(_speak_with_voiceover, text, vo_interrupt)
+                return
             if interrupt:
                 subprocess.Popen(['killall', 'say'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             proc = subprocess.Popen(['say', text])
@@ -7603,10 +7638,56 @@ class _MciAudio(object):
         self.cmd(f"seek {self.alias} to {int(ms)}")
         if playing:
             self.cmd(f"play {self.alias}")
+    def stop(self):
+        self.cmd(f"stop {self.alias}")
     def close(self):
         if self.open:
             self.cmd(f"close {self.alias}")
             self.open = False
+
+class _NSSoundAudio(object):
+    """macOS playback through AppKit NSSound: MP3/WAV with pause, resume and seek."""
+    def __init__(self):
+        from AppKit import NSSound  # noqa: F401 (raises if AppKit is missing)
+        self.sound = None
+        self.open = False
+        self._paused = False
+    def load(self, path):
+        from AppKit import NSSound
+        self.close()
+        self.sound = NSSound.alloc().initWithContentsOfFile_byReference_(path, True)
+        self.open = self.sound is not None
+        return self.open
+    def length(self):
+        return int(self.sound.duration() * 1000) if self.sound else 0
+    def position(self):
+        return int(self.sound.currentTime() * 1000) if self.sound else 0
+    def mode(self):
+        if not self.sound:
+            return "stopped"
+        if self._paused:
+            return "paused"
+        return "playing" if self.sound.isPlaying() else "stopped"
+    def play(self):
+        self._paused = False
+        return bool(self.sound and self.sound.play())
+    def pause(self):
+        if self.sound and self.sound.pause():
+            self._paused = True
+    def resume(self):
+        if self.sound and self.sound.resume():
+            self._paused = False
+    def seek(self, ms, playing):
+        if self.sound:
+            self.sound.setCurrentTime_(max(0.0, ms / 1000.0))
+    def stop(self):
+        if self.sound:
+            self.sound.stop()
+        self._paused = False
+    def close(self):
+        self.stop()
+        self.sound = None
+        self.open = False
 
 class VoicePlayer(object):
     """Plays one voice message at a time inside a chat, without dialogs or focus changes.
@@ -7621,12 +7702,12 @@ class VoicePlayer(object):
         self.state = "stopped"
         self._timer = None
     def _ensure(self):
-        if sys.platform == 'win32':
+        if sys.platform in ('win32', 'darwin'):
             if self.mci is None:
                 try:
-                    self.mci = _MciAudio()
+                    self.mci = _MciAudio() if sys.platform == 'win32' else _NSSoundAudio()
                 except Exception as e:
-                    print(f"MCI unavailable: {e}")
+                    print(f"Native audio player unavailable: {e}")
             if self.mci is not None:
                 return self.mci
         if self.ctrl is None and wxmedia is not None:
@@ -7710,7 +7791,7 @@ class VoicePlayer(object):
         was = self.state
         self.state = "stopped"
         if self.mci and self.mci.open:
-            self.mci.cmd(f"stop {self.mci.alias}")
+            self.mci.stop()
             self.mci.close()
         elif self.ctrl:
             self.ctrl.Stop()
@@ -8871,6 +8952,9 @@ class ChatPanel(wx.Panel):
         if event.GetKeyCode() in (ord('S'), ord('s')) and event.ControlDown() and not event.AltDown() and not event.ShiftDown():
             self.on_save_selected_to_archive()
             return
+        if sys.platform == 'darwin' and event.GetKeyCode() == wx.WXK_BACK and event.CmdDown():
+            self.on_remove_selected_message(None)  # Command+Delete, the Mac way to delete an item
+            return
         if event.GetKeyCode() in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE) and not event.HasAnyModifiers():
             self.on_remove_selected_message(None)
             return
@@ -9079,8 +9163,23 @@ class ChatWindow(wx.Frame):
         event.Skip()
     def on_key(self, event):
         code = event.GetKeyCode()
-        ctrl = event.ControlDown() and not event.AltDown()
+        ctrl = event.ControlDown() and not event.AltDown()   # Command on macOS
         shift = event.ShiftDown()
+        if sys.platform == 'darwin':
+            raw_ctrl = event.RawControlDown() and not event.AltDown()
+            # Ctrl+Tab (Command+Tab belongs to macOS), plus the usual Command+Shift+] / [.
+            if self.tabbed and ((raw_ctrl and code == wx.WXK_TAB) or (event.CmdDown() and shift and code in (ord(']'), ord('[')))):
+                count = self.notebook.GetPageCount()
+                if count:
+                    back = (code == ord('[')) or (code == wx.WXK_TAB and shift)
+                    self.select_tab((self.notebook.GetSelection() + (-1 if back else 1)) % count)
+                return
+            # Inner tabs: Ctrl+Page Down/Up, or Command+Option+Right/Left on keyboards without Page keys.
+            if (raw_ctrl and code in (wx.WXK_PAGEDOWN, wx.WXK_PAGEUP)) or (event.CmdDown() and event.AltDown() and code in (wx.WXK_RIGHT, wx.WXK_LEFT)):
+                cur = self.current_chat()
+                if cur and hasattr(cur, "switch_inner_tab"):
+                    cur.switch_inner_tab(1 if code in (wx.WXK_PAGEDOWN, wx.WXK_RIGHT) else -1)
+                return
         if self.tabbed and ctrl and code == wx.WXK_TAB:
             count = self.notebook.GetPageCount()
             if count:

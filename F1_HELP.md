@@ -99,6 +99,18 @@ Each conversation has three tabs:
   - On a message: `Ctrl+C` copy, `Ctrl+S` save to Chat Archive, `Delete` delete, `Applications` or `Shift+F10` for all actions
   - On a voice message: `Enter` play or stop, `Space` pause or resume, `Left`/`Right` skip 5 seconds
 
+
+## On a Mac
+Thrive for Mac has the same features. Where Windows uses Control, the Mac uses Command. A few keys differ so they don't clash with macOS or VoiceOver:
+- Switch conversation tabs: `Control+Tab` / `Control+Shift+Tab`, or `Command+Shift+]` / `Command+Shift+[`.
+- Go to a conversation: `Command+1` to `Command+9`. Close it: `Command+W`. Go to the contact list: `Command+0`.
+- Switch the inner tabs (Messages, Chat Archive, File Transfers): `Control+Page Down` / `Control+Page Up`, or `Command+Option+Right` / `Command+Option+Left`.
+- Insert emoji: `Command+E`. Record a voice message: `Command+R`. Leave a voicemail: `Command+Shift+R`.
+- On a message: `Command+C` copies, `Command+S` saves to Chat Archive, and `Command+Delete` deletes.
+- Announcements (typing, copied, voice messages) go to VoiceOver when it's on. If VoiceOver is off, the Mac speaks them with its built-in voice.
+- The first time you record, macOS asks for permission to use the microphone.
+- Saved passwords and passkeys are kept in the macOS Keychain. On Windows they're kept in Windows Credential Manager. Neither is ever stored in a settings file.
+
 ## Notes
 - Server-side account permissions are enforced by each server.
 - This build includes TappedIn server defaults and multi-server profile selection.

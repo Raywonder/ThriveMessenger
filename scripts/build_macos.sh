@@ -10,7 +10,7 @@ OUT_DIR="${ROOT_DIR}/dist-macos"
 ARCH_LABEL="${1:-$(uname -m)}"
 VENV_DIR="${ROOT_DIR}/.venv-build"
 PYTHON_BIN="${THRIVE_PYTHON_BIN:-python3}"
-APP_VERSION="${THRIVE_APP_VERSION:-15.10.0}"
+APP_VERSION="${THRIVE_APP_VERSION:-15.11.0}"
 
 ${PYTHON_BIN} -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
@@ -20,8 +20,10 @@ python -m pip install \
   "pyinstaller>=6.18.0" \
   "keyring>=25.7.0" \
   "plyer>=2.1.0" \
-  "wxPython>=4.2.5" \
-  "sounddevice>=0.5.1"
+  "wxPython>=4.2.5,<4.3" \
+  "sounddevice>=0.5.1" \
+  "pyobjc-core" \
+  "pyobjc-framework-Cocoa"
 
 rm -rf build dist "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
@@ -37,6 +39,9 @@ pyinstaller \
   --add-data "assets/videos:assets/videos" \
   --add-data "sounds:sounds" \
   --add-data "README.md:." \
+  --add-data "F1_HELP.md:." \
+  --hidden-import AppKit \
+  --hidden-import Foundation \
   main.py
 
 APP_PATH="dist/${APP_NAME}.app"
@@ -48,6 +53,10 @@ if [[ ! -d "${APP_PATH}" ]]; then
 fi
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
+# Voice messages and voicemail record from the microphone; macOS requires a reason string or it refuses access.
+MIC_REASON="Thrive Messenger records voice messages and voicemail from your microphone only when you press Command R."
+/usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription ${MIC_REASON}" "${APP_PATH}/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string ${MIC_REASON}" "${APP_PATH}/Contents/Info.plist"
 if ! /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"; then
   /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${APP_VERSION}" "${APP_PATH}/Contents/Info.plist"
 fi
