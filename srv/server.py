@@ -5482,15 +5482,35 @@ def handle_client(cs, addr):
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
 
             elif action == "typing":
-                to = msg.get("to")
+                to = str(msg.get("to") or "").strip()
                 typing = bool(msg.get("typing", False))
                 if not to:
                     continue
                 with lock:
-                    sock_to = clients.get(to)
-                if sock_to:
+                    # Contact names can differ in case from the login name; match either way.
+                    target = to if to in clients else next((u for u in clients if u.lower() == to.lower()), None)
+                    targets = list(user_sessions.get(target, set())) if target else []
+                    if target and not targets and clients.get(target):
+                        targets = [clients[target]]
+                if not targets:
+                    continue
+                try:
+                    con = sqlite3.connect(DB)
+                    blocked = con.execute(
+                        "SELECT 1 FROM contacts WHERE owner=? AND contact=? COLLATE NOCASE AND blocked=1", (target, user)
+                    ).fetchone()
+                    con.close()
+                except Exception:
+                    blocked = None
+                if blocked:
+                    continue
+                payload = (json.dumps({"action": "typing", "from": user, "typing": typing}) + "\n").encode()
+                # Every signed-in device of the recipient shows the indicator.
+                for sock_to in targets:
+                    if sock_to is sock:
+                        continue
                     try:
-                        sock_to.sendall((json.dumps({"action": "typing", "from": user, "typing": typing}) + "\n").encode())
+                        sock_to.sendall(payload)
                     except Exception:
                         pass
                     
