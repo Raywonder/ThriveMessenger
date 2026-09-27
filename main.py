@@ -4644,7 +4644,6 @@ class MainFrame(wx.Frame):
         self._pending_display_names = {}
         self.notifications = []; self.Bind(wx.EVT_CLOSE, self.on_close_window)
         self._chat_panels = []; self._tabs_window = None
-        self.Bind(wx.EVT_WINDOW_DESTROY, self._destroy_chat_windows)
         self.main_notebook = wx.Notebook(self)
         panel = wx.Panel(self.main_notebook)
 
@@ -6371,10 +6370,11 @@ class MainFrame(wx.Frame):
             target.SetFocus()
         if announce:
             speak_text("Contact list", interrupt=True)
+    def Destroy(self):
+        # Chat windows are separate top-level windows (so the contact list stays in Alt+Tab); close them with it.
+        self._destroy_chat_windows()
+        return super().Destroy()
     def _destroy_chat_windows(self, event=None):
-        if event is not None and event.GetEventObject() is not self:
-            event.Skip()
-            return
         for win in self.chat_windows():
             try:
                 win.Destroy()
@@ -6382,8 +6382,6 @@ class MainFrame(wx.Frame):
                 pass
         self._chat_panels = []
         self._tabs_window = None
-        if event is not None:
-            event.Skip()
     def get_chat(self, contact):
         wanted = str(contact or "").strip().lower()
         if not wanted:
