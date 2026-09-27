@@ -2328,7 +2328,7 @@ class ClientApp(wx.App):
 
     def _bootstrap_startup_ui(self):
         if getattr(self, "_startup_ui_started", False):
-            return
+            return True
         self._startup_ui_started = True
         try:
             ok = self.show_login_dialog()
@@ -2338,6 +2338,7 @@ class ClientApp(wx.App):
             ok = False
         if not ok:
             self.ExitMainLoop()
+        return ok
 
     def _signal_existing_instance(self):
         try:
@@ -2423,9 +2424,16 @@ class ClientApp(wx.App):
         # On macOS, opening modal dialogs directly in OnInit can result in a
         # running process with no visible windows. Defer startup UI until the
         # event loop is active.
-        wx.CallAfter(self._bootstrap_startup_ui)
-        wx.CallLater(2000, self._startup_window_watchdog)
-        return True
+        if sys.platform == 'darwin':
+            # Startup creates the login dialog with CallAfter. Keep the app
+            # alive until that first top-level window exists.
+            self.SetExitOnFrameDelete(False)
+            wx.CallAfter(self._bootstrap_startup_ui)
+            wx.CallLater(2000, self._startup_window_watchdog)
+            return True
+        # Elsewhere, with no window yet MainLoop would return at once and the app would quit
+        # silently (fresh installs, or anyone not using auto-login). Show the login UI now.
+        return bool(self._bootstrap_startup_ui())
 
     def add_transfer_history(self, direction, user, filename, path="", status="ok"):
         self.transfer_history.append({
