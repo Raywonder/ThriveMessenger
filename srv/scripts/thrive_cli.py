@@ -559,6 +559,9 @@ def cmd_listen(args: argparse.Namespace) -> None:
             if _maybe_handle_voice_call_event(sock, event, args):
                 event = dict(event)
                 event["handled"] = "auto_declined"
+            elif action == "msg" and getattr(args, "mark_read", False) and event.get("id") and not event.get("echo"):
+                # Tell the sender their message was read, so Thrive shows it as read (like a person's client).
+                send_json(sock, {"action": "msg_read", "ids": [event.get("id")]})
             elif action == "file_offer" and args.auto_accept_files:
                 send_json(sock, {"action": "file_accept", "transfer_id": event.get("transfer_id")})
             elif action == "file_data" and args.save_dir:
@@ -877,6 +880,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_login_args(listen)
     listen.add_argument("--save-dir", type=Path, default=None, help="Directory for received file_data or bot-mesh files.")
     listen.add_argument("--auto-accept-files", action="store_true", help="Automatically accept incoming direct file offers.")
+    listen.add_argument("--mark-read", action="store_true", help="Send read receipts for incoming direct messages as they arrive.")
     listen.add_argument("--auto-fetch-bot-files", action="store_true", help="Automatically fetch bot-mesh file_available events.")
     listen.add_argument("--consume-bot-files", action="store_true", help="Consume bot-mesh files after auto-fetching.")
     listen.add_argument("--include-data", action="store_true", help="Include base64 file data in JSON output.")
