@@ -27,28 +27,43 @@ ${PYTHON_BIN} -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"
 
 python -m pip install --upgrade pip
+REQS=("pyinstaller>=6.18.0" "keyring>=25.7.0" "plyer>=2.1.0" "sounddevice>=0.5.1" "pyobjc-core" "pyobjc-framework-Cocoa"
+      "pyobjc-framework-ServiceManagement")
 if [[ "${TARGET_ARCH}" == "universal2" ]]; then
+  # Download every dependency for both architectures, merge each single-arch pair into a universal2 wheel
+  # (wxPython, cffi and the like only publish separate x86_64 and arm64 Mac wheels), then install only those.
   WHEELS="${ROOT_DIR}/.wheels"
   rm -rf "${WHEELS}"; mkdir -p "${WHEELS}/x86_64" "${WHEELS}/arm64" "${WHEELS}/universal2"
   python -m pip install "delocate>=0.12"
   PYV="$(python -c 'import sys;print(f"{sys.version_info[0]}.{sys.version_info[1]}")')"
-  python -m pip download --only-binary=:all: --no-deps --python-version "${PYV}" --platform macosx_10_13_x86_64 -d "${WHEELS}/x86_64" "wxPython==${WX_VERSION}"
-  python -m pip download --only-binary=:all: --no-deps --python-version "${PYV}" --platform macosx_11_0_arm64 -d "${WHEELS}/arm64" "wxPython==${WX_VERSION}"
-  delocate-merge "${WHEELS}"/x86_64/*.whl "${WHEELS}"/arm64/*.whl -w "${WHEELS}/universal2"
-  python -m pip install "${WHEELS}"/universal2/*.whl
-  WX_REQ="wxPython==${WX_VERSION}"
+  for arch in x86_64 arm64; do
+    python -m pip download --only-binary=:all: --python-version "${PYV}" --platform "macosx_11_0_${arch}" \
+      -d "${WHEELS}/${arch}" "wxPython==${WX_VERSION}" "${REQS[@]}"
+  done
+  python - "${WHEELS}" <<'PY'
+import os, subprocess, sys
+root = sys.argv[1]
+def key(name):  # distribution name and version, e.g. ("cffi", "2.0.0")
+    parts = name.split("-")
+    return parts[0].lower().replace("_", "-"), parts[1]
+arm = {key(f): f for f in os.listdir(os.path.join(root, "arm64")) if f.endswith(".whl")}
+for f in sorted(os.listdir(os.path.join(root, "x86_64"))):
+    if not f.endswith(".whl"):
+        continue
+    src = os.path.join(root, "x86_64", f)
+    if "-none-any" in f or "universal2" in f:
+        subprocess.check_call(["cp", src, os.path.join(root, "universal2", f)])
+        continue
+    other = arm.get(key(f))
+    if not other:
+        sys.exit(f"no arm64 wheel matching {f}")
+    subprocess.check_call(["delocate-merge", src, os.path.join(root, "arm64", other), "-w", os.path.join(root, "universal2")])
+    print("merged", f, "+", other)
+PY
+  python -m pip install --no-index --find-links "${WHEELS}/universal2" "wxPython==${WX_VERSION}" "${REQS[@]}"
 else
-  WX_REQ="wxPython>=4.2.5,<4.3"
+  python -m pip install "wxPython>=4.2.5,<4.3" "${REQS[@]}"
 fi
-python -m pip install \
-  "pyinstaller>=6.18.0" \
-  "keyring>=25.7.0" \
-  "plyer>=2.1.0" \
-  "${WX_REQ}" \
-  "sounddevice>=0.5.1" \
-  "pyobjc-core" \
-  "pyobjc-framework-Cocoa" \
-  "pyobjc-framework-ServiceManagement"
 
 rm -rf build dist "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
