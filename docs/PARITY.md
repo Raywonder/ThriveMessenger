@@ -34,5 +34,6 @@ Legend: [x] done and tested, [~] implemented but not yet tested on real hardware
 
 ## Still open
 - A real VoiceOver pass on the Mac build (Dom). Agents avoid GUI tests on the Mac mini while Dom is using it.
-- Signed and notarized Mac builds: the build is ad-hoc signed unless a Developer ID identity is provided.
+- Mac builds (standing rule, 2026-09-28): universal2 (arm64 + x86_64), Developer ID signed and notarised, with every binary
+  checked by `lipo -archs` (see the README). Native Apple-silicon testing needs an M-series tester; the Mac mini is Intel.
 - The iOS app on the passkey and iOS branches.

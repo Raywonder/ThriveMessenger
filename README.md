@@ -77,21 +77,29 @@ If you wish to compile a binary, run the appropriate compile script. Thrive Mess
 
 ### Compiling on macOS (Intel + Apple Silicon)
 
-The repo includes a macOS build script that produces a `.app` zipped archive:
+Every Mac build we ship is **universal2**: it runs natively on Apple silicon (M1 and later) and on Intel Macs, and it
+is signed with the Developer ID and notarised. The build works on an Intel Mac too (it cross-builds the arm64 half).
 
-```bash
-chmod +x scripts/build_macos.sh
-scripts/build_macos.sh
-```
+1. Install the python.org **universal2** Python 3.13 (framework only is enough; it lives in
+   `/Library/Frameworks/Python.framework/Versions/3.13` and doesn't replace any other `python3`).
+2. Build:
 
-This writes output archives to `dist-macos/`.
+   ```bash
+   scripts/build_macos.sh
+   ```
 
-For automated dual-architecture builds, run the GitHub Actions workflow:
-`Build macOS Desktop`.
-It produces:
+   wxPython only publishes separate x86_64 and arm64 Mac wheels, so the script downloads both and merges them into one
+   universal2 wheel with `delocate-merge`, builds with PyInstaller `--target-arch universal2`, and then checks every
+   Mach-O file in the app with `lipo -archs`. The build fails if any file lacks either architecture.
+3. Sign, notarise and staple (on the Mac, in the logged-in session so the keychain is unlocked):
 
-- `thrive_messenger-macos-x86_64.zip`
-- `thrive_messenger-macos-arm64.zip`
+   ```bash
+   scripts/sign_notarize_macos.sh
+   ```
+
+   The result is `dist-macos/thrive_messenger-macos-universal2.zip`.
+
+An Intel Mac can't run the arm64 half, so native Apple-silicon testing is done by testers with M-series Macs.
 
 ### Server auto-deploy workflow (PM2)
 
