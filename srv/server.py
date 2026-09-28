@@ -3,6 +3,10 @@ import smtplib, secrets
 import re
 import urllib.request, urllib.parse
 import http.client
+try:
+    from . import rooms
+except ImportError:  # run as a script by pm2
+    import rooms
 import html as _html_lib
 from email.mime.text import MIMEText
 try:
@@ -72,7 +76,7 @@ FEATURE_DEFAULTS = {
     "bot_mesh": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Bot-to-bot relay, delegation, and temp file exchange features."},
     "bot_moderation": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot-powered moderation watch, spam scoring, and guest activity feeds."},
     "bot_rules": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Bot rules management features."},
-    "group_chat": {"enabled": False, "ui_visible": False, "scope": "admin", "description": "Reserved for future group chat create/join/send features."},
+    "group_chat": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Chat rooms: create, join, invite, topics, history, read receipts, mentions, voice, moderation."},
     "group_call": {"enabled": False, "ui_visible": False, "scope": "all", "description": "Group call signaling exists, but call audio is disabled until a client media engine is available."},
     "voice_call": {"enabled": False, "ui_visible": False, "scope": "all", "description": "Direct call signaling exists, but call audio is disabled until a client/bot media engine is available."},
     "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
@@ -1173,6 +1177,276 @@ def _remove_links(actor, items):
     for users, event in events:
         _send_to_all_sessions(users, event)
     return removed, denied
+
+# --- chat rooms (group chats) ----------------------------------------------------------------------------------
+ROOM_POST_LIMIT_PER_MINUTE = 60
+_room_post_times = {}
+_room_bot_locks = {}
+
+def _room_members(room_id):
+    try:
+        return [m["username"] for m in rooms.list_members(DB, room_id)]
+    except Exception:
+        return []
+
+def _room_broadcast(room_id, payload, extra_users=()):
+    """Every signed-in device of every room member (plus anyone just removed, so they hear about it)."""
+    _send_to_all_sessions(set(_room_members(room_id)) | set(extra_users or ()), payload)
+
+def _room_rate_ok(user):
+    now = time.time()
+    recent = [t for t in _room_post_times.get(user.lower(), []) if now - t < 60]
+    if len(recent) >= ROOM_POST_LIMIT_PER_MINUTE:
+        _room_post_times[user.lower()] = recent
+        return False
+    recent.append(now)
+    _room_post_times[user.lower()] = recent
+    return True
+
+def _room_open_payload(room_id, user, limit=100):
+    room = rooms.get_room(DB, room_id, user)
+    messages, has_more = rooms.history(DB, room_id, user, limit)
+    payload = {"action": "group_room_open_response", "ok": True, "room": room, "members": rooms.list_members(DB, room_id),
+               "messages": messages, "has_more": has_more}
+    if room["role"] in ("moderator", "admin", "owner"):
+        payload["bans"] = rooms.list_bans(DB, room_id)
+    return payload
+
+def _room_post(room_id, sender, body, client_id="", kind="text", voice_path=None, voice_duration=None, filename=""):
+    """Save a room message, tell every member, and let any agent that should answer do so."""
+    item = rooms.add_message(DB, room_id, sender, body, kind=kind, filename=filename, client_id=client_id,
+                             voice_path=voice_path, voice_duration=voice_duration)
+    _room_broadcast(room_id, {"action": "group_room_message", "message": item})
+    if kind in ("text", "voice"):
+        _room_maybe_bot_replies(room_id, sender, item)
+    return item
+
+def _room_mark_read(room_id, user, message_id):
+    read_at = rooms.mark_read(DB, room_id, user, message_id)
+    if read_at:
+        _room_broadcast(room_id, {"action": "group_room_read", "room_id": room_id, "username": user,
+                                  "message_id": message_id, "read_at": read_at})
+    return read_at
+
+def _room_maybe_bot_replies(room_id, sender, item):
+    """Agents answer in the room they were asked in: when @mentioned, or when the room is just the sender and that agent.
+    Agents never answer other agents' messages, so two agents can't loop."""
+    if _is_virtual_bot(sender) or str(sender).lower() in {b.lower() for b in _external_bot_names()}:
+        return
+    members = _room_members(room_id)
+    bots = [m for m in members if _is_virtual_bot(m)]
+    if not bots:
+        return
+    mentioned = {m.lower() for m in item.get("mentions") or []}
+    humans = [m for m in members if not _is_virtual_bot(m)]
+    for bot in bots:
+        if bot.lower() in mentioned or (len(members) == 2 and len(humans) == 1):
+            threading.Thread(target=_room_bot_worker, args=(room_id, sender, bot, item), name=f"room-bot-{bot}", daemon=True).start()
+
+def _external_bot_names():
+    try:
+        return list(bot_runtime_config.get('external_names', []) or [])
+    except Exception:
+        return []
+
+def _room_bot_worker(room_id, sender, bot, item):
+    key = (room_id, bot.lower())
+    lock = _room_bot_locks.setdefault(key, threading.Lock())
+    with lock:
+        try:
+            room = rooms.get_room(DB, room_id, bot)
+        except Exception:
+            return
+        _room_broadcast(room_id, {"action": "group_room_typing", "room_id": room_id, "username": bot, "typing": True})
+        try:
+            # The agent has picked it up: that's when it counts as read by the agent.
+            _room_mark_read(room_id, bot, item["message_id"])
+            text = item.get("body") or ""
+            if item.get("kind") == "voice":
+                path = rooms.voice_path(DB, room_id, bot, item["message_id"])
+                heard = _transcribe_audio_file(path) if path else ""
+                text = f"(voice message) {heard}" if heard else "(a voice message that couldn't be transcribed)"
+            reply = _room_agent_reply(room, sender, bot, text)
+            if not reply:
+                return
+            for idx, chunk in enumerate(_split_outgoing_text(reply, max_bot_reply_length), start=1):
+                try:
+                    _room_post(room_id, bot, chunk)
+                except Exception as e:
+                    print(f"Room reply from {bot} could not be posted: {e}")
+                    break
+        except Exception as e:
+            print(f"Room bot worker failed for {bot}: {e}")
+        finally:
+            _room_broadcast(room_id, {"action": "group_room_typing", "room_id": room_id, "username": bot, "typing": False})
+
+def _room_agent_reply(room, sender, bot, text):
+    """One agent turn for a room message, using the room's own agent session. Returns reply text or ''."""
+    reply = None
+    agent_result = _openclaw_agent_bot_reply(sender, bot, text, room=room)
+    if agent_result:
+        reply = agent_result[0]
+    framed = f"[In the Thrive room \"{room['name']}\", {sender} said:] {text}"
+    if not reply and _codex_primary_enabled_for_bot(bot):
+        reply = _codex_bot_reply(sender, bot, framed, sync_context="")
+    if not reply:
+        reply = _gateway_natural_reply(sender, bot, framed)
+    if not reply:
+        reply = _ollama_bot_reply(sender, bot, framed, sync_context="")
+    if not reply:
+        _append_agent_task("model_followup_needed", {
+            "user": sender, "bot": bot, "room": room["name"], "room_id": room["room_id"],
+            "reason": "No model or agent answered a room message. Repair the route and reply in the room.",
+            "latest_user_message": _moderation_excerpt(text, 500),
+        })
+        if not _first_unreachable_notice(sender, bot):
+            return ""
+        return f"I couldn't answer just now: nothing is connected to reply for {bot}. Your message is saved in this room."
+    reply, blocked, reason = _user_facing_bot_output(str(reply or ""))
+    if blocked or not reply:
+        _append_agent_task("blocked_bot_reply", {"user": sender, "bot": bot, "room": room["name"], "reason": reason or "empty"})
+        return ""
+    return reply
+
+def _room_reply(sock, action, ok=True, **fields):
+    payload = {"action": "group_room_result", "ok": ok, "request": action}
+    payload.update(fields)
+    _send_json_line(sock, payload)
+
+def _handle_room_action(sock, user, action, msg):
+    """All group_room_* requests. Errors go back to the asker as group_room_result ok=False with a plain reason."""
+    room_id = str(msg.get("room_id") or "").strip()
+    server_admin = _is_admin(user)
+    try:
+        if not _can_user_use_feature(user, "group_chat"):
+            raise rooms.RoomError("Chat rooms are turned off for your account on this server.")
+        if action == "group_room_list":
+            _send_json_line(sock, {"action": "group_room_list_response", "ok": True, "query": str(msg.get("query") or ""),
+                                   "rooms": rooms.list_rooms(DB, user, msg.get("query") or "")})
+        elif action == "group_room_create":
+            room = rooms.create_room(DB, user, msg.get("name"), msg.get("description", ""), msg.get("topic", ""),
+                                     msg.get("visibility", "public"), msg.get("expiration", "never"), msg.get("permissions"))
+            _room_reply(sock, action, event="created", room=room)
+        elif action == "group_room_join":
+            if not room_id and msg.get("name"):
+                room_id = rooms.room_by_name(DB, msg.get("name"), user)["room_id"]
+            room = rooms.join_room(DB, room_id, user)
+            _room_broadcast(room_id, {"action": "group_room_event", "event": "joined", "room_id": room_id, "username": user})
+            _room_reply(sock, action, event="joined", room=room)
+        elif action == "group_room_leave":
+            deleted = rooms.leave_room(DB, room_id, user)
+            _room_broadcast(room_id, {"action": "group_room_event", "event": "left", "room_id": room_id, "username": user}, extra_users=[user])
+            _room_reply(sock, action, event="left", room_id=room_id, deleted=deleted)
+        elif action == "group_room_delete_room":
+            room = rooms.delete_room(DB, room_id, user, server_admin=server_admin)
+            members = [m for m in _room_members(room_id)] or [user]
+            _send_to_all_sessions(set(members) | {user}, {"action": "group_room_event", "event": "deleted", "room_id": room_id, "name": room["name"], "by": user})
+        elif action == "group_room_open":
+            _send_json_line(sock, _room_open_payload(room_id, user, msg.get("limit", 100)))
+        elif action == "group_room_history":
+            messages, has_more = rooms.history(DB, room_id, user, msg.get("limit", 100), msg.get("before"))
+            _send_json_line(sock, {"action": "group_room_history_response", "ok": True, "room_id": room_id, "messages": messages,
+                                   "has_more": has_more, "before": msg.get("before"), "request_id": str(msg.get("request_id") or "")[:64]})
+        elif action == "group_room_message":
+            if not _room_rate_ok(user):
+                raise rooms.RoomError("You're posting very quickly. Wait a moment and try again.")
+            client_id = str(msg.get("client_id") or "")
+            if isinstance(msg.get("voice"), dict):
+                ok, reason, mp3 = _prepare_voice_message(msg)
+                if not ok:
+                    raise rooms.RoomError(reason)
+                path = _store_voice_file("room-" + uuid.uuid4().hex, mp3)
+                if not path:
+                    raise rooms.RoomError("The server couldn't save that voice message.")
+                _room_post(room_id, user, msg["msg"], client_id=client_id, kind="voice", voice_path=path,
+                           voice_duration=msg["voice"].get("duration"))
+            else:
+                _room_post(room_id, user, msg.get("body", msg.get("msg", "")), client_id=client_id)
+        elif action == "group_room_file":
+            encoded = str(msg.get("data") or "")
+            limit = int(file_config.get('size_limit', 0) or 0) or 10 * 1024 * 1024
+            if len(encoded) * 3 // 4 > min(limit, 10 * 1024 * 1024):
+                raise rooms.RoomError("That file is too big to share in a room.")
+            filename = os.path.basename(str(msg.get("filename") or "file").replace("\\", "/"))[:255] or "file"
+            item = rooms.add_message(DB, room_id, user, "", "file", filename, client_id=str(msg.get("client_id") or ""))
+            _room_broadcast(room_id, {"action": "group_room_file", "message": item, "data": encoded})
+        elif action == "group_room_edit":
+            item = rooms.edit_message(DB, room_id, user, msg.get("message_id"), msg.get("body", ""))
+            _room_broadcast(room_id, {"action": "group_room_edited", "room_id": room_id, "message": item, "by": user})
+        elif action == "group_room_delete":
+            path = rooms.delete_message(DB, room_id, user, msg.get("message_id"))
+            if path and os.path.realpath(path).startswith(os.path.realpath(VOICE_DIR) + os.sep):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            _room_broadcast(room_id, {"action": "group_room_deleted", "room_id": room_id, "message_id": msg.get("message_id"), "by": user})
+        elif action == "group_room_remove_links":
+            changed, denied = rooms.remove_links(DB, room_id, user, msg.get("items") or [], _find_links)
+            for item in changed:
+                _room_broadcast(room_id, {"action": "group_room_edited", "room_id": room_id, "message": item, "by": user,
+                                          "links_removed": item.get("links_removed", 0)})
+            _send_json_line(sock, {"action": "msg_remove_links_result", "removed": sum(i.get("links_removed", 0) for i in changed),
+                                   "denied": denied, "room_id": room_id})
+        elif action == "group_room_read":
+            _room_mark_read(room_id, user, msg.get("message_id"))
+        elif action == "group_room_typing":
+            if rooms.member_role(DB, room_id, user):
+                _room_broadcast(room_id, {"action": "group_room_typing", "room_id": room_id, "username": user, "typing": bool(msg.get("typing"))})
+        elif action == "group_room_voice_fetch":
+            path = rooms.voice_path(DB, room_id, user, msg.get("message_id"))
+            data = None
+            if path and os.path.realpath(path).startswith(os.path.realpath(VOICE_DIR) + os.sep) and os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    data = base64.b64encode(fh.read()).decode("ascii")
+            _send_json_line(sock, {"action": "group_room_voice_data", "room_id": room_id, "message_id": msg.get("message_id"),
+                                   "ok": bool(data), "b64": data or "", "mime": "audio/mpeg"})
+        elif action in ("group_room_add_member", "group_room_invite"):
+            target = _canonical_username(msg.get("username")) or ""
+            if not target:
+                raise rooms.RoomError("There's no account with that name.")
+            rooms.add_member(DB, room_id, user, target, msg.get("role", "user"), actor_is_server_admin=server_admin)
+            room = rooms.get_room(DB, room_id, target)
+            _room_broadcast(room_id, {"action": "group_room_members", "room_id": room_id, "members": rooms.list_members(DB, room_id)})
+            _send_to_all_sessions({target}, {"action": "group_room_event", "event": "invited", "room_id": room_id, "room": room, "by": user})
+            _room_reply(sock, action, event="invited", room_id=room_id, username=target)
+        elif action == "group_room_set_role":
+            rooms.set_member_role(DB, room_id, user, str(msg.get("username", "")), str(msg.get("role", "")), actor_is_server_admin=server_admin)
+            _room_broadcast(room_id, {"action": "group_room_members", "room_id": room_id, "members": rooms.list_members(DB, room_id)})
+        elif action in ("group_room_kick", "group_room_ban", "group_room_unban", "group_room_mute"):
+            target = str(msg.get("username") or "").strip()
+            canonical = _canonical_username(target) or target
+            if action == "group_room_kick":
+                rooms.kick(DB, room_id, user, canonical, actor_is_server_admin=server_admin)
+            elif action == "group_room_ban":
+                rooms.ban(DB, room_id, user, canonical, msg.get("reason", ""), actor_is_server_admin=server_admin)
+            elif action == "group_room_unban":
+                rooms.unban(DB, room_id, user, canonical, actor_is_server_admin=server_admin)
+            else:
+                rooms.mute(DB, room_id, user, canonical, msg.get("minutes", 0), actor_is_server_admin=server_admin)
+            event = {"group_room_kick": "kicked", "group_room_ban": "banned", "group_room_unban": "unbanned", "group_room_mute": "muted"}[action]
+            if action == "group_room_mute" and not int(msg.get("minutes") or 0):
+                event = "unmuted"
+            _room_broadcast(room_id, {"action": "group_room_event", "event": event, "room_id": room_id, "username": canonical, "by": user,
+                                      "minutes": int(msg.get("minutes") or 0), "reason": str(msg.get("reason") or "")[:300]},
+                            extra_users=[canonical])
+            _room_broadcast(room_id, {"action": "group_room_members", "room_id": room_id, "members": rooms.list_members(DB, room_id)})
+        elif action in ("group_room_update", "group_room_topic"):
+            changes = {"topic": msg.get("topic", "")} if action == "group_room_topic" else (msg.get("changes") or {})
+            room = rooms.update_room(DB, room_id, user, changes)
+            _room_broadcast(room_id, {"action": "group_room_event", "event": "topic" if action == "group_room_topic" else "updated",
+                                      "room_id": room_id, "room": room, "by": user})
+        elif action == "group_room_read_status":
+            readers, total = rooms.read_by(DB, room_id, msg.get("message_id"))
+            _send_json_line(sock, {"action": "group_room_read_status", "room_id": room_id, "message_id": msg.get("message_id"),
+                                   "read_by": readers, "total": total})
+        else:
+            raise rooms.RoomError("That room action isn't supported by this server.")
+    except rooms.RoomError as e:
+        _room_reply(sock, action, ok=False, reason=str(e), room_id=room_id)
+    except Exception as e:
+        print(f"Room action {action} failed: {type(e).__name__}: {e}")
+        _room_reply(sock, action, ok=False, reason="The server hit a problem with that room action.", room_id=room_id)
 
 def _send_to_all_sessions(usernames, payload):
     """Send one event to every signed-in device of each user (names matched ignoring case)."""
@@ -2654,8 +2928,9 @@ def _openclaw_media_path(ref):
         return ""
     return path if os.path.isfile(path) else ""
 
-def _openclaw_agent_bot_reply(sender_user, bot_name, text):
-    """Run one turn of the bot's real OpenClaw agent. Returns (text, [media paths]) or None."""
+def _openclaw_agent_bot_reply(sender_user, bot_name, text, room=None):
+    """Run one turn of the bot's real OpenClaw agent. Returns (text, [media paths]) or None.
+    With room, the turn runs in that room's own session and the reply is posted in the room."""
     agent_id = _openclaw_agent_for_bot(bot_name, sender_user)
     if not agent_id:
         return None
@@ -2672,7 +2947,14 @@ def _openclaw_agent_bot_reply(sender_user, bot_name, text):
         "is delivered there too.]\n\n"
         + str(text or "")
     )
-    if _openclaw_shared_session_key(agent_id, sender_user):
+    if room:
+        session_key = f"agent:{agent_id}:thrive:room:{room['room_id']}"
+        envelope = (
+            f"[Thrive Messenger chat room \"{room['name']}\" (room id {room['room_id']}). Message from verified Thrive account {who}. "
+            "Your final reply text is posted in this same room automatically, where every member sees it. "
+            "Keep it to what the room needs; reply privately only if they ask.]\n\n" + str(text or "")
+        )
+    elif _openclaw_shared_session_key(agent_id, sender_user):
         default_key = _openclaw_session_key_template_only(agent_id, sender_user)
         envelope = (
             "[This session is shared with this person's other channel, so earlier turns may be from there. "
@@ -3875,6 +4157,12 @@ def init_db():
     cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('max_accounts_per_email', '0')")
     conn.commit()
     _seed_feature_defaults()
+    rooms.init_schema(DB)
+    # Chat rooms went live in 2026-09: switch on the old "reserved" placeholder policy (an admin's own choice is kept).
+    conn.execute("UPDATE feature_policies SET enabled=1, ui_visible=1, scope='all', description=?, updated_by='system-rooms' "
+                 "WHERE feature_key='group_chat' AND description LIKE 'Reserved for future group chat%'",
+                 (FEATURE_DEFAULTS["group_chat"]["description"],))
+    conn.commit()
     conn.close()
 
 _PBKDF2_ITERATIONS = 390000
@@ -6368,6 +6656,9 @@ def handle_client(cs, addr):
             elif action == "msg_read":
                 _mark_messages_read(user, msg.get("ids") or [])
 
+            elif action.startswith("group_room_"):
+                _handle_room_action(sock, user, action, msg)
+
             elif action == "link_titles":
                 _link_titles_request(sock, user, msg.get("urls") or [], msg.get("request_id"))
 
@@ -6863,6 +7154,9 @@ def delete_user_account(user):
             ("user_access_groups", "DELETE FROM user_access_groups WHERE username=?", (username,)),
             ("file_bans", "DELETE FROM file_bans WHERE username=?", (username,)),
             ("contacts", "DELETE FROM contacts WHERE owner=? OR contact=?", (username, username)),
+            ("group_room_members", "DELETE FROM group_room_members WHERE username=?", (username,)),
+            ("group_room_messages", "DELETE FROM group_room_messages WHERE sender=?", (username,)),
+            ("group_room_bans", "DELETE FROM group_room_bans WHERE username=?", (username,)),
         )
         if "group_rooms" in tables:
             owned_rooms = [r[0] for r in con.execute("SELECT room_id FROM group_rooms WHERE owner=?", (username,)).fetchall()]

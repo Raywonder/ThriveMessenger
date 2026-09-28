@@ -14,6 +14,8 @@ import mimetypes
 import os
 import secrets
 import socket
+import re
+import uuid
 import sqlite3
 import ssl
 import sys
@@ -587,6 +589,10 @@ def cmd_listen(args: argparse.Namespace) -> None:
             else:
                 sender = event.get("from", "")
                 body = event.get("msg", event.get("reason", ""))
+                if action == "group_room_message":
+                    item = event.get("message") or {}
+                    sender = f"[room {item.get('room_id', '')}] {item.get('sender', '')}"
+                    body = item.get("body", "")
                 if saved_files:
                     body = f"saved {len(saved_files)} file(s): " + ", ".join(str(item.get("path", item.get("error", ""))) for item in saved_files)
                 print(f"{datetime.now().isoformat()} {action} {sender}: {body}", flush=True)
@@ -594,6 +600,102 @@ def cmd_listen(args: argparse.Namespace) -> None:
         pass
     finally:
         sock.close()
+
+
+ROOM_ACTIONS = ("list", "create", "join", "leave", "post", "history", "members", "invite", "topic", "read-status", "mark-read")
+
+
+def _room_request(sock, payload, wanted, timeout=8.0):
+    send_json(sock, payload)
+    event = recv_until_action(sock, list(wanted) + ["group_room_result"], timeout=timeout)
+    if event.get("action") == "group_room_result" and event.get("ok") is False:
+        raise RuntimeError(event.get("reason") or "Room action failed.")
+    return event
+
+
+def _resolve_room(sock, ref):
+    """A room by id or by name (ignoring case), among public rooms and rooms you're in."""
+    rooms = _room_request(sock, {"action": "group_room_list"}, ["group_room_list_response"]).get("rooms") or []
+    ref_l = str(ref or "").strip().lower()
+    for room in rooms:
+        if room.get("room_id") == ref or str(room.get("name", "")).lower() == ref_l:
+            return room
+    raise RuntimeError(f"No room called {ref!r} that you can see.")
+
+
+def cmd_room(args: argparse.Namespace) -> None:
+    """Chat rooms for agents: list/search, create, join, leave, post, read history, members, invite, topic, read status."""
+    sock = login(args)
+    try:
+        act = args.room_action
+        if act == "list":
+            rooms = _room_request(sock, {"action": "group_room_list", "query": args.query or ""}, ["group_room_list_response"]).get("rooms") or []
+            if args.json:
+                emit({"status": "ok", "rooms": rooms}, True)
+            else:
+                for r in rooms:
+                    print(f"{r['name']}  ({r.get('role_label') or 'not joined'}, {r.get('member_count', 0)} members, {r.get('unread', 0)} unread)"
+                          f"  id {r['room_id']}" + (f"  topic: {r['topic']}" if r.get("topic") else ""))
+            return
+        if act == "create":
+            ev = _room_request(sock, {"action": "group_room_create", "name": args.room, "topic": args.topic or "",
+                                      "description": args.description or "", "visibility": "private" if args.private else "public"},
+                               ["group_room_result"])
+            emit({"status": "ok", "room": ev.get("room")}, args.json)
+            return
+        if act == "join":
+            ev = _room_request(sock, {"action": "group_room_join", "name": args.room} if not re.match(r"^[0-9a-f-]{36}$", args.room)
+                               else {"action": "group_room_join", "room_id": args.room}, ["group_room_result"])
+            emit({"status": "ok", "room": ev.get("room")}, args.json)
+            return
+        room = _resolve_room(sock, args.room)
+        rid = room["room_id"]
+        if act == "leave":
+            ev = _room_request(sock, {"action": "group_room_leave", "room_id": rid}, ["group_room_result"])
+            emit({"status": "ok", "left": room["name"], "deleted": ev.get("deleted", False)}, args.json)
+        elif act == "post":
+            text = sys.stdin.read() if args.text == "-" else args.text
+            client_id = uuid.uuid4().hex
+            for part in split_message(text, args.split_at):
+                send_json(sock, {"action": "group_room_message", "room_id": rid, "body": part, "client_id": client_id})
+                ev = recv_until_action(sock, ["group_room_message", "group_room_result"], timeout=8.0)
+                if ev.get("action") == "group_room_result" and ev.get("ok") is False:
+                    raise RuntimeError(ev.get("reason"))
+            emit({"status": "ok", "room": room["name"], "posted": True, "message_id": (ev.get("message") or {}).get("message_id")}, args.json)
+        elif act == "history":
+            ev = _room_request(sock, {"action": "group_room_history", "room_id": rid, "limit": args.limit}, ["group_room_history_response"])
+            msgs = ev.get("messages") or []
+            if args.json:
+                emit({"status": "ok", "room": room["name"], "messages": msgs}, True)
+            else:
+                for m in msgs:
+                    when = datetime.fromtimestamp(float(m.get("sent_at") or 0)).strftime("%Y-%m-%d %H:%M")
+                    print(f"{when} {m.get('sender')}: {'(deleted)' if m.get('deleted') else m.get('body')}  [{m.get('message_id')}]")
+        elif act == "members":
+            ev = _room_request(sock, {"action": "group_room_open", "room_id": rid, "limit": 1}, ["group_room_open_response"])
+            emit({"status": "ok", "room": room["name"], "members": ev.get("members")}, args.json)
+        elif act == "invite":
+            ev = _room_request(sock, {"action": "group_room_add_member", "room_id": rid, "username": args.text, "role": args.role},
+                               ["group_room_result"])
+            emit({"status": "ok", "room": room["name"], "invited": ev.get("username")}, args.json)
+        elif act == "topic":
+            send_json(sock, {"action": "group_room_topic", "room_id": rid, "topic": args.text or ""})
+            ev = recv_until_action(sock, ["group_room_event", "group_room_result"], timeout=8.0)
+            if ev.get("ok") is False:
+                raise RuntimeError(ev.get("reason"))
+            emit({"status": "ok", "room": room["name"], "topic": (ev.get("room") or {}).get("topic")}, args.json)
+        elif act == "read-status":
+            ev = _room_request(sock, {"action": "group_room_read_status", "room_id": rid, "message_id": args.text}, ["group_room_read_status"])
+            emit({"status": "ok", "room": room["name"], "read_by": ev.get("read_by"), "total": ev.get("total"),
+                  "summary": f"read by {len(ev.get('read_by') or [])} of {ev.get('total')}"}, args.json)
+        elif act == "mark-read":
+            send_json(sock, {"action": "group_room_read", "room_id": rid, "message_id": args.text})
+            emit({"status": "ok", "room": room["name"], "marked_read": args.text}, args.json)
+    except RuntimeError as exc:
+        fail(str(exc), args.json)
+    finally:
+        sock.close()
+
 
 
 def cmd_register_bot_session(args: argparse.Namespace) -> None:
@@ -731,6 +833,20 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for immediate server replies.")
     send.add_argument("--split-at", type=int, default=20000, help="Split longer messages into labelled parts (0 disables).")
     send.set_defaults(func=cmd_send)
+
+    room = sub.add_parser("room", help="Chat rooms: list, create, join, leave, post, history, members, invite, topic, read-status, mark-read.")
+    add_login_args(room)
+    room.add_argument("room_action", choices=ROOM_ACTIONS)
+    room.add_argument("room", nargs="?", default="", help="Room name or id (not needed for list).")
+    room.add_argument("text", nargs="?", default="", help="Message (- for stdin), username to invite, topic, or message id.")
+    room.add_argument("--query", help="Words to search for (list).")
+    room.add_argument("--topic", help="Topic for a new room (create).")
+    room.add_argument("--description", help="Description for a new room (create).")
+    room.add_argument("--private", action="store_true", help="Create a private (invite-only) room.")
+    room.add_argument("--role", default="user", help="Role for invite: guest, member, moderator or admin.")
+    room.add_argument("--limit", type=int, default=30, help="How many messages (history).")
+    room.add_argument("--split-at", type=int, default=4000, help="Split longer posts into labelled parts.")
+    room.set_defaults(func=cmd_room)
 
     send_file = sub.add_parser("send-file", help="Offer one or more files to a user and send after acceptance.")
     add_login_args(send_file)
