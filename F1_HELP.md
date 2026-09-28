@@ -46,6 +46,13 @@ Each conversation has three tabs:
 - Opening a chat puts you in the message box, with the newest message selected. The backlog isn't read out.
 - If you'd rather start with an empty chat each time, turn on **Start chats fresh each time** in Settings, General tab, Chat Behavior. Nothing is deleted, and older messages stay in the Chat Archive.
 
+## Read Receipts
+- Your own messages end with their status: "sent", "delivered", or "read" with the time, for example "read 2:14 PM".
+- When the person reads your newest message, you hear a short "Read by" announcement and a soft sound, once. Older messages don't announce.
+- A message you receive counts as read when it stays selected for 2 seconds (you can set 1 to 10), or when it's the newest message in the chat you're looking at.
+- Settings, General tab, Chat Behavior: **Send read receipts** (on by default) and **Mark a message as read after it's selected for this many seconds**. If you turn read receipts off, others don't see when you read their messages, and you don't see theirs.
+- Clawdia and the other assistant bots mark your message as read when their agent picks it up.
+
 ## Chat Links
 - Links in chat messages are clickable.
 - Activate a message row (Enter or double-click) to open its link. If the message has no link, Enter opens the full message in a read-only text box you can read line by line; Escape closes it.

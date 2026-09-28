@@ -232,3 +232,6 @@ Telephony. Real FlexPBX system sounds and ringtones where they fit, and telephon
 | `ringtone_ring_ring.wav` | 5.10 s | copied from FlexPBX: `/home/flexpbxuser/public_html/uploads/media/sounds/ringtones/ringtone-ring-ring-flitch.wav` (3 bars from 2.70 s (5.1 s), faded) |
 | `call_connect_prompt.wav` | 3.68 s | copied from FlexPBX: `/home/flexpbxuser/apps/flexpbx/media/sounds/queue/call-connect.wav` (extra, not mapped to an event: sounds like a spoken prompt (8 kHz voice), kept so Dom can decide; resampled to 44.1 kHz mono) |
 
+
+## message_read (added 2026-09-28)
+Original for Thrive in every theme (sox): a soft, short cue when someone reads your newest message. default: two soft sine notes rising (0.2 s); galaxia: detuned synth ping with reverb (0.35 s); skype: rounded upward glide (0.16 s); flexpbx: two soft ticks (0.2 s).

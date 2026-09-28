@@ -912,3 +912,6 @@ Telephone-system / PBX style sound, voicemail left. Sound: "voicemail sent": thr
 Telephone-system / PBX style sound, voicemail new. Sound: "you have a new voicemail": three notes rising, inviting. Mood: professional, functional, clearly "phone". Instruments: telephone keypad DTMF tones, call-progress beeps, classic phone ringer, slightly band-limited like a phone line. Length about 0.8 seconds, one-shot, not looping, short natural tail. No vocals, no speech, clean start, no background noise.
 ```
 
+
+## message_read.wav (all themes)
+Prompt: "A very soft, short UI confirmation chime, under half a second, gentle and unobtrusive, signalling a message was read; no loop; matches the theme (neutral / spacey synth / soft bubbly / telephone-style tick)."

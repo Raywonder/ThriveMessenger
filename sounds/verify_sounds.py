@@ -7,7 +7,7 @@ import os, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 THEMES = ['default', 'galaxia', 'skype', 'flexpbx']
-EVENTS = ['call_connected', 'call_ended', 'contact_offline', 'contact_online', 'file_error',
+EVENTS = ['message_read', 'call_connected', 'call_ended', 'contact_offline', 'contact_online', 'file_error',
           'file_receive', 'file_send', 'group_call_join', 'group_call_leave', 'incoming_call',
           'login', 'logout', 'outgoing_call', 'receive', 'send',
           'call_busy', 'call_missed', 'voicemail_left', 'voicemail_new', 'voice_message_send',

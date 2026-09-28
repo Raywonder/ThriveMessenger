@@ -444,6 +444,8 @@ def load_user_config():
         'double_escape_to_close_chat': True,
         'chat_tabs': True,
         'start_chats_fresh': False,
+        'send_read_receipts': True,
+        'read_after_seconds': 2,
         'keep_contact_list_open': True,
         'save_chat_history_default': False,
         'message_edit_window_seconds': 300,
@@ -510,6 +512,11 @@ def load_user_config():
     settings['delete_messages_for_everyone'] = bool(settings.get('delete_messages_for_everyone', True))
     settings['chat_tabs'] = bool(settings.get('chat_tabs', True))
     settings['start_chats_fresh'] = bool(settings.get('start_chats_fresh', False))
+    settings['send_read_receipts'] = bool(settings.get('send_read_receipts', True))
+    try:
+        settings['read_after_seconds'] = max(1, min(10, int(settings.get('read_after_seconds', 2))))
+    except Exception:
+        settings['read_after_seconds'] = 2
     settings['keep_contact_list_open'] = bool(settings.get('keep_contact_list_open', True))
     settings['delete_attached_files_with_message'] = bool(settings.get('delete_attached_files_with_message', False))
     settings['interrupt_speech'] = bool(settings.get('interrupt_speech', True))
@@ -1911,6 +1918,12 @@ class SettingsDialog(wx.Dialog):
         self.start_fresh_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Start chats fresh each time")
         self.start_fresh_cb.SetValue(bool(self.config.get('start_chats_fresh', False)))
         self.start_fresh_cb.SetToolTip("Open chats empty instead of showing recent messages. Nothing is deleted; older messages stay in the Chat Archive tab.")
+        self.read_receipts_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Send read receipts")
+        self.read_receipts_cb.SetValue(bool(self.config.get('send_read_receipts', True)))
+        self.read_receipts_cb.SetToolTip("Let people see when you've read their messages. When this is off, you don't see theirs either.")
+        self.read_after_label = wx.StaticText(accessibility_box.GetStaticBox(), label="Mark a message as &read after it's selected for this many seconds:")
+        self.read_after_spin = wx.SpinCtrl(accessibility_box.GetStaticBox(), min=1, max=10, initial=int(self.config.get('read_after_seconds', 2)),
+                                           name="Mark a message as read after it's selected for this many seconds")
         self.keep_contact_list_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Keep the contact list open when a chat opens")
         self.keep_contact_list_cb.SetValue(bool(self.config.get('keep_contact_list_open', True)))
         self.keep_contact_list_cb.SetToolTip("Chat windows get their own taskbar and Alt+Tab entry, so the contact list stays available. Ctrl+0 in a chat returns to it.")
@@ -2059,6 +2072,11 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.chat_tabs_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.keep_contact_list_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.start_fresh_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.read_receipts_cb, 0, wx.ALL, 5)
+        read_row = wx.BoxSizer(wx.HORIZONTAL)
+        read_row.Add(self.read_after_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        read_row.Add(self.read_after_spin, 0)
+        accessibility_box.Add(read_row, 0, wx.ALL, 5)
         accessibility_box.Add(self.delete_for_everyone_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.delete_attached_files_cb, 0, wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -2129,7 +2147,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -3208,6 +3226,8 @@ class ClientApp(wx.App):
                             wx.CallAfter(setattr, self.frame, "am_admin", bool(msg.get("is_admin")))
                     elif act == "msg_sent": wx.CallAfter(self.frame.on_message_sent_ack, msg)
                     elif act == "history": wx.CallAfter(self.frame.on_history, msg)
+                    elif act == "msg_read_update": wx.CallAfter(self.frame.on_msg_read_update, msg)
+                    elif act == "msg_read_sync": wx.CallAfter(self.frame.on_msg_read_sync, msg)
                     elif act == "history_days": wx.CallAfter(self.frame.on_history_days, msg)
                     elif act == "voice_data": wx.CallAfter(self.frame.on_voice_data, msg)
                     elif act == "voicemail_saved": wx.CallAfter(self.frame.on_voicemail_saved, msg)
@@ -5467,6 +5487,10 @@ class MainFrame(wx.Frame):
         app.user_config['chat_tabs'] = dlg.chat_tabs_cb.IsChecked()
         app.user_config['keep_contact_list_open'] = dlg.keep_contact_list_cb.IsChecked()
         app.user_config['start_chats_fresh'] = dlg.start_fresh_cb.IsChecked()
+        app.user_config['send_read_receipts'] = dlg.read_receipts_cb.IsChecked()
+        app.user_config['read_after_seconds'] = int(dlg.read_after_spin.GetValue())
+        for chat in self.all_chats():
+            chat.refresh_all_rows()
         app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
         edit_window, undo_window = dlg.message_policy()
         app.user_config['message_edit_window_seconds'] = edit_window
@@ -6477,6 +6501,8 @@ class MainFrame(wx.Frame):
         dlg.set_typing_label(sender, False)
         self.clear_typing_state(sender)
         is_focused_chat = dlg.is_active_chat()
+        if is_focused_chat:
+            dlg.mark_newest_read_if_active()
         if not is_focused_chat:
             dlg.mark_tab_unread()
             self._mark_unread(sender)
@@ -6530,7 +6556,14 @@ class MainFrame(wx.Frame):
         wx.GetApp().message_acknowledged(msg.get("client_id"))
         chat = self.get_chat(msg.get("to"))
         if chat:
-            chat.set_row_message_id(str(msg.get("client_id") or ""), str(msg.get("id") or ""))
+            chat.set_row_message_id(str(msg.get("client_id") or ""), str(msg.get("id") or ""), delivered=bool(msg.get("delivered")))
+    def on_msg_read_update(self, msg):
+        chat = self.get_chat(msg.get("by"))
+        if chat:
+            chat.apply_read_update(msg.get("ids"), msg.get("read_at"), by=msg.get("by"))
+    def on_msg_read_sync(self, msg):
+        for chat in self.all_chats():
+            chat.apply_read_sync(msg.get("ids"))
     def on_message_changed(self, msg):
         chat = self._chat_for_message_event(msg)
         if not chat:
@@ -8418,6 +8451,7 @@ class ChatPanel(wx.Panel):
         self.hist = wx.ListBox(mp, style=wx.LB_SINGLE, name="Messages")
         self._history_rows = []
         self.hist.Bind(wx.EVT_LISTBOX_DCLICK, self.on_history_item_activated)
+        self.hist.Bind(wx.EVT_LISTBOX, lambda e: (self._schedule_read_mark(), e.Skip()))
         self.hist.Bind(wx.EVT_KEY_DOWN, self.on_history_key)
         self.hist.Bind(wx.EVT_CONTEXT_MENU, self.on_history_context_menu)
         self.typing_lbl = wx.StaticText(mp, label="")
@@ -8540,6 +8574,7 @@ class ChatPanel(wx.Panel):
         if hasattr(self.frame, "_clear_unread"):
             self.frame._clear_unread(self.contact)
     def on_host_activated(self):
+        wx.CallAfter(self.mark_newest_read_if_active)
         if self.inner.GetSelection() == 0:
             self._focus_input()
         else:
@@ -9100,13 +9135,16 @@ class ChatPanel(wx.Panel):
                 r["queued"] = bool(queued)
                 self._refresh_row_display(i)
                 return
-    def set_row_message_id(self, client_id, msg_id):
+    def set_row_message_id(self, client_id, msg_id, delivered=False):
         if not client_id or not msg_id:
             return
         self._known_ids.add(msg_id)
-        for r in reversed(self._history_rows):
+        for i in range(len(self._history_rows) - 1, -1, -1):
+            r = self._history_rows[i]
             if r.get("client_id") == client_id:
                 r["id"] = msg_id
+                r["delivered"] = bool(delivered)
+                self._refresh_row_display(i)
                 return
     # --- server history -------------------------------------------------------------------
     HISTORY_PAGE = 200
@@ -9135,6 +9173,10 @@ class ChatPanel(wx.Panel):
                "epoch": timestamp_epoch(item.get("time")), "id": item.get("id"), "seq": item.get("seq")}
         if item.get("edited"):
             row["edited"] = True
+        row["delivered"] = bool(item.get("delivered"))
+        if item.get("read_at"):
+            row["read_at"] = item["read_at"]
+            row["read_sent"] = True
         v = item.get("voice")
         if isinstance(v, dict):
             cached = os.path.join(voice_cache_dir(), f"{re.sub(r'[^A-Za-z0-9_-]', '', str(item.get('id')))}.mp3")
@@ -9143,6 +9185,81 @@ class ChatPanel(wx.Panel):
             if os.path.isfile(cached):
                 row["files"] = [cached]
         return row
+    # --- read receipts ------------------------------------------------------------------------------
+    @staticmethod
+    def _receipts_on():
+        return bool(wx.GetApp().user_config.get('send_read_receipts', True))
+    def _status_suffix(self, row):
+        if not self._receipts_on() or row.get("sender") != self.user or row.get("error") or not row.get("id"):
+            return ""
+        if row.get("read_at"):
+            dt = parse_timestamp_value(row["read_at"])
+            when = dt.strftime('%I:%M %p').lstrip('0') if dt else ""
+            return f", read {when}".rstrip()
+        return ", delivered" if row.get("delivered") else ", sent"
+    def refresh_all_rows(self):
+        for i in range(len(self._history_rows)):
+            self._refresh_row_display(i)
+    def _schedule_read_mark(self, delay_seconds=None):
+        if not self._receipts_on() or self.is_remote_directory_chat:
+            return
+        seconds = delay_seconds if delay_seconds is not None else int(wx.GetApp().user_config.get('read_after_seconds', 2) or 2)
+        old = getattr(self, "_read_timer", None)
+        if old:
+            try: old.Stop()
+            except Exception: pass
+        self._read_timer = wx.CallLater(int(seconds * 1000), self._mark_selected_read)
+    def _mark_selected_read(self):
+        """The selected message (and anything older from them) counts as read once it has stayed selected in the active chat."""
+        if not self.is_active_chat():
+            return
+        idx = self.hist.GetSelection()
+        if idx == wx.NOT_FOUND or idx >= len(self._history_rows):
+            return
+        self._send_read(upto=idx)
+    def mark_newest_read_if_active(self):
+        if self.is_active_chat() and self._history_rows:
+            self._schedule_read_mark()
+            # Newest message visible in the active chat counts too, even if selection moved elsewhere.
+            wx.CallLater(int(int(wx.GetApp().user_config.get('read_after_seconds', 2) or 2) * 1000),
+                         lambda: self.is_active_chat() and self._send_read(upto=len(self._history_rows) - 1))
+    def _send_read(self, upto):
+        if not self._receipts_on():
+            return
+        ids = []
+        for row in self._history_rows[:upto + 1]:
+            if row.get("sender") not in (self.user, "System") and row.get("id") and not row.get("read_sent") \
+                    and not str(row.get("id")).startswith("h"):
+                row["read_sent"] = True
+                ids.append(row["id"])
+        if not ids:
+            return
+        try:
+            self.sock.sendall((json.dumps({"action": "msg_read", "ids": ids}) + "\n").encode())
+        except Exception:
+            for row in self._history_rows:
+                if row.get("id") in ids:
+                    row["read_sent"] = False
+    def apply_read_update(self, ids, read_at, by=None):
+        """Our messages were read: update their status; announce once if the newest one we sent is among them."""
+        ids = set(ids or [])
+        changed_newest = False
+        own = [i for i, r in enumerate(self._history_rows) if r.get("sender") == self.user and r.get("id")]
+        newest_own = own[-1] if own else None
+        for i, row in enumerate(self._history_rows):
+            if row.get("id") in ids and not row.get("read_at"):
+                row["read_at"] = read_at; row["delivered"] = True
+                self._refresh_row_display(i)
+                if i == newest_own:
+                    changed_newest = True
+        if changed_newest and self._receipts_on():
+            wx.GetApp().play_sound("message_read.wav")
+            speak_text(f"Read by {self.display_name()}", interrupt=False)
+    def apply_read_sync(self, ids):
+        ids = set(ids or [])
+        for row in self._history_rows:
+            if row.get("id") in ids:
+                row["read_sent"] = True
     def _row_display(self, row):
         text = row.get("text", "")
         if row.get("edited"):
@@ -9150,7 +9267,7 @@ class ChatPanel(wx.Panel):
         if row.get("queued"):
             text = f"{text} (not sent yet, will send when reconnected)"
         display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
-        return display
+        return display + self._status_suffix(row)
     def apply_history(self, msg):
         """Merge server history in time order, skipping anything already shown (no duplicates)."""
         self._hist_state["pending"] = False
