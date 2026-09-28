@@ -57,6 +57,7 @@ struct ChatView: View {
                     }
                 }
                 .listStyle(.plain)
+                .scrollDismissesKeyboard(.immediately)
                 .onChange(of: c.messages.count) { _, _ in
                     if let last = c.messages.last {
                         if scrollTarget == nil { proxy.scrollTo(last.id, anchor: .bottom) }

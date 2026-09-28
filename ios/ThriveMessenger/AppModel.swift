@@ -79,6 +79,10 @@ final class AppModel {
         linkOpenInApp = defaults.object(forKey: "link_open_in_app") as? Bool ?? true
         roomAlerts = defaults.string(forKey: "room_alerts") ?? "mentions"
         username = defaults.string(forKey: "username") ?? ""
+        if ProcessInfo.processInfo.arguments.contains("--reset-for-tests") {
+            Keychain.delete(server: server.id, user: username)
+            username = ""
+        }
         pathMonitor.pathUpdateHandler = { [weak self] path in
             guard path.status == .satisfied else { return }
             Task { @MainActor in self?.networkChanged() }

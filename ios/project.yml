@@ -23,3 +23,20 @@ targets:
         INFOPLIST_FILE: ThriveMessenger/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: NO
+  ThriveMessengerUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [ThriveMessengerUITests]
+    dependencies:
+      - target: ThriveMessenger
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: fm.tappedin.thrivemessenger.uitests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  ThriveMessenger:
+    build:
+      targets:
+        ThriveMessenger: all
+    test:
+      targets: [ThriveMessengerUITests]
