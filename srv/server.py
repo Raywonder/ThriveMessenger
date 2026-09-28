@@ -816,7 +816,7 @@ def _history_query(user, other, before_seq=None, limit=HISTORY_DEFAULT_LIMIT, da
         con.close()
     has_more = len(rows) > limit
     rows = list(reversed(rows[:limit]))
-    return [_history_item(r) for r in rows], has_more
+    return _attach_reactions("dm", [_history_item(r) for r in rows], "id"), has_more
 
 def _history_days(user, other, tz_offset_minutes=0):
     con = sqlite3.connect(DB, timeout=10)
@@ -1206,6 +1206,7 @@ def _room_rate_ok(user):
 def _room_open_payload(room_id, user, limit=100):
     room = rooms.get_room(DB, room_id, user)
     messages, has_more = rooms.history(DB, room_id, user, limit)
+    _attach_reactions("room", messages, "message_id")
     payload = {"action": "group_room_open_response", "ok": True, "room": room, "members": rooms.list_members(DB, room_id),
                "messages": messages, "has_more": has_more}
     if room["role"] in ("moderator", "admin", "owner"):
@@ -1228,20 +1229,56 @@ def _room_mark_read(room_id, user, message_id):
                                   "message_id": message_id, "read_at": read_at})
     return read_at
 
+ROOM_AGENT_COOLDOWN = 30          # seconds between an agent's replies to other agents in one room
+ROOM_AGENT_HOURLY_CAP = 30        # replies per agent per room per hour
+ROOM_AGENT_STREAK_CAP = 6         # consecutive agent-only messages before agents wait for a human
+_room_agent_replies = {}
+
+def _is_agent(name):
+    return _is_virtual_bot(name) or str(name).lower() in {b.lower() for b in _external_bot_names()} or str(name).lower() == "systemmonitor"
+
+def _room_agent_streak(room_id):
+    try:
+        msgs, _ = rooms.history(DB, room_id, _room_members(room_id)[0], limit=ROOM_AGENT_STREAK_CAP + 1)
+    except Exception:
+        return 0
+    n = 0
+    for m in reversed(msgs):
+        if not _is_agent(m.get("sender")):
+            break
+        n += 1
+    return n
+
+def _room_agent_allowed(room_id, bot, from_agent):
+    now = time.time()
+    key = (room_id, bot.lower())
+    recent = [t for t in _room_agent_replies.get(key, []) if now - t < 3600]
+    _room_agent_replies[key] = recent
+    if len(recent) >= ROOM_AGENT_HOURLY_CAP:
+        return False
+    if from_agent and recent and now - recent[-1] < ROOM_AGENT_COOLDOWN:
+        return False
+    if from_agent and _room_agent_streak(room_id) >= ROOM_AGENT_STREAK_CAP:
+        return False
+    return True
+
 def _room_maybe_bot_replies(room_id, sender, item):
     """Agents answer in the room they were asked in: when @mentioned, or when the room is just the sender and that agent.
-    Agents never answer other agents' messages, so two agents can't loop."""
-    if _is_virtual_bot(sender) or str(sender).lower() in {b.lower() for b in _external_bot_names()}:
-        return
+    Agents answer other agents only when explicitly @mentioned, never themselves, and with a cool-down, an hourly cap and a
+    stop after several agent-only messages in a row (until a person speaks), so agents can't loop."""
+    from_agent = _is_agent(sender)
     members = _room_members(room_id)
-    bots = [m for m in members if _is_virtual_bot(m)]
+    bots = [m for m in members if _is_virtual_bot(m) and m.lower() != str(sender).lower()]
     if not bots:
         return
     mentioned = {m.lower() for m in item.get("mentions") or []}
-    humans = [m for m in members if not _is_virtual_bot(m)]
+    humans = [m for m in members if not _is_agent(m)]
     for bot in bots:
-        if bot.lower() in mentioned or (len(members) == 2 and len(humans) == 1):
-            threading.Thread(target=_room_bot_worker, args=(room_id, sender, bot, item), name=f"room-bot-{bot}", daemon=True).start()
+        addressed = bot.lower() in mentioned or (not from_agent and len(members) == 2 and len(humans) == 1)
+        if not addressed or not _room_agent_allowed(room_id, bot, from_agent):
+            continue
+        _room_agent_replies.setdefault((room_id, bot.lower()), []).append(time.time())
+        threading.Thread(target=_room_bot_worker, args=(room_id, sender, bot, item), name=f"room-bot-{bot}", daemon=True).start()
 
 def _external_bot_names():
     try:
@@ -1299,8 +1336,8 @@ def _room_agent_reply(room, sender, bot, text):
             "reason": "No model or agent answered a room message. Repair the route and reply in the room.",
             "latest_user_message": _moderation_excerpt(text, 500),
         })
-        if not _first_unreachable_notice(sender, bot):
-            return ""
+        if _is_agent(sender) or not _first_unreachable_notice(sender, bot):
+            return ""  # never answer another agent with a notice (it would only add noise)
         return f"I couldn't answer just now: nothing is connected to reply for {bot}. Your message is saved in this room."
     reply, blocked, reason = _user_facing_bot_output(str(reply or ""))
     if blocked or not reply:
@@ -1345,6 +1382,7 @@ def _handle_room_action(sock, user, action, msg):
             _send_json_line(sock, _room_open_payload(room_id, user, msg.get("limit", 100)))
         elif action == "group_room_history":
             messages, has_more = rooms.history(DB, room_id, user, msg.get("limit", 100), msg.get("before"))
+            _attach_reactions("room", messages, "message_id")
             _send_json_line(sock, {"action": "group_room_history_response", "ok": True, "room_id": room_id, "messages": messages,
                                    "has_more": has_more, "before": msg.get("before"), "request_id": str(msg.get("request_id") or "")[:64]})
         elif action == "group_room_message":
@@ -1447,6 +1485,100 @@ def _handle_room_action(sock, user, action, msg):
     except Exception as e:
         print(f"Room action {action} failed: {type(e).__name__}: {e}")
         _room_reply(sock, action, ok=False, reason="The server hit a problem with that room action.", room_id=room_id)
+
+# --- reactions (DMs and rooms) ---------------------------------------------------------------------------------
+REACTION_MAX_PER_USER = 20
+
+def _init_reactions(cur):
+    cur.execute("""CREATE TABLE IF NOT EXISTS message_reactions (
+        scope TEXT NOT NULL, message_id TEXT NOT NULL, username TEXT NOT NULL COLLATE NOCASE, emoji TEXT NOT NULL,
+        created_at REAL NOT NULL, PRIMARY KEY(scope, message_id, username, emoji))""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reactions_msg ON message_reactions(scope, message_id)")
+
+def _valid_reaction(emoji):
+    emoji = str(emoji or "").strip()
+    # One emoji (possibly with skin tone, variation selector or ZWJ parts): short, and no letters, digits or spaces.
+    if not emoji or len(emoji) > 12 or any(ch.isalnum() and ord(ch) < 0x2000 or ch.isspace() for ch in emoji):
+        return ""
+    return emoji
+
+def _reactions_for(scope, ids):
+    """{message_id: [{"emoji": e, "users": [names in order]}]} for the given messages."""
+    ids = [str(i) for i in ids if i]
+    out = {}
+    if not ids:
+        return out
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            q = ("SELECT message_id, emoji, username FROM message_reactions WHERE scope=? AND message_id IN (%s) ORDER BY created_at"
+                 % ",".join("?" * len(chunk)))
+            try:
+                found = con.execute(q, [scope] + chunk).fetchall()
+            except sqlite3.OperationalError:
+                return out  # table not created yet (before the first restart with reactions)
+            for mid, emoji, user in found:
+                groups = out.setdefault(mid, [])
+                g = next((x for x in groups if x["emoji"] == emoji), None)
+                if not g:
+                    g = {"emoji": emoji, "users": []}
+                    groups.append(g)
+                g["users"].append(user)
+    finally:
+        con.close()
+    return out
+
+def _attach_reactions(scope, items, key):
+    found = _reactions_for(scope, [i.get(key) for i in items])
+    for i in items:
+        if i.get(key) in found:
+            i["reactions"] = found[i[key]]
+    return items
+
+def _react(user, scope, message_id, emoji, on=True, room_id=""):
+    """Add or remove one reaction. Only people in the conversation (or room members) can react.
+    Returns (ok, reason, update payload, who to tell)."""
+    emoji = _valid_reaction(emoji)
+    if not emoji:
+        return False, "That isn't a reaction Thrive can use.", None, ()
+    message_id = str(message_id or "").strip()
+    if scope == "room":
+        try:
+            if not rooms.can(DB, room_id, user, "view") or not rooms.get_message(DB, room_id, message_id):
+                return False, "Join the room to react there.", None, ()
+        except rooms.RoomError as e:
+            return False, str(e), None, ()
+        audience = set(_room_members(room_id)) | {user}
+    else:
+        scope = "dm"
+        con = sqlite3.connect(DB, timeout=10)
+        try:
+            row = con.execute("SELECT frm, to_user FROM direct_message_history WHERE msg_uid=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+                              (message_id,)).fetchone()
+        finally:
+            con.close()
+        if not row or str(user).lower() not in (str(row[0]).lower(), str(row[1]).lower()):
+            return False, "You can only react to messages in your own conversations.", None, ()
+        audience = {row[0], row[1], user}
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        if on:
+            mine = con.execute("SELECT COUNT(*) FROM message_reactions WHERE scope=? AND message_id=? AND username=?",
+                               (scope, message_id, user)).fetchone()[0]
+            if mine >= REACTION_MAX_PER_USER:
+                return False, "That's the most reactions one person can add to a message.", None, ()
+            con.execute("INSERT OR IGNORE INTO message_reactions (scope, message_id, username, emoji, created_at) VALUES (?,?,?,?,?)",
+                        (scope, message_id, user, emoji, time.time()))
+        else:
+            con.execute("DELETE FROM message_reactions WHERE scope=? AND message_id=? AND username=? AND emoji=?", (scope, message_id, user, emoji))
+        con.commit()
+    finally:
+        con.close()
+    payload = {"action": "reaction_update", "scope": scope, "message_id": message_id, "room_id": room_id if scope == "room" else "",
+               "emoji": emoji, "username": user, "on": bool(on),
+               "reactions": _reactions_for(scope, [message_id]).get(message_id, [])}
+    return True, "", payload, audience
 
 def _send_to_all_sessions(usernames, payload):
     """Send one event to every signed-in device of each user (names matched ignoring case)."""
@@ -4125,6 +4257,7 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS pending_voicemail (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS pending_bot_messages (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS link_titles (url TEXT PRIMARY KEY, title TEXT, fetched_at REAL)")
+    _init_reactions(cur)
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_message_cursors (
         bot TEXT NOT NULL,
         channel TEXT NOT NULL DEFAULT 'thrive',
@@ -6655,6 +6788,17 @@ def handle_client(cs, addr):
 
             elif action == "msg_read":
                 _mark_messages_read(user, msg.get("ids") or [])
+
+            elif action == "ping":
+                _send_json_line(sock, {"action": "pong", "t": msg.get("t")})
+
+            elif action == "react":
+                ok, reason, update, audience = _react(user, str(msg.get("scope") or "dm"), msg.get("message_id"), msg.get("emoji"),
+                                                      bool(msg.get("on", True)), str(msg.get("room_id") or ""))
+                if ok:
+                    _send_to_all_sessions(audience, update)
+                else:
+                    _send_json_line(sock, {"action": "reaction_failed", "reason": reason, "message_id": msg.get("message_id")})
 
             elif action.startswith("group_room_"):
                 _handle_room_action(sock, user, action, msg)

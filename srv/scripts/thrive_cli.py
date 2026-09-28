@@ -444,8 +444,35 @@ def cmd_read_status(args: argparse.Namespace) -> None:
     if args.ids:
         wanted = set(args.ids)
         rows = [r for r in rows if r["id"] in wanted]
+    # Reactions on these messages (a thumbs up from the recipient is an acknowledgement; see REACTION_MEANINGS).
+    found = thrive_server._reactions_for("dm", [r["id"] for r in rows])
+    for r in rows:
+        r["reactions"] = found.get(r["id"], [])
     emit({"status": "ok", "from": args.sender, "to": args.to, "messages": rows,
           "unread": sum(1 for r in rows if not r["read"])}, args.json)
+
+
+REACTION_NAMES = {"\U0001F44D": "thumbs up", "\U0001F44E": "thumbs down", "\u2764\ufe0f": "heart", "\U0001F602": "laugh",
+                  "\U0001F62E": "wow", "\U0001F622": "sad", "\U0001F389": "celebrate", "\u2705": "check mark", "\U0001F440": "seen"}
+REACTION_ALIASES = {v.replace(" ", ""): k for k, v in REACTION_NAMES.items()}
+REACTION_ALIASES.update({"like": "\U0001F44D", "+1": "\U0001F44D", "-1": "\U0001F44E", "eyes": "\U0001F440", "check": "\u2705", "love": "\u2764\ufe0f"})
+
+
+def cmd_react(args: argparse.Namespace) -> None:
+    """React to a message (DM with --to, or in a room with --room). Emoji or a name: thumbsup, heart, seen, check..."""
+    emoji = REACTION_ALIASES.get(args.emoji.lower().replace(" ", "").replace("_", ""), args.emoji)
+    sock = login(args)
+    try:
+        payload = {"action": "react", "message_id": args.message_id, "emoji": emoji, "on": not args.off, "scope": "dm"}
+        if args.room:
+            payload.update(scope="room", room_id=_resolve_room(sock, args.room)["room_id"])
+        send_json(sock, payload)
+        ev = recv_until_action(sock, ["reaction_update", "reaction_failed"], timeout=8.0)
+        if ev.get("action") == "reaction_failed":
+            fail(ev.get("reason") or "Reaction refused.", args.json)
+        emit({"status": "ok", "message_id": args.message_id, "emoji": emoji, "on": not args.off, "reactions": ev.get("reactions")}, args.json)
+    finally:
+        sock.close()
 
 
 def cmd_send(args: argparse.Namespace) -> None:
@@ -836,6 +863,14 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for immediate server replies.")
     send.add_argument("--split-at", type=int, default=20000, help="Split longer messages into labelled parts (0 disables).")
     send.set_defaults(func=cmd_send)
+
+    react = sub.add_parser("react", help="Add (or with --off remove) a reaction on a message: DM with --to, or --room.")
+    add_login_args(react)
+    react.add_argument("message_id")
+    react.add_argument("emoji", help="An emoji, or a name: thumbsup, thumbsdown, heart, laugh, wow, sad, celebrate, check, seen.")
+    react.add_argument("--room", help="Room name or id (for room messages).")
+    react.add_argument("--off", action="store_true", help="Remove the reaction instead.")
+    react.set_defaults(func=cmd_react)
 
     room = sub.add_parser("room", help="Chat rooms: list, create, join, leave, post, history, members, invite, topic, read-status, mark-read.")
     add_login_args(room)
