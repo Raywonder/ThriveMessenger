@@ -100,6 +100,24 @@ def prepare_review(demo_user, demo_pass):
                                                       "relationships": {"app": {"data": {"type": "apps", "id": aid}}}}})
     print("review details and beta description set (contact copied from another app)")
 
+def make_profile(name):
+    """A fresh App Store profile for the Thrive bundle with every current distribution certificate; saved for Xcode."""
+    import base64, plistlib, subprocess
+    bid = api("GET", f"bundleIds?filter[identifier]={BUNDLE}")["data"]
+    bid = next(b for b in bid if b["attributes"]["identifier"] == BUNDLE)["id"]
+    certs = [c for c in api("GET", "certificates?limit=200")["data"]
+             if c["attributes"]["certificateType"] in ("DISTRIBUTION", "IOS_DISTRIBUTION")]
+    print("distribution certificates:", len(certs))
+    prof = api("POST", "profiles", {"data": {"type": "profiles", "attributes": {"name": name, "profileType": "IOS_APP_STORE"},
+                                             "relationships": {"bundleId": {"data": {"type": "bundleIds", "id": bid}},
+                                                               "certificates": {"data": [{"type": "certificates", "id": c["id"]} for c in certs]}}}})["data"]
+    content = base64.b64decode(prof["attributes"]["profileContent"])
+    uuid = prof["attributes"]["uuid"]
+    d = os.path.expanduser("~/Library/MobileDevice/Provisioning Profiles")
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, uuid + ".mobileprovision"), "wb").write(content)
+    print("profile created and installed:", name)
+
 def submit(build_number):
     aid = app_id()
     build = None
@@ -143,6 +161,8 @@ def submit(build_number):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "submit":
         submit(sys.argv[2])
+    elif len(sys.argv) > 1 and sys.argv[1] == "profile":
+        make_profile(sys.argv[2])
     elif len(sys.argv) > 1 and sys.argv[1] == "others":
         others()
     elif len(sys.argv) > 1 and sys.argv[1] == "prepare":
