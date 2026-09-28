@@ -7751,6 +7751,16 @@ class GroupPolicyDialog(wx.Dialog):
         self.info.SetLabel("Policy updated. Reloading...")
         self.on_load(None)
 
+def panel_ok_cancel(panel, ok_label=None):
+    """OK and Cancel buttons owned by the panel whose sizer holds them (dialog-owned buttons in a panel sizer assert)."""
+    buttons = wx.StdDialogButtonSizer()
+    ok = wx.Button(panel, wx.ID_OK, label=ok_label or "OK")
+    ok.SetDefault()
+    buttons.AddButton(ok)
+    buttons.AddButton(wx.Button(panel, wx.ID_CANCEL))
+    buttons.Realize()
+    return buttons
+
 class CreateGroupRoomDialog(wx.Dialog):
     def __init__(self, parent):
         super().__init__(parent, title="Create Group Room")
@@ -7771,8 +7781,7 @@ class CreateGroupRoomDialog(wx.Dialog):
         self.expiration.SetSelection(0)
         self.expiration.SetToolTip("Empty deletes the room immediately after its last member leaves.")
         s.Add(self.expiration, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
-        s.Add(buttons, 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(panel_ok_cancel(panel, "&Create"), 0, wx.EXPAND | wx.ALL, 8)
         panel.SetSizer(s)
         outer = wx.BoxSizer(wx.VERTICAL); outer.Add(panel, 1, wx.EXPAND); self.SetSizerAndFit(outer)
         self.name_ctrl.SetFocus()
@@ -7815,7 +7824,7 @@ class GroupRoomSettingsDialog(wx.Dialog):
         permissions = room.get("permissions", {})
         for index, (action, role) in enumerate((a, r) for a in self.ACTIONS for r in self.ROLES): self.permission_list.Check(index, role in permissions.get(action, []))
         s.Add(self.permission_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-        s.Add(self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL), 0, wx.EXPAND | wx.ALL, 8)
+        s.Add(panel_ok_cancel(panel, "&Save"), 0, wx.EXPAND | wx.ALL, 8)
         panel.SetSizer(s); outer = wx.BoxSizer(wx.VERTICAL); outer.Add(panel, 1, wx.EXPAND); self.SetSizer(outer)
     def changes(self):
         permissions = {action: [] for action in self.ACTIONS}
@@ -9220,9 +9229,7 @@ class MessageJumpDialog(wx.Dialog):
         if labels:
             self.list.SetSelection(0)
         s.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
-        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
-        self.FindWindowById(wx.ID_OK).SetLabel("&Go to")
-        s.Add(buttons, 0, wx.EXPAND | wx.ALL, 6)
+        s.Add(panel_ok_cancel(panel, "&Go to"), 0, wx.EXPAND | wx.ALL, 6)
         panel.SetSizer(s)
         self.list.Bind(wx.EVT_LISTBOX_DCLICK, lambda e: self._go())
         self.Bind(wx.EVT_BUTTON, lambda e: self._go(), id=wx.ID_OK)
