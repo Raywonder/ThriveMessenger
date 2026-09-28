@@ -6,6 +6,17 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.17
+- **Links in chats:** a message says how many links it has. Left Arrow and Right Arrow move between them, and Enter opens one in a full view inside Thrive. Escape comes back. Link lists and link removal are in the message menu.
+- **Go to** (Control+G): jump to messages with links, from a person, your own, unread, by date, or by search. Alt+Left goes back.
+- **Chat rooms:** open rooms from the Groups tab as chat tabs, with members, roles, topics, @mentions, "read by 2 of 5", voice messages and moderation.
+- **Reactions** (Alt+R on a message): thumbs up, heart, seen and more.
+- **Reconnect:** Thrive reconnects by itself after any outage and fills in what you missed.
+- **Start at sign-in:** on by default, and Thrive doesn't take focus.
+- **Chat tabs:** arrowing along a tab strip stays on the tabs. Enter, Space or Tab moves into the page.
+- **Mac:** the Mac app now runs natively on Apple silicon and on Intel Macs.
+- **iPhone:** a native iPhone app is in testing through TestFlight. See "On iPhone" below.
+
 ## Server Manager (No manual .conf edits required)
 - In the Login window, use **Manage Servers...**
 - Add/update/remove server entries.
@@ -29,6 +40,20 @@
   - **Open chats in tabs in one chat window** (on by default). Turn it off for one window per chat.
   - **Keep the contact list open when a chat opens** (on by default). Turn it off for the older behaviour, where chat windows belong to the contact list window.
 - A new message never moves your focus or switches tabs. Its tab shows the unread count, for example "Clawdia (2 unread)", and you hear the usual sound or announcement.
+
+### Moving along the tabs
+There are two tab strips: the conversation tabs at the top of the Chats window, and the inner tabs inside each conversation (Messages, Chat Archive, File Transfers, and Members in a room).
+1. Press Tab or Shift+Tab until you reach a tab strip. The screen reader reads the tab.
+2. Press Left Arrow or Right Arrow to move between tabs. Focus stays on the tabs, so you can keep arrowing. The page behind the tab is updated, but nothing extra is announced.
+3. Press Enter or Space to move into that page. On the Messages tab this puts you in the message box. Tab also moves into the page.
+- Control+Page Down and Control+Page Up (inner tabs) and Control+Tab (conversations) still switch tabs from anywhere in the chat.
+
+## Sending Messages
+- Type in the message box, then press **Alt+S** (the Send button) to send. On a Mac, use the Send button, or set Enter to Send message.
+- What **Enter** does in the message box is set in Settings, General tab, Chat Behavior: **Enter key action**. The choices are **Do nothing** (the default), **Send message** and **Place call**. Choose Send message if you want Enter to send.
+- **Shift+Enter** (or Alt+Enter) always puts a new line in the message box.
+- **Control+Enter** sends a file to this person.
+- **Escape** closes the chat. With **Require double Escape to dismiss chat windows** on (the default), the first Escape shows "Press Escape again to close this chat", and a second Escape within about a second closes it. While you are editing a message, Escape cancels the edit instead.
 
 ## Inside a Conversation
 Each conversation has three tabs:
@@ -123,8 +148,10 @@ Each conversation has three tabs:
 ## Keyboard Shortcuts
 - `F1`: Open Help
 - `Escape`: Close dialogs/chat
-- `Enter`: Open selected contact chat / send in focused context
+- `Enter`: in the contact list, open a chat with the selected contact. In the message box, it does what Settings, **Enter key action** says (Do nothing by default, or Send message).
+- `Alt+S`: send the message
 - `Shift+Enter`: New line in chat message box
+- `Ctrl+Enter`: send a file in a chat
 - `Alt` shortcuts in Contacts screen:
   - `Alt+B` Block/Unblock
   - `Alt+A` Add Contact
@@ -143,11 +170,18 @@ Each conversation has three tabs:
   - `Ctrl+1` to `Ctrl+8`: go to that conversation; `Ctrl+9`: the last one
   - `Ctrl+W` or `Ctrl+F4`: close the current conversation
   - `Ctrl+0`: go to the contact list
-  - `Ctrl+Page Down` / `Ctrl+Page Up`: next or previous inner tab (Messages, Chat Archive, File Transfers)
+  - `Ctrl+Page Down` / `Ctrl+Page Up`: next or previous inner tab (Messages, Chat Archive, File Transfers, and Members in a room)
+  - On a tab strip: `Left`/`Right` move between tabs and keep focus on the tabs; `Enter`, `Space` or `Tab` move into the page
+  - `Ctrl+G`: Go to (messages with links, from a person, mine, unread, by date, search)
   - `Ctrl+E`: insert emoji
   - `Ctrl+R`: record a voice message (press again to stop)
   - `Ctrl+Shift+R`: leave a voicemail
-  - On a message: `Ctrl+C` copy, `Ctrl+S` save to Chat Archive, `Delete` delete, `Applications` or `Shift+F10` for all actions
+  - `Escape`: close the chat (press it twice when Require double Escape is on); while editing, cancel the edit
+  - On a message: `Ctrl+C` copy, `Ctrl+S` save to Chat Archive, `Delete` delete, `Alt+R` react, `Applications` or `Shift+F10` for all actions
+  - On a message with links: `Left`/`Right` move between its links, `Enter` or `Space` open the link
+  - In the message list: `Alt+Down` / `Alt+Up` next or previous message with a link, `Alt+Left` back to where you were before a jump, `Ctrl+Home` / `Ctrl+End` first or last message
+  - In full view of a link: `Escape` or `Ctrl+W` close, `Alt+Left` / `Alt+Right` back and forward, `F5` reload
+  - In a list of links: `Enter` open, `Ctrl+C` copy the link, `Ctrl+Shift+C` copy the title, `Delete` remove, `Escape` close
   - On a voice message: `Enter` play or stop, `Space` pause or resume, `Left`/`Right` skip 5 seconds
 
 
@@ -157,10 +191,41 @@ Thrive for Mac has the same features. Where Windows uses Control, the Mac uses C
 - Go to a conversation: `Command+1` to `Command+9`. Close it: `Command+W`. Go to the contact list: `Command+0`.
 - Switch the inner tabs (Messages, Chat Archive, File Transfers): `Control+Page Down` / `Control+Page Up`, or `Command+Option+Right` / `Command+Option+Left`.
 - Insert emoji: `Command+E`. Record a voice message: `Command+R`. Leave a voicemail: `Command+Shift+R`.
+- Go to: `Command+G`. First and last message: `Command+Home` and `Command+End`.
+- Shortcuts that use Alt on Windows use Option on a Mac, for example `Option+R` to react and `Option+Down` for the next message with a link.
 - On a message: `Command+C` copies, `Command+S` saves to Chat Archive, and `Command+Delete` deletes.
 - Announcements (typing, copied, voice messages) go to VoiceOver when it's on. If VoiceOver is off, the Mac speaks them with its built-in voice.
 - The first time you record, macOS asks for permission to use the microphone.
 - Saved passwords and passkeys are kept in the macOS Keychain. On Windows they're kept in Windows Credential Manager. Neither is ever stored in a settings file.
+
+## On iPhone (TestFlight beta)
+Thrive for iPhone is a separate, native app, now in testing through TestFlight. It needs iOS 17 or later. It has three tabs at the bottom: **Chats**, **Rooms** and **Settings**.
+
+### Signing in
+1. Enter your username and password. The server is TappedIn (`im.tappedin.fm`).
+2. Leave **Stay signed in** on to sign in automatically next time.
+3. Tap **Sign in**.
+- This version connects to the TappedIn server only. Settings says more servers, including your own, are coming in a later version.
+
+### Chats and rooms
+- **Chats** lists your contacts. VoiceOver reads each as "name, online or offline, status, unread count". Double-tap to open the chat.
+- **Rooms** lists your rooms and public rooms, with a Search rooms field. Pull down to refresh. Opening a public room you're not in joins it. A private room needs an invitation. **Create room** (the plus button) asks for a name, a topic and whether it's private.
+- In a chat, the top bar has **Go to**, **Links**, **Members** (rooms only) and, after a jump, **Back to where I was**.
+- The bottom of the chat has the message box, **Record voice message** and **Send**. Activate Record again to stop and send. The first time, iOS asks for the microphone.
+- **Load earlier messages** is at the top of the list.
+
+### Messages with VoiceOver
+- Each message is one item that reads "sender, time, text, edited, number of links, reactions, status".
+- Swipe up or down on a message for its actions: **Copy**, **React**, **Thumbs up**, **Seen**, and when they apply, **Play voice message**, **Open link**, **Links in this message**, **Edit** and **Delete for everyone**. Double-tap to use the action you chose.
+- Without VoiceOver, double-tapping a message opens its first link, or plays it if it's a voice message.
+- Touching and holding a message shows a menu with Copy, React, Links in this message, Edit, Delete for everyone, and in a room, **Who has read this** for your own messages.
+- In a list of links, swipe up or down for **Copy link** and **Copy title**.
+- In Members, swipe up or down on a member for mute, remove, ban and role changes, when your room role allows it.
+
+### iPhone settings
+- **Send read receipts**, **Fetch link titles**, **Open links inside Thrive**, and **Room messages when the room isn't open** (only when someone mentions me, every message, or nothing).
+- **Sign out** is in the Account section.
+- If the connection drops, a "Reconnecting" banner shows at the top and VoiceOver says "Reconnecting", then "Reconnected". Thrive also checks the connection when you come back to the app.
 
 ## Notes
 - Server-side account permissions are enforced by each server.

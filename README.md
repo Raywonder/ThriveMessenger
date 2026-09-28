@@ -126,6 +126,25 @@ Alternatively, you can [download the Thrive Messenger installer](https://github.
 
 As long as you have a PC with Windows 7 or higher, an internet connection and a working sound card, this release should work just fine.
 
+### TappedIn downloads
+
+The TappedIn build (Alpha 15.17) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+
+* Windows installer or portable ZIP.
+* Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
+* iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.17
+
+* **Links in chats:** Left and Right Arrow move between a message's links, Enter opens one in a full view inside Thrive, and Escape comes back. Link lists and link removal are in the message menu.
+* **Go to** (Ctrl + G): jump to messages with links, from a person, your own, unread, by date or by search. Alt + Left goes back.
+* **Chat rooms** open from the Groups tab as chat tabs, with members, roles, topics, @mentions, "read by 2 of 5", voice messages and moderation.
+* **Reactions:** Alt + R on a message.
+* **Reconnect:** Thrive reconnects by itself after any outage, and can start when you sign in without taking focus.
+* **Chat tabs:** arrowing along a tab strip keeps focus on the tabs. Enter, Space or Tab moves into the page.
+
+The full user guide, with every keyboard shortcut for Windows and Mac and a section for iPhone and VoiceOver, is [F1_HELP.md](F1_HELP.md).
+
 ### Login
 
 Logging into your Thrive Messenger account is as simple as logging into your computer's user account.
@@ -169,7 +188,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 
 ### Sending and receiving messages
 
-You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
+You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Press Alt + S (the Send button) to send it. What Enter does is set in Settings, General tab, Chat Behavior, **Enter key action**: Do nothing (the default), Send message, or Place call. Pressing Shift + Enter types a new line, and Ctrl + Enter sends a file. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
 
 ### File transfer
 
