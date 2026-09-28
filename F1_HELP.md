@@ -53,11 +53,18 @@ Each conversation has three tabs:
 - Settings, General tab, Chat Behavior: **Send read receipts** (on by default) and **Mark a message as read after it's selected for this many seconds**. If you turn read receipts off, others don't see when you read their messages, and you don't see theirs.
 - Clawdia and the other assistant bots mark your message as read when their agent picks it up.
 
-## Chat Links
-- Links in chat messages are clickable.
-- Activate a message row (Enter or double-click) to open its link. If the message has no link, Enter opens the full message in a read-only text box you can read line by line; Escape closes it.
-- The context menu (Applications key or Shift+F10) on a message row also has "View Full Message".
-- If multiple links are present, the first one opens.
+## Links in Chats
+- A message with links says how many at the end, for example "3 links".
+- On a message, **Right Arrow** and **Left Arrow** move between its links and read "link 2 of 3" and the page title. Up and Down still move between messages.
+- **Enter** or **Space** opens the link you moved to. With one link, Enter opens it. With several and none picked yet, Enter shows a list of them. A message with no links opens in a read-only text box instead; Escape closes it.
+- **Full view:** links open inside Thrive by default, showing the whole page. Use Back, Forward, Reload, Open in default browser and Close. The screen reader reads the page as it would in a browser. **Escape** or **Control+W** (Command+W on a Mac) closes it and puts you back on the message the link came from. Alt+Left and Alt+Right go back and forward, and F5 reloads.
+- **Mouse:** double-click a message to open its link. View Full Message shows each link as a real clickable link.
+- **Links menu:** the message context menu (Applications key or Shift+F10) has a Links group below the usual options:
+  - Open link, Open link in full view, Open link in default browser, Copy link and Copy link title. These act on the link you moved to or the only link; with several links you pick one from a submenu.
+  - **Show list of links:** in this message, in this conversation (its whole history), in this chat window (all open tabs) or in all conversations. Each item reads "title, address, sender, time". Enter opens, Control+C copies the link, Control+Shift+C copies the title, Delete removes it, and the Applications key shows more actions. Escape closes the list.
+  - **Remove links:** this link, all links in this message, a link in this conversation (you pick from a list), all links in this conversation, or all links in all conversations. Thrive asks first. Links in your own messages are removed for everyone, following the same rule as deleting: only the sender or an admin. Links other people sent are hidden on this device only, and Thrive tells you which.
+- **Link titles:** the Thrive server looks up each page's title in the background, so links are read by name, and the site sees the server rather than you. It never visits private or local network addresses. When there's no title, the address is used.
+- Settings, General tab, Chat Behavior: **Open links in** (Full view inside Thrive, Default browser, or Ask each time), **Fetch link titles** (on by default) and **Sort link lists** (Newest first or By sender).
 
 ## Messages: Copy, Edit and Delete
 - **Copy Message** (Control+C on a message) copies it to the clipboard and says "Copied".

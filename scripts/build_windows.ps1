@@ -19,6 +19,14 @@ Copy-Item -Recurse -Force "sounds\*" (Join-Path $AppDir "sounds")
 Copy-Item -Force "client.conf" (Join-Path $AppDir "client.conf")
 # NVDA controller client so announcements reach NVDA directly.
 Copy-Item -Force "native\windows\nvdaControllerClient*.dll" $AppDir
+# WebView2 loader, so links can open in full view (the Edge engine); PyInstaller doesn't pick it up by itself.
+$WxDir = python -c "import os, wx; print(os.path.dirname(wx.__file__))"
+$Loader = Join-Path $WxDir "WebView2Loader.dll"
+if (!(Test-Path $Loader)) {
+    throw "WebView2Loader.dll not found in $WxDir"
+}
+Copy-Item -Force $Loader $AppDir
+Copy-Item -Force $Loader (Join-Path $AppDir "_internal\wx")
 
 if (Test-Path "assets") {
     Copy-Item -Recurse -Force "assets" (Join-Path $AppDir "assets")

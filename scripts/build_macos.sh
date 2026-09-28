@@ -10,7 +10,7 @@ OUT_DIR="${ROOT_DIR}/dist-macos"
 ARCH_LABEL="${1:-$(uname -m)}"
 VENV_DIR="${ROOT_DIR}/.venv-build"
 PYTHON_BIN="${THRIVE_PYTHON_BIN:-python3}"
-APP_VERSION="${THRIVE_APP_VERSION:-15.16.0}"
+APP_VERSION="${THRIVE_APP_VERSION:-15.17.0}"
 
 ${PYTHON_BIN} -m venv "${VENV_DIR}"
 source "${VENV_DIR}/bin/activate"

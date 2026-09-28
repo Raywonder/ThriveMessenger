@@ -17,7 +17,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.16"
+VERSION_TAG = "v2026-alpha15.17"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -134,11 +134,6 @@ def apply_voiceover_hint(control, hint):
         control.SetToolTip(str(hint))
     except Exception:
         pass
-
-class F3SearchTextCtrl(wx.TextCtrl):
-    """A search field reached explicitly with F3 instead of normal Tab order."""
-    def AcceptsFocusFromKeyboard(self):
-        return False
     try:
         control.SetHelpText(str(hint))
     except Exception:
@@ -151,6 +146,11 @@ class F3SearchTextCtrl(wx.TextCtrl):
             control.SetName(label)
     except Exception:
         pass
+
+class F3SearchTextCtrl(wx.TextCtrl):
+    """A search field reached explicitly with F3 instead of normal Tab order."""
+    def AcceptsFocusFromKeyboard(self):
+        return False
 
 # --- Dark Mode for MSW ---
 try:
@@ -446,6 +446,10 @@ def load_user_config():
         'start_chats_fresh': False,
         'send_read_receipts': True,
         'read_after_seconds': 2,
+        'link_open_mode': 'full',
+        'fetch_link_titles': True,
+        'link_list_sort': 'newest',
+        'hidden_links': {},
         'keep_contact_list_open': True,
         'save_chat_history_default': False,
         'message_edit_window_seconds': 300,
@@ -518,6 +522,13 @@ def load_user_config():
     except Exception:
         settings['read_after_seconds'] = 2
     settings['keep_contact_list_open'] = bool(settings.get('keep_contact_list_open', True))
+    if settings.get('link_open_mode') not in ('full', 'browser', 'ask'):
+        settings['link_open_mode'] = 'full'
+    settings['fetch_link_titles'] = bool(settings.get('fetch_link_titles', True))
+    if settings.get('link_list_sort') not in ('newest', 'sender'):
+        settings['link_list_sort'] = 'newest'
+    if not isinstance(settings.get('hidden_links'), dict):
+        settings['hidden_links'] = {}
     settings['delete_attached_files_with_message'] = bool(settings.get('delete_attached_files_with_message', False))
     settings['interrupt_speech'] = bool(settings.get('interrupt_speech', True))
     settings['prefer_contact_display_names'] = bool(settings.get('prefer_contact_display_names', False))
@@ -1924,6 +1935,16 @@ class SettingsDialog(wx.Dialog):
         self.read_after_label = wx.StaticText(accessibility_box.GetStaticBox(), label="Mark a message as &read after it's selected for this many seconds:")
         self.read_after_spin = wx.SpinCtrl(accessibility_box.GetStaticBox(), min=1, max=10, initial=int(self.config.get('read_after_seconds', 2)),
                                            name="Mark a message as read after it's selected for this many seconds")
+        self.link_open_label = wx.StaticText(accessibility_box.GetStaticBox(), label="Open &links in:")
+        self.link_open_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Full view inside Thrive", "Default browser", "Ask each time"], name="Open links in")
+        self.link_open_choice.SetSelection({'full': 0, 'browser': 1, 'ask': 2}.get(self.config.get('link_open_mode', 'full'), 0))
+        self.fetch_link_titles_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Fetch link titles")
+        self.fetch_link_titles_cb.SetValue(bool(self.config.get('fetch_link_titles', True)))
+        self.fetch_link_titles_cb.SetToolTip("The Thrive server looks up each link's page title, so links are read by name. Sites see the server, not you.")
+        self.link_sort_label = wx.StaticText(accessibility_box.GetStaticBox(), label="Sort link lists:")
+        self.link_sort_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=["Newest first", "By sender"], name="Sort link lists")
+        self.link_sort_choice.SetSelection(1 if self.config.get('link_list_sort') == 'sender' else 0)
         self.keep_contact_list_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Keep the contact list open when a chat opens")
         self.keep_contact_list_cb.SetValue(bool(self.config.get('keep_contact_list_open', True)))
         self.keep_contact_list_cb.SetToolTip("Chat windows get their own taskbar and Alt+Tab entry, so the contact list stays available. Ctrl+0 in a chat returns to it.")
@@ -2079,6 +2100,15 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(read_row, 0, wx.ALL, 5)
         accessibility_box.Add(self.delete_for_everyone_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.delete_attached_files_cb, 0, wx.ALL, 5)
+        link_row = wx.BoxSizer(wx.HORIZONTAL)
+        link_row.Add(self.link_open_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        link_row.Add(self.link_open_choice, 1, wx.EXPAND)
+        accessibility_box.Add(link_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(self.fetch_link_titles_cb, 0, wx.ALL, 5)
+        link_sort_row = wx.BoxSizer(wx.HORIZONTAL)
+        link_sort_row.Add(self.link_sort_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        link_sort_row.Add(self.link_sort_choice, 1, wx.EXPAND)
+        accessibility_box.Add(link_sort_row, 0, wx.EXPAND | wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
         audio_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 8)
         audio_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -2147,7 +2177,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -3228,6 +3258,9 @@ class ClientApp(wx.App):
                     elif act == "history": wx.CallAfter(self.frame.on_history, msg)
                     elif act == "msg_read_update": wx.CallAfter(self.frame.on_msg_read_update, msg)
                     elif act == "msg_read_sync": wx.CallAfter(self.frame.on_msg_read_sync, msg)
+                    elif act == "link_titles": wx.CallAfter(self.frame.on_link_titles, msg)
+                    elif act == "links_list": wx.CallAfter(self.frame.on_links_list, msg)
+                    elif act == "msg_remove_links_result": wx.CallAfter(self.frame.on_remove_links_result, msg)
                     elif act == "history_days": wx.CallAfter(self.frame.on_history_days, msg)
                     elif act == "voice_data": wx.CallAfter(self.frame.on_voice_data, msg)
                     elif act == "voicemail_saved": wx.CallAfter(self.frame.on_voicemail_saved, msg)
@@ -4183,7 +4216,7 @@ class SavedMessagesDialog(wx.Dialog):
 
 class MessageViewerDialog(wx.Dialog):
     """Read-only full view of one chat message, so long or multi-line messages can be read line by line."""
-    def __init__(self, parent, sender_label, text, time_label=""):
+    def __init__(self, parent, sender_label, text, time_label="", links=None, chat=None):
         title = f"Message from {sender_label}" if sender_label else "Message"
         super().__init__(parent, title=title, size=(760, 520), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.panel = wx.Panel(self)
@@ -4196,6 +4229,18 @@ class MessageViewerDialog(wx.Dialog):
         self.view.SetValue(str(text or ""))
         self.view.SetInsertionPoint(0)
         s.Add(self.view, 1, wx.EXPAND | wx.ALL, 8)
+        if links:
+            # Real links for mouse and keyboard: Tab to one and press Enter (or click it).
+            s.Add(wx.StaticText(self.panel, label=f"Links ({len(links)}):"), 0, wx.LEFT | wx.RIGHT, 8)
+            for link in links:
+                hl = wx.adv.HyperlinkCtrl(self.panel, wx.ID_ANY, label=link_label(link), url=link["url"])
+                hl.SetToolTip(link["url"])
+
+                def _go(event, link=link):
+                    self.EndModal(wx.ID_CLOSE)
+                    wx.CallAfter(chat._open_link if chat else (lambda l: open_link(l["url"])), link)
+                hl.Bind(wx.adv.EVT_HYPERLINK, _go)
+                s.Add(hl, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
         btn = wx.Button(self.panel, wx.ID_CLOSE, label="Close")
         btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CLOSE))
         self.SetEscapeId(wx.ID_CLOSE)
@@ -5489,6 +5534,9 @@ class MainFrame(wx.Frame):
         app.user_config['start_chats_fresh'] = dlg.start_fresh_cb.IsChecked()
         app.user_config['send_read_receipts'] = dlg.read_receipts_cb.IsChecked()
         app.user_config['read_after_seconds'] = int(dlg.read_after_spin.GetValue())
+        app.user_config['link_open_mode'] = ('full', 'browser', 'ask')[max(0, dlg.link_open_choice.GetSelection())]
+        app.user_config['fetch_link_titles'] = dlg.fetch_link_titles_cb.IsChecked()
+        app.user_config['link_list_sort'] = 'sender' if dlg.link_sort_choice.GetSelection() == 1 else 'newest'
         for chat in self.all_chats():
             chat.refresh_all_rows()
         app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
@@ -6561,6 +6609,27 @@ class MainFrame(wx.Frame):
         chat = self.get_chat(msg.get("by"))
         if chat:
             chat.apply_read_update(msg.get("ids"), msg.get("read_at"), by=msg.get("by"))
+    def on_link_titles(self, msg):
+        app = wx.GetApp()
+        titles = {u: t for u, t in (msg.get("titles") or {}).items() if t}
+        known = getattr(app, "link_titles", None)
+        if known is None:
+            known = app.link_titles = {}
+        known.update(titles)
+        for dlg in [d for d in getattr(app, "open_link_lists", []) if d]:
+            dlg.refresh_titles()
+    def on_links_list(self, msg):
+        callback = (getattr(wx.GetApp(), "link_list_requests", None) or {}).pop(str(msg.get("request_id") or ""), None)
+        if callback:
+            callback(msg.get("items") or [])
+    def on_remove_links_result(self, msg):
+        removed, denied = int(msg.get("removed") or 0), list(msg.get("denied") or [])
+        if removed:
+            wx.GetApp().play_sound("message_edited.wav")
+        parts = [f"Removed {removed} link{'s' if removed != 1 else ''} for everyone"] if removed else []
+        if denied:
+            parts.append(f"{len(denied)} message{'s' if len(denied) != 1 else ''} couldn't be changed")
+        speak_text(". ".join(parts) or "No links were removed", interrupt=True)
     def on_msg_read_sync(self, msg):
         for chat in self.all_chats():
             chat.apply_read_sync(msg.get("ids"))
@@ -6573,7 +6642,7 @@ class MainFrame(wx.Frame):
         label = self.format_user_label(actor) if actor else "Someone"
         if msg.get("action") == "msg_edited":
             if chat.apply_remote_edit(str(msg.get("id") or ""), str(msg.get("msg", "") or "")) and not by_me:
-                speak_text(f"{label} edited a message", interrupt=False)
+                speak_text(f"{label} removed a link" if msg.get("links_removed") else f"{label} edited a message", interrupt=False)
         else:
             if chat.apply_remote_delete(str(msg.get("id") or "")) and not by_me:
                 speak_text(f"{label} deleted a message", interrupt=False)
@@ -8399,6 +8468,344 @@ class ContactTransfersPanel(wx.Panel):
         self.refresh()
         self.lv.SetFocus()
 
+# --- links in messages ---------------------------------------------------------------------------------------
+# Same rules as the server's _find_links, so link counts, lists and removal always agree.
+LINK_SCHEME_RE = re.compile(r'(?:https?|ipfs|ipns|web3)://[^\s<>()"\']+', re.IGNORECASE)
+LINK_BARE_RE = re.compile(r'(?<![\w@./:-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63})(?::\d{1,5})?(?:/[^\s<>()"\']*)?)',
+                          re.IGNORECASE)
+# Bare names only count as links with www. or a familiar web ending, so "server.py" or "notes.txt" aren't links.
+LINK_BARE_TLDS = {"com", "org", "net", "io", "fm", "cc", "app", "dev", "co", "uk", "us", "ca", "edu", "gov", "info", "me", "tv",
+                  "ai", "software", "blog", "xyz", "de", "au", "nz", "ie", "eu", "biz", "site", "online", "store", "tech", "news",
+                  "link", "live", "page", "social", "eth", "gg", "ly", "to", "be", "nl", "fr", "es", "it", "in", "jp"}
+LINK_TRAIL = ".,;:!?'\""
+
+def find_links(text):
+    """Links in message text, in order, without duplicates: [{"raw": text as written, "url": openable URL}]."""
+    text = str(text or "")
+    found, taken = [], []
+    for m in LINK_SCHEME_RE.finditer(text):
+        raw = m.group(0).rstrip(LINK_TRAIL)
+        if "://" in raw and raw.split("://", 1)[1]:
+            found.append((m.start(), raw, raw)); taken.append((m.start(), m.start() + len(raw)))
+    for m in LINK_BARE_RE.finditer(text):
+        start, raw = m.start(1), m.group(1).rstrip(LINK_TRAIL)
+        if any(a <= start < b for a, b in taken):
+            continue
+        if raw.lower().startswith("www.") or m.group(2).lower() in LINK_BARE_TLDS:
+            found.append((start, raw, "https://" + raw))
+    out, seen = [], set()
+    for _, raw, url in sorted(found):
+        if url.lower() not in seen:
+            seen.add(url.lower()); out.append({"raw": raw, "url": url})
+    return out
+
+def link_title_for(url):
+    return (getattr(wx.GetApp(), "link_titles", None) or {}).get(url) or ""
+
+def link_label(link):
+    """What a link is called when spoken: its page title, or the address when there's no title."""
+    return link.get("title") or link_title_for(link.get("url")) or link.get("url", "")
+
+def copy_text_to_clipboard(text):
+    copied = False
+    if wx.TheClipboard.Open():
+        try:
+            copied = bool(wx.TheClipboard.SetData(wx.TextDataObject(str(text or ""))))
+            wx.TheClipboard.Flush()
+        finally:
+            wx.TheClipboard.Close()
+    if copied:
+        wx.GetApp().play_sound("copied.wav")
+    return copied
+
+def open_link(url, parent=None, title="", return_to=None, mode=None):
+    """Open a chat link the way the user chose in Settings: full view inside Thrive, the default browser, or ask."""
+    mode = mode or str(wx.GetApp().user_config.get('link_open_mode', 'full') or 'full')
+    if mode == 'ask':
+        dlg = wx.MessageDialog(parent, f"How do you want to open {title or url}?", "Open Link",
+                               wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
+        dlg.SetYesNoCancelLabels("&Full view in Thrive", "&Default browser", "Cancel")
+        res = dlg.ShowModal()
+        dlg.Destroy()
+        if res not in (wx.ID_YES, wx.ID_NO):
+            return False
+        mode = 'full' if res == wx.ID_YES else 'browser'
+    if mode == 'full':
+        if LinkViewerFrame.available():
+            try:
+                LinkViewerFrame(parent, url, title=title, return_to=return_to)
+                return True
+            except Exception as e:
+                print(f"Full view failed: {e}")
+        speak_text("Full view isn't available on this computer, so the link opens in your browser.", interrupt=True)
+    return open_path_or_url(url)
+
+# Escape or Ctrl/Cmd+W inside the page closes full view (keys inside a web view never reach wx on Windows).
+_LINK_VIEW_KEYS_JS = """
+document.addEventListener('keydown', function (e) {
+  var closeKey = (e.key === 'Escape' && !e.defaultPrevented) || ((e.ctrlKey || e.metaKey) && (e.key === 'w' || e.key === 'W'));
+  if (!closeKey) return;
+  var h = window.thrive || (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.thrive);
+  if (h) { e.preventDefault(); h.postMessage('close'); }
+}, false);
+"""
+
+class LinkViewerFrame(wx.Frame):
+    """A link shown in full inside Thrive (WebView2 on Windows, WKWebView on the Mac) with Back, Forward, Reload,
+    Open in browser and Close. Escape or Ctrl+W (Command+W) closes it and puts focus back on the message it came from."""
+    @staticmethod
+    def _backend():
+        if wxhtml2 is None:
+            return None
+        if sys.platform == 'win32':
+            edge = getattr(wxhtml2, "WebViewBackendEdge", None)
+            try:
+                if edge and wxhtml2.WebView.IsBackendAvailable(edge):
+                    return edge
+            except Exception:
+                pass
+            return None  # the old IE engine can't show modern pages fully; use the browser instead
+        return getattr(wxhtml2, "WebViewBackendDefault", "")
+    @classmethod
+    def available(cls):
+        return cls._backend() is not None
+    def __init__(self, parent, url, title="", return_to=None):
+        top = parent.GetTopLevelParent() if parent else None
+        super().__init__(top, title=f"{title or url} - Thrive full view", size=(1100, 800))
+        self._return_to = return_to
+        self._focused_page = False
+        self.SetName("Thrive full view")
+        panel = wx.Panel(self)
+        bar = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_back = wx.Button(panel, label="&Back")
+        self.btn_forward = wx.Button(panel, label="&Forward")
+        self.btn_reload = wx.Button(panel, label="&Reload")
+        self.btn_browser = wx.Button(panel, label="Open in default &browser")
+        self.btn_close = wx.Button(panel, label="&Close")
+        apply_voiceover_hint(self.btn_close, "Close full view and go back to the chat. Escape does the same.")
+        for b in (self.btn_back, self.btn_forward, self.btn_reload, self.btn_browser, self.btn_close):
+            bar.Add(b, 0, wx.ALL, 4)
+        self.address = wx.TextCtrl(panel, value=url, style=wx.TE_READONLY, name="Page address")
+        self.address.SetToolTip("Escape or Control W goes back to the chat.")
+        bar.Add(self.address, 1, wx.EXPAND | wx.ALL, 4)
+        self.web = wxhtml2.WebView.New(panel, backend=self._backend())
+        self.web.SetName(title or "Web page")
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(bar, 0, wx.EXPAND)
+        s.Add(self.web, 1, wx.EXPAND)
+        panel.SetSizer(s)
+        self.btn_back.Bind(wx.EVT_BUTTON, lambda e: self.web.CanGoBack() and self.web.GoBack())
+        self.btn_forward.Bind(wx.EVT_BUTTON, lambda e: self.web.CanGoForward() and self.web.GoForward())
+        self.btn_reload.Bind(wx.EVT_BUTTON, lambda e: self.web.Reload())
+        self.btn_browser.Bind(wx.EVT_BUTTON, self.on_open_in_browser)
+        self.btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.web.Bind(wxhtml2.EVT_WEBVIEW_TITLE_CHANGED, self.on_title)
+        self.web.Bind(wxhtml2.EVT_WEBVIEW_NAVIGATED, self.on_navigated)
+        self.web.Bind(wxhtml2.EVT_WEBVIEW_LOADED, self.on_loaded)
+        self.web.Bind(wxhtml2.EVT_WEBVIEW_NEWWINDOW, lambda e: self.web.LoadURL(e.GetURL()))
+        self.web.Bind(wxhtml2.EVT_WEBVIEW_ERROR, self.on_error)
+        try:
+            self.web.AddScriptMessageHandler("thrive")
+            self.web.Bind(wxhtml2.EVT_WEBVIEW_SCRIPT_MESSAGE_RECEIVED, self.on_script_message)
+            self.web.AddUserScript(_LINK_VIEW_KEYS_JS)
+        except Exception as e:
+            print(f"Full view key script unavailable: {e}")
+        self._update_buttons()
+        self.web.LoadURL(url)
+        self.Show()
+        self.Raise()
+        speak_text(f"Opening {title or url} in full view", interrupt=True)
+    def _update_buttons(self):
+        self.btn_back.Enable(bool(self.web.CanGoBack()))
+        self.btn_forward.Enable(bool(self.web.CanGoForward()))
+    def on_title(self, event):
+        title = event.GetString() or self.web.GetCurrentTitle()
+        if title:
+            self.SetTitle(f"{title} - Thrive full view")
+            self.web.SetName(title)
+    def on_navigated(self, event):
+        self.address.SetValue(event.GetURL() or self.web.GetCurrentURL())
+        self._update_buttons()
+        event.Skip()
+    def on_loaded(self, event):
+        self._update_buttons()
+        if not self._focused_page:
+            # Put focus in the page once, so the screen reader enters browse mode and starts reading.
+            self._focused_page = True
+            wx.CallAfter(self.web.SetFocus)
+        event.Skip()
+    def on_error(self, event):
+        speak_text(f"The page couldn't be loaded: {event.GetString() or 'error'}", interrupt=True)
+        event.Skip()
+    def on_script_message(self, event):
+        if str(event.GetString() or "") == "close":
+            wx.CallAfter(self.Close)
+    def on_open_in_browser(self, _=None):
+        open_path_or_url(self.web.GetCurrentURL() or self.address.GetValue())
+    def on_key(self, event):
+        key = event.GetKeyCode()
+        if key == wx.WXK_ESCAPE or ((event.ControlDown() or event.CmdDown()) and key in (ord('W'), ord('w'))):
+            self.Close()
+            return
+        if key == wx.WXK_F5:
+            self.web.Reload()
+            return
+        if event.AltDown() and key == wx.WXK_LEFT:
+            self.web.CanGoBack() and self.web.GoBack()
+            return
+        if event.AltDown() and key == wx.WXK_RIGHT:
+            self.web.CanGoForward() and self.web.GoForward()
+            return
+        event.Skip()
+    def on_close(self, event):
+        back = self._return_to
+        self.Destroy()
+        if back:
+            wx.CallAfter(back)
+
+class LinksListDialog(wx.Dialog):
+    """Links as an accessible list; each item reads "title, URL, sender, time".
+    Enter opens, Ctrl+C copies the link, Ctrl+Shift+C copies the title, the Applications key shows more actions.
+    pick_to_remove=True makes Enter remove the chosen link instead (Remove links > A link in this conversation)."""
+    def __init__(self, chat, heading, items, pick_to_remove=False):
+        super().__init__(chat.GetTopLevelParent(), title=heading, size=(820, 520), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.chat = chat
+        self.pick_to_remove = bool(pick_to_remove)
+        order = str(wx.GetApp().user_config.get('link_list_sort', 'newest') or 'newest')
+        items = sorted(items, key=lambda i: timestamp_epoch(i.get("time")) or 0, reverse=True)
+        if order == 'sender':
+            items = sorted(items, key=lambda i: str(self._sender_label(i)).lower())
+        self.items = items
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        hint = "Enter removes the chosen link." if self.pick_to_remove else \
+            "Enter opens. Control C copies the link, Control Shift C copies the title. Applications key for more."
+        self.lbl = wx.StaticText(panel, label=f"&Links, {len(items)} ({hint})")
+        self.list = wx.ListBox(panel, choices=[self._label(i) for i in items] or ["No links found"], style=wx.LB_SINGLE, name=heading)
+        if items:
+            self.list.SetSelection(0)
+        s.Add(self.lbl, 0, wx.ALL, 6)
+        s.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_open = wx.Button(panel, label="&Open")
+        self.btn_browser = wx.Button(panel, label="Open in &browser")
+        self.btn_copy = wx.Button(panel, label="Copy lin&k")
+        self.btn_copy_title = wx.Button(panel, label="Copy &title")
+        self.btn_remove = wx.Button(panel, label="&Remove link")
+        btn_close = wx.Button(panel, wx.ID_CLOSE, label="Close")
+        for b in (self.btn_open, self.btn_browser, self.btn_copy, self.btn_copy_title, self.btn_remove, btn_close):
+            row.Add(b, 0, wx.ALL, 4)
+            b.Enable(bool(items) or b is btn_close)
+        s.Add(row, 0, wx.ALIGN_CENTER)
+        panel.SetSizer(s)
+        self.btn_open.Bind(wx.EVT_BUTTON, lambda e: self._open())
+        self.btn_browser.Bind(wx.EVT_BUTTON, lambda e: self._open(mode='browser'))
+        self.btn_copy.Bind(wx.EVT_BUTTON, lambda e: self._copy(title=False))
+        self.btn_copy_title.Bind(wx.EVT_BUTTON, lambda e: self._copy(title=True))
+        self.btn_remove.Bind(wx.EVT_BUTTON, lambda e: self._remove())
+        btn_close.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        self.SetEscapeId(wx.ID_CLOSE)
+        self.list.Bind(wx.EVT_KEY_DOWN, self.on_list_key)
+        self.list.Bind(wx.EVT_LISTBOX_DCLICK, lambda e: self._remove() if self.pick_to_remove else self._open())
+        self.list.Bind(wx.EVT_CONTEXT_MENU, self.on_context_menu)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        app = wx.GetApp()
+        app.open_link_lists = [d for d in getattr(app, "open_link_lists", []) if d] + [self]
+        chat.request_link_titles([i["url"] for i in items if not i.get("title")])
+        self.Show()
+        self.list.SetFocus()
+    def _sender_label(self, item):
+        sender = item.get("sender", "")
+        if str(sender).lower() == str(self.chat.user).lower():
+            return "you"
+        try:
+            return self.chat.frame.format_user_label(sender)
+        except Exception:
+            return str(sender)
+    def _label(self, item):
+        title = item.get("title") or link_title_for(item["url"])
+        parts = ([title] if title and title != item["url"] else []) + [item["url"], self._sender_label(item), format_timestamp(item.get("time"))]
+        if item.get("contact") and item.get("show_contact"):
+            parts.append(f"with {item['contact']}")
+        return ", ".join(p for p in parts if p)
+    def refresh_titles(self):
+        for n, item in enumerate(self.items):
+            if not item.get("title") and link_title_for(item["url"]):
+                item["title"] = link_title_for(item["url"])
+                self.list.SetString(n, self._label(item))
+    def _selected(self):
+        n = self.list.GetSelection()
+        return self.items[n] if self.items and 0 <= n < len(self.items) else None
+    def _refocus(self):
+        if self:
+            self.Raise()
+            self.list.SetFocus()
+    def _open(self, mode=None):
+        item = self._selected()
+        if item:
+            open_link(item["url"], parent=self, title=item.get("title") or link_title_for(item["url"]), return_to=self._refocus, mode=mode)
+    def _copy(self, title=False):
+        item = self._selected()
+        if not item:
+            return
+        if title:
+            t = item.get("title") or link_title_for(item["url"])
+            ok = copy_text_to_clipboard(t or item["url"])
+            speak_text(("Title copied" if t else "No title found, copied the link instead") if ok else "Could not copy", interrupt=True)
+        else:
+            speak_text("Link copied" if copy_text_to_clipboard(item["url"]) else "Could not copy", interrupt=True)
+    def _remove(self):
+        item = self._selected()
+        if not item:
+            return
+        n = self.list.GetSelection()
+        if self.chat.remove_link_items([item], "Remove this link", parent=self):
+            self.items.pop(n)
+            self.list.Delete(n)
+            if self.items:
+                self.list.SetSelection(min(n, len(self.items) - 1))
+            else:
+                self.list.Append("No links found")
+            self.lbl.SetLabel(f"&Links, {len(self.items)}")
+        self.list.SetFocus()
+    def on_list_key(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and not event.HasAnyModifiers():
+            self._remove() if self.pick_to_remove else self._open()
+            return
+        if key in (ord('C'), ord('c')) and event.ControlDown() and not event.AltDown():
+            self._copy(title=event.ShiftDown())
+            return
+        if key in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE) and not event.HasAnyModifiers():
+            self._remove()
+            return
+        event.Skip()
+    def on_char_hook(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE or ((event.ControlDown() or event.CmdDown()) and event.GetKeyCode() in (ord('W'), ord('w'))):
+            self.Close()
+            return
+        event.Skip()
+    def on_context_menu(self, event):
+        if not self._selected():
+            return
+        menu = wx.Menu()
+        for label, fn in (("&Open", lambda: self._open()), ("Open in &full view", lambda: self._open(mode='full')),
+                          ("Open in default &browser", lambda: self._open(mode='browser')),
+                          ("Copy lin&k\tCtrl+C", lambda: self._copy(title=False)), ("Copy &title\tCtrl+Shift+C", lambda: self._copy(title=True)),
+                          ("&Remove link\tDelete", lambda: self._remove())):
+            item = menu.Append(wx.ID_ANY, label)
+            self.Bind(wx.EVT_MENU, lambda e, f=fn: f(), item)
+        self.PopupMenu(menu)
+        menu.Destroy()
+    def on_close(self, event):
+        chat = self.chat
+        self.Destroy()
+        if chat:
+            wx.CallAfter(chat.focus_messages)
+
 class ChatPanel(wx.Panel):
     """One conversation. Lives in a ChatWindow: as a tab (tabbed mode) or as the only content (classic mode)."""
     def __init__(self, frame, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None, can_call=False, show_call=False, wx_parent=None):
@@ -8451,7 +8858,7 @@ class ChatPanel(wx.Panel):
         self.hist = wx.ListBox(mp, style=wx.LB_SINGLE, name="Messages")
         self._history_rows = []
         self.hist.Bind(wx.EVT_LISTBOX_DCLICK, self.on_history_item_activated)
-        self.hist.Bind(wx.EVT_LISTBOX, lambda e: (self._schedule_read_mark(), e.Skip()))
+        self.hist.Bind(wx.EVT_LISTBOX, lambda e: (setattr(self, "_link_cursor", None), self._schedule_read_mark(), e.Skip()))
         self.hist.Bind(wx.EVT_KEY_DOWN, self.on_history_key)
         self.hist.Bind(wx.EVT_CONTEXT_MENU, self.on_history_context_menu)
         self.typing_lbl = wx.StaticText(mp, label="")
@@ -8867,7 +9274,6 @@ class ChatPanel(wx.Panel):
         self.on_send(None)
     def append(self, text, sender, ts, is_error=False, announce=True, msg_id=None, client_id=None, files=None, voice=None):
         display, formatted_time = self._build_message_display(text, sender, ts, is_error=is_error)
-        self.hist.Append(display)
         row = {"sender": sender, "text": text, "time": ts, "error": is_error, "epoch": timestamp_epoch(ts)}
         if msg_id:
             row["id"] = msg_id
@@ -8881,7 +9287,10 @@ class ChatPanel(wx.Panel):
             if voice.get("path"):
                 row["files"] = list(row.get("files", [])) + [voice["path"]]
         self._history_rows.append(row)
+        self.hist.Append(self._row_display(row))
         self.hist.SetSelection(self.hist.GetCount() - 1)
+        if find_links(text):
+            self._prefetch_link_titles()
         app = wx.GetApp()
         if announce and sender not in (self.user, "System") and app.user_config.get('read_messages_aloud', False):
             parent = self.frame
@@ -8950,6 +9359,7 @@ class ChatPanel(wx.Panel):
             self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
         self.Bind(wx.EVT_MENU, self.on_remove_selected_message, mi_remove)
         self.Bind(wx.EVT_MENU, self.on_undo_last_deleted_message, mi_undo)
+        self._add_links_menu(menu, idx)
         self.PopupMenu(menu)
         menu.Destroy()
     def on_view_selected_message(self, _=None):
@@ -8965,7 +9375,8 @@ class ChatPanel(wx.Panel):
                 label = parent.format_user_label(sender)
             except Exception:
                 pass
-        dlg = MessageViewerDialog(self, label, str(row.get("text", "")), format_timestamp(row.get("time", time.time())))
+        dlg = MessageViewerDialog(self, label, self._visible_text(row), format_timestamp(row.get("time", time.time())),
+                                  links=self._row_links(row), chat=self)
         dlg.ShowModal()
         dlg.Destroy()
         self.hist.SetFocus()
@@ -9261,13 +9672,13 @@ class ChatPanel(wx.Panel):
             if row.get("id") in ids:
                 row["read_sent"] = True
     def _row_display(self, row):
-        text = row.get("text", "")
+        text = self._visible_text(row)
         if row.get("edited"):
             text = f"{text} (edited)"
         if row.get("queued"):
             text = f"{text} (not sent yet, will send when reconnected)"
         display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
-        return display + self._status_suffix(row)
+        return display + self._links_suffix(row) + self._status_suffix(row)
     def apply_history(self, msg):
         """Merge server history in time order, skipping anything already shown (no duplicates)."""
         self._hist_state["pending"] = False
@@ -9296,6 +9707,7 @@ class ChatPanel(wx.Panel):
             self.hist.Insert(self._row_display(row), pos)
             self._known_ids.add(row["id"])
             inserted += 1
+        self._prefetch_link_titles()
         if earlier:
             # Land on the newest of the older messages, so Up keeps going back in time.
             self.hist.SetSelection(max(0, inserted - 1))
@@ -9431,8 +9843,7 @@ class ChatPanel(wx.Panel):
             return
         idx = max(0, min(idx, self.hist.GetCount()))
         self._history_rows.insert(idx, row)
-        display, _ = self._build_message_display(row.get("text", ""), row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
-        self.hist.Insert(display, idx)
+        self.hist.Insert(self._row_display(row), idx)
         self.hist.SetSelection(idx)
         self._last_deleted_message = None
 
@@ -9445,18 +9856,9 @@ class ChatPanel(wx.Panel):
         if self._history_rows[idx].get("voice"):
             self._play_voice_row(self._history_rows[idx], toggle=True)
             return
-        message_text = self._history_rows[idx].get("text", "")
-        urls = extract_urls(message_text)
-        if not urls:
+        # A link picked with Left/Right, the only link, or a list of this message's links; otherwise the full message.
+        if not self.activate_selected_link():
             self.on_view_selected_message()
-            return
-        if len(urls) == 1:
-            open_path_or_url(urls[0])
-            return
-        chosen = urls[0]
-        # Keep interaction simple for screen-reader flow: open first URL and notify user.
-        wx.MessageBox(f"Multiple links found. Opening first link:\n{chosen}", "Open Link", wx.OK | wx.ICON_INFORMATION)
-        open_path_or_url(chosen)
     def on_history_key(self, event):
         if event.GetKeyCode() in (ord('C'), ord('c')) and event.ControlDown() and not event.AltDown() and not event.ShiftDown():
             self.on_copy_selected_message()
@@ -9475,6 +9877,12 @@ class ChatPanel(wx.Panel):
             if code in (wx.WXK_LEFT, wx.WXK_RIGHT) and self.voice_player.path == voice_row["voice"].get("path"):
                 if self.voice_player.seek(-VoicePlayer.SKIP_MS if code == wx.WXK_LEFT else VoicePlayer.SKIP_MS):
                     return
+        if event.GetKeyCode() in (wx.WXK_LEFT, wx.WXK_RIGHT) and not event.HasAnyModifiers():
+            self._move_link(1 if event.GetKeyCode() == wx.WXK_RIGHT else -1)
+            return
+        if event.GetKeyCode() == wx.WXK_SPACE and not event.HasAnyModifiers() and not voice_row:
+            if self.activate_selected_link():
+                return
         if event.GetKeyCode() in (ord('S'), ord('s')) and event.ControlDown() and not event.AltDown() and not event.ShiftDown():
             self.on_save_selected_to_archive()
             return
@@ -9490,6 +9898,277 @@ class ChatPanel(wx.Panel):
                 self.on_history_item_activated(event)
             return
         event.Skip()
+    # --- links ------------------------------------------------------------------------------------------------
+    def _hidden_links(self, row):
+        return (wx.GetApp().user_config.get('hidden_links') or {}).get(str(row.get("id") or "")) or []
+    def _visible_text(self, row):
+        """Message text as shown here: links hidden on this device read "[link hidden]"."""
+        text = str(row.get("text", "") or "")
+        for raw in sorted(self._hidden_links(row), key=len, reverse=True):
+            text = text.replace(raw, "[link hidden]")
+        return text
+    def _row_links(self, row):
+        if row.get("voice") or row.get("error"):
+            return []
+        return find_links(self._visible_text(row))
+    def _links_suffix(self, row):
+        n = len(self._row_links(row))
+        return f", {n} link{'s' if n != 1 else ''}" if n else ""
+    def _current_link(self, idx=None):
+        """(position of the link picked with Left/Right in this message or None, the message's links)."""
+        idx = self._selected_history_index() if idx is None else idx
+        if idx is None:
+            return None, []
+        row = self._history_rows[idx]
+        links = self._row_links(row)
+        cur = getattr(self, "_link_cursor", None)
+        pos = cur[1] if cur and cur[0] is row and cur[1] < len(links) else None
+        return pos, links
+    def _move_link(self, step):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        pos, links = self._current_link(idx)
+        if not links:
+            speak_text("No links in this message", interrupt=True)
+            return
+        pos = (0 if step > 0 else len(links) - 1) if pos is None else max(0, min(len(links) - 1, pos + step))
+        self._link_cursor = (self._history_rows[idx], pos)
+        self.request_link_titles([l["url"] for l in links])
+        speak_text(f"link {pos + 1} of {len(links)}, {link_label(links[pos])}", interrupt=True)
+    def focus_messages(self, row=None):
+        """Bring this chat forward with focus on a message (the one a link came from, when given)."""
+        if not self:
+            return
+        if self.window:
+            self.window.present(self, activate=True)
+        if self.inner.GetSelection() != 0:
+            self.inner.SetSelection(0)
+        if row is not None and row in self._history_rows:
+            self.hist.SetSelection(self._history_rows.index(row))
+        # present() puts focus in the message box shortly after; land on the message list after that.
+        wx.CallLater(300, lambda: self and self.hist.SetFocus())
+    def _open_link(self, link, mode=None):
+        idx = self._selected_history_index()
+        row = self._history_rows[idx] if idx is not None else None
+        open_link(link["url"], parent=self, title=link_title_for(link["url"]),
+                  return_to=lambda: self.focus_messages(row), mode=mode)
+    def activate_selected_link(self, mode=None):
+        """Enter/Space on a message: open the link picked with Left/Right, the only link, or list them."""
+        pos, links = self._current_link()
+        if not links:
+            return False
+        if pos is None and len(links) > 1:
+            self.show_links_list("message")
+            return True
+        self._open_link(links[pos or 0], mode=mode)
+        return True
+    def _copy_link(self, link):
+        speak_text("Link copied" if copy_text_to_clipboard(link["url"]) else "Could not copy", interrupt=True)
+    def _copy_link_title(self, link):
+        title = link_title_for(link["url"])
+        ok = copy_text_to_clipboard(title or link["url"])
+        speak_text(("Title copied" if title else "No title found, copied the link instead") if ok else "Could not copy", interrupt=True)
+    def request_link_titles(self, urls):
+        """Ask the server for page titles (it fetches them safely); results fill app.link_titles."""
+        app = wx.GetApp()
+        if self.is_remote_directory_chat or not app.user_config.get('fetch_link_titles', True):
+            return
+        known = getattr(app, "link_titles", None)
+        if known is None:
+            known = app.link_titles = {}
+        asked = getattr(app, "_link_titles_asked", None)
+        if asked is None:
+            asked = app._link_titles_asked = set()
+        todo = []
+        for u in urls or []:
+            if u and u.lower().startswith(("http://", "https://")) and u not in known and u not in asked and u not in todo:
+                todo.append(u)
+        for start in range(0, len(todo), 25):
+            chunk = todo[start:start + 25]
+            try:
+                self.sock.sendall((json.dumps({"action": "link_titles", "urls": chunk}) + "\n").encode())
+                asked.update(chunk)
+            except Exception:
+                return
+    def _prefetch_link_titles(self):
+        if getattr(self, "_title_prefetch", None):
+            return
+        def run():
+            self._title_prefetch = None
+            if self:
+                self.request_link_titles([l["url"] for r in self._history_rows[-200:] for l in self._row_links(r)])
+        self._title_prefetch = wx.CallLater(800, run)
+    def _link_items_from_rows(self, rows, contact=None, show_contact=False):
+        items = []
+        for row in rows:
+            for link in self._row_links(row):
+                items.append({"id": row.get("id"), "url": link["url"], "raw": link["raw"], "sender": row.get("sender", ""),
+                              "time": row.get("time"), "contact": contact or self.contact, "show_contact": show_contact})
+        return items
+    def _server_links(self, scope, callback):
+        """Ask the server for every link in this conversation (scope "conversation") or all of them ("all")."""
+        app = wx.GetApp()
+        request_id = uuid.uuid4().hex
+        payload = {"action": "links_list", "scope": scope, "request_id": request_id}
+        if scope == "conversation":
+            payload["with"] = self.contact
+        pending = getattr(app, "link_list_requests", None)
+        if pending is None:
+            pending = app.link_list_requests = {}
+        pending[request_id] = callback
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            speak_text("Getting links", interrupt=True)
+        except Exception:
+            pending.pop(request_id, None)
+            speak_text("Offline. Showing links from the messages loaded here.", interrupt=True)
+            callback(None)
+    def _server_items(self, items, show_contact=False):
+        """Server links_list items in the dialog's shape, minus links hidden on this device."""
+        me = str(self.user or "").lower()
+        hidden = wx.GetApp().user_config.get('hidden_links') or {}
+        out = []
+        for i in items or []:
+            if i.get("raw") in (hidden.get(str(i.get("id"))) or []):
+                continue
+            sender = self.user if str(i.get("from", "")).lower() == me else i.get("from", "")
+            contact = i.get("to") if sender == self.user else i.get("from")
+            out.append({"id": i.get("id"), "url": i.get("url"), "raw": i.get("raw"), "title": i.get("title") or "",
+                        "sender": sender, "time": i.get("time"), "contact": contact, "show_contact": show_contact})
+        return out
+    LINK_SCOPES = {"message": "in this message", "conversation": "in this conversation",
+                   "window": "in this chat window", "all": "in all conversations"}
+    def show_links_list(self, scope, pick_to_remove=False):
+        where = self.LINK_SCOPES[scope]
+        heading = f"Choose a link to remove {where}" if pick_to_remove else f"Links {where}"
+        if scope == "message":
+            idx = self._selected_history_index()
+            rows = [self._history_rows[idx]] if idx is not None else []
+            LinksListDialog(self, heading, self._link_items_from_rows(rows), pick_to_remove)
+        elif scope == "window":
+            items = []
+            for chat in (self.window.chats() if self.window else [self]):
+                items += chat._link_items_from_rows(chat._history_rows, show_contact=True)
+            LinksListDialog(self, heading, items, pick_to_remove)
+        elif self.is_remote_directory_chat:
+            LinksListDialog(self, heading, self._link_items_from_rows(self._history_rows), pick_to_remove)
+        else:
+            def got(items):
+                if not self:
+                    return
+                if items is None:
+                    items = self._link_items_from_rows(self._history_rows)
+                else:
+                    items = self._server_items(items, show_contact=(scope == "all"))
+                LinksListDialog(self, heading, items, pick_to_remove)
+            self._server_links(scope, got)
+    def remove_links(self, scope, link=None):
+        """Remove links menu: "link" (one), "message", "conversation" or "all"."""
+        if scope == "link" and link:
+            idx = self._selected_history_index()
+            row = self._history_rows[idx] if idx is not None else {}
+            self.remove_link_items([{"id": row.get("id"), "raw": link["raw"], "url": link["url"], "sender": row.get("sender")}], "Remove this link")
+        elif scope == "message":
+            idx = self._selected_history_index()
+            if idx is not None:
+                self.remove_link_items(self._link_items_from_rows([self._history_rows[idx]]), "Remove all links in this message")
+        elif scope in ("conversation", "all") and not self.is_remote_directory_chat:
+            what = f"Remove all links {self.LINK_SCOPES[scope]}"
+            self._server_links(scope, lambda items: self and self.remove_link_items(
+                self._server_items(items) if items is not None else self._link_items_from_rows(self._history_rows), what))
+        else:
+            self.remove_link_items(self._link_items_from_rows(self._history_rows), "Remove all links in this conversation")
+    def remove_link_items(self, items, what, parent=None):
+        """Links in your own messages (any message, for admins) are removed for everyone, like deleting;
+        links other people sent are hidden on this device only. Asks first. True if something was done."""
+        items = [i for i in items if i.get("raw")]
+        if not items:
+            speak_text("No links to remove", interrupt=True)
+            return False
+        me = str(self.user or "").lower()
+        everyone = [i for i in items if i.get("id") and not str(i.get("id")).startswith("h") and not self.is_remote_directory_chat
+                    and (str(i.get("sender") or "").lower() == me or self._am_admin())]
+        local = [i for i in items if i not in everyone]
+        def count(n):
+            return f"{n} link{'s' if n != 1 else ''}"
+        parts = []
+        if everyone:
+            parts.append(f"remove {count(len(everyone))} for everyone in the conversation")
+        if local:
+            parts.append(f"hide {count(len(local))} sent by other people on this device only (only the sender or an admin can remove those for everyone)")
+        text = f"{what}: {' and '.join(parts)}? This can't be undone." if everyone else f"{what}: {' and '.join(parts)}?"
+        if wx.MessageBox(text[0].upper() + text[1:], "Remove Links", wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, parent or self) != wx.YES:
+            return False
+        if everyone:
+            by_id = {}
+            for i in everyone:
+                by_id.setdefault(i["id"], []).append(i["raw"])
+            try:
+                self.sock.sendall((json.dumps({"action": "msg_remove_links", "request_id": uuid.uuid4().hex,
+                                               "items": [{"id": k, "raw": v} for k, v in by_id.items()]}) + "\n").encode())
+            except Exception as e:
+                self.append_error(f"Could not remove the links: {e}")
+                return False
+        if local:
+            app = wx.GetApp()
+            hidden = dict(app.user_config.get('hidden_links') or {})
+            for i in local:
+                key = str(i.get("id") or "")
+                if key:
+                    hidden[key] = sorted(set(hidden.get(key, [])) | {i["raw"]})
+            app.user_config['hidden_links'] = hidden
+            save_user_config(app.user_config)
+            for chat in self.frame.all_chats() if hasattr(self.frame, "all_chats") else [self]:
+                chat.refresh_all_rows()
+            if not everyone:
+                speak_text(f"Hidden for you only: {count(len(local))}. Only the sender or an admin can remove links for everyone.", interrupt=True)
+        self._link_cursor = None
+        return True
+    def _add_links_menu(self, menu, idx):
+        """The Links group, below the usual message options."""
+        pos, links = self._current_link(idx)
+        self.request_link_titles([l["url"] for l in links])
+        lm = wx.Menu()
+        def per_link(parent_menu, label, fn):
+            # The link picked with Left/Right, or the only link; with several, a submenu of this message's links.
+            if not links:
+                parent_menu.Append(wx.ID_ANY, label).Enable(False)
+            elif pos is not None or len(links) == 1:
+                link = links[pos or 0]
+                item = parent_menu.Append(wx.ID_ANY, label)
+                self.Bind(wx.EVT_MENU, lambda e, l=link: fn(l), item)
+            else:
+                sub = wx.Menu()
+                for n, l in enumerate(links, 1):
+                    item = sub.Append(wx.ID_ANY, f"&{n} {link_label(l)}")
+                    self.Bind(wx.EVT_MENU, lambda e, l=l: fn(l), item)
+                parent_menu.AppendSubMenu(sub, label)
+        def plain(parent_menu, label, fn, enabled=True):
+            item = parent_menu.Append(wx.ID_ANY, label)
+            item.Enable(enabled)
+            self.Bind(wx.EVT_MENU, lambda e: fn(), item)
+        per_link(lm, "&Open link", self._open_link)
+        per_link(lm, "Open link in &full view", lambda l: self._open_link(l, mode='full'))
+        per_link(lm, "Open link in default &browser", lambda l: self._open_link(l, mode='browser'))
+        per_link(lm, "&Copy link", self._copy_link)
+        per_link(lm, "Copy link &title", self._copy_link_title)
+        lm.AppendSeparator()
+        show = wx.Menu()
+        plain(show, "In this &message", lambda: self.show_links_list("message"), bool(links))
+        plain(show, "In this &conversation", lambda: self.show_links_list("conversation"))
+        plain(show, "In this chat &window", lambda: self.show_links_list("window"))
+        plain(show, "In &all conversations", lambda: self.show_links_list("all"), not self.is_remote_directory_chat)
+        lm.AppendSubMenu(show, "&Show list of links")
+        rm = wx.Menu()
+        per_link(rm, "&This link", lambda l: self.remove_links("link", l))
+        plain(rm, "All links in this &message", lambda: self.remove_links("message"), bool(links))
+        plain(rm, "A &link in this conversation...", lambda: self.show_links_list("conversation", pick_to_remove=True))
+        plain(rm, "All links in this &conversation", lambda: self.remove_links("conversation"))
+        plain(rm, "All links in &all conversations", lambda: self.remove_links("all"), not self.is_remote_directory_chat)
+        lm.AppendSubMenu(rm, "&Remove links")
+        menu.AppendSeparator()
+        menu.AppendSubMenu(lm, f"Lin&ks ({len(links)} in this message)" if links else "Lin&ks")
     def set_typing_label(self, username, is_typing):
         app = wx.GetApp()
         if is_typing and app.user_config.get('typing_indicators', True):
