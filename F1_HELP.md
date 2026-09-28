@@ -66,6 +66,25 @@ Each conversation has three tabs:
 - **Link titles:** the Thrive server looks up each page's title in the background, so links are read by name, and the site sees the server rather than you. It never visits private or local network addresses. When there's no title, the address is used.
 - Settings, General tab, Chat Behavior: **Open links in** (Full view inside Thrive, Default browser, or Ask each time), **Fetch link titles** (on by default) and **Sort link lists** (Newest first or By sender).
 
+## Getting Around Long Histories
+- The message context menu (Applications key or Shift+F10) has, below the usual options:
+  - **Links in this message**: one submenu per link, named by its title and address, to open it (in full view or your browser) or copy the link or title.
+  - **Link lists and removal**: lists of links in this message, conversation, chat window or all conversations, and removing links.
+  - **Go to** (also **Control+G** in a chat): Messages with links, Messages from a person, My messages, Unread messages, By date, and Search. Each opens a list where every item reads "sender, time, first words". Enter goes to that message. Thrive loads the rest of the history first when needed.
+- **Alt+Left** goes back to where you were before a jump.
+- **Alt+Down** and **Alt+Up** go to the next or previous message with a link.
+- **Control+Home** and **Control+End** go to the first and last message.
+
+## Chat Rooms
+- The **Groups** tab is the room directory: your rooms and public rooms, each read as "name, your role, members, unread, topic". Type in Search rooms and press Enter to filter. Enter on a room opens it; a public room you're not in is joined first.
+- **Create room** asks for a name, topic, description, public or private, and when it expires (never by default). Rooms and their history are kept on the server, so they survive restarts.
+- A room opens as a chat tab like a conversation, so links, Go to, voice messages (Control+R), files, edit and delete all work the same way.
+- **Mentions:** type @ and a member's name (for example @Clawdia). Mentioned people hear "X mentioned you" even when the room isn't open. Settings has **Room messages when the room isn't open** (mentions only by default, every message, or nothing).
+- **Read receipts in rooms:** your messages end with "sent", "read by 2 of 5" or "read by everyone". Thrive says "Read by everyone" once for your newest message.
+- **Members tab** (Control+Page Down in a room): the topic, then each member with their role (owner, admin, moderator, member or guest), whether they're muted, and whether they've read the newest message. The Applications key on a member offers direct message, mention, change role, mute, remove from room and ban. There are also Invite, Change topic, Room settings, Banned people and Leave room buttons.
+- **Roles:** the owner can do everything, including handing the room over. Admins manage members and roles. Moderators can mute, remove, ban, and edit or delete others' messages. Members can post, share files and voice, and invite. Guests can post text.
+- **Agents in rooms:** Clawdia, Sapphire, Sophia, Elder, Adam and System Monitor can be in rooms. An agent answers in the same room when you @mention it (or in a room with just you and that agent). Agents don't answer each other, so they can't loop.
+
 ## Messages: Copy, Edit and Delete
 - **Copy Message** (Control+C on a message) copies it to the clipboard and says "Copied".
 - **Edit Message** appears only on your own recent messages. Admins can edit any message. Enter saves the edit and Escape cancels. Both people see it marked "(edited)".

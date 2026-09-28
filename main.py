@@ -449,6 +449,7 @@ def load_user_config():
         'link_open_mode': 'full',
         'fetch_link_titles': True,
         'link_list_sort': 'newest',
+        'room_alerts': 'mentions',
         'hidden_links': {},
         'keep_contact_list_open': True,
         'save_chat_history_default': False,
@@ -527,6 +528,8 @@ def load_user_config():
     settings['fetch_link_titles'] = bool(settings.get('fetch_link_titles', True))
     if settings.get('link_list_sort') not in ('newest', 'sender'):
         settings['link_list_sort'] = 'newest'
+    if settings.get('room_alerts') not in ('mentions', 'all', 'none'):
+        settings['room_alerts'] = 'mentions'
     if not isinstance(settings.get('hidden_links'), dict):
         settings['hidden_links'] = {}
     settings['delete_attached_files_with_message'] = bool(settings.get('delete_attached_files_with_message', False))
@@ -1945,6 +1948,10 @@ class SettingsDialog(wx.Dialog):
         self.link_sort_label = wx.StaticText(accessibility_box.GetStaticBox(), label="Sort link lists:")
         self.link_sort_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=["Newest first", "By sender"], name="Sort link lists")
         self.link_sort_choice.SetSelection(1 if self.config.get('link_list_sort') == 'sender' else 0)
+        self.room_alerts_label = wx.StaticText(accessibility_box.GetStaticBox(), label="Room messages when the room isn't open:")
+        self.room_alerts_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Only when someone mentions me", "Announce every message", "Nothing"], name="Room messages when the room isn't open")
+        self.room_alerts_choice.SetSelection({'mentions': 0, 'all': 1, 'none': 2}.get(self.config.get('room_alerts', 'mentions'), 0))
         self.keep_contact_list_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Keep the contact list open when a chat opens")
         self.keep_contact_list_cb.SetValue(bool(self.config.get('keep_contact_list_open', True)))
         self.keep_contact_list_cb.SetToolTip("Chat windows get their own taskbar and Alt+Tab entry, so the contact list stays available. Ctrl+0 in a chat returns to it.")
@@ -2109,6 +2116,10 @@ class SettingsDialog(wx.Dialog):
         link_sort_row.Add(self.link_sort_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         link_sort_row.Add(self.link_sort_choice, 1, wx.EXPAND)
         accessibility_box.Add(link_sort_row, 0, wx.EXPAND | wx.ALL, 5)
+        room_row = wx.BoxSizer(wx.HORIZONTAL)
+        room_row.Add(self.room_alerts_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        room_row.Add(self.room_alerts_choice, 1, wx.EXPAND)
+        accessibility_box.Add(room_row, 0, wx.EXPAND | wx.ALL, 5)
         audio_sizer = wx.BoxSizer(wx.VERTICAL)
         audio_sizer.Add(sound_box, 0, wx.EXPAND | wx.ALL, 8)
         audio_sizer.Add(call_audio_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -3237,7 +3248,7 @@ class ClientApp(wx.App):
                     elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
                     elif act == "group_policy": wx.CallAfter(self.frame.on_group_policy, msg)
                     elif act == "group_policy_update": wx.CallAfter(self.frame.on_group_policy_update, msg)
-                    elif act in ("group_room_list_response", "group_room_open_response", "group_room_result", "group_room_event", "group_room_message", "group_room_file", "group_room_members"):
+                    elif str(act or "").startswith("group_room_"):
                         wx.CallAfter(self.frame.on_group_room_action, msg)
                     elif act in ("module_list_response", "module_result"):
                         wx.CallAfter(self.frame.on_module_action, msg)
@@ -4991,9 +5002,93 @@ class MainFrame(wx.Frame):
         self.apply_feature_visibility()
         wx.CallAfter(self.groups_panel.refresh_rooms)
 
+    def open_room_chat(self, room, activate=True):
+        panel = RoomChat(self, room)
+        panel.open_chat(activate=activate)
+        return panel
+    def _room_name(self, room_id):
+        panel = self.get_chat("room:" + str(room_id or ""))
+        if panel:
+            return panel.room.get("name", "a room")
+        for r in getattr(self.groups_panel, "rooms", []) or []:
+            if r.get("room_id") == room_id:
+                return r.get("name", "a room")
+        return "a room"
+    def _room_message_elsewhere(self, item):
+        """A room message for a room that isn't open here: mentions are always announced; the rest per Settings."""
+        if str(item.get("sender", "")).lower() == str(self.user).lower():
+            return
+        app = wx.GetApp()
+        mode = str(app.user_config.get('room_alerts', 'mentions') or 'mentions')
+        who = self.format_user_label(item.get("sender", ""))
+        where = self._room_name(item.get("room_id"))
+        body = item.get("body") or (f"a file, {item.get('filename')}" if item.get("kind") == "file" else "a voice message")
+        if str(self.user).lower() in {m.lower() for m in item.get("mentions") or []}:
+            app.play_sound("receive.wav")
+            speak_text(f"{who} mentioned you in {where}: {body}", interrupt=False)
+        elif mode == 'all':
+            app.play_sound("receive.wav")
+            speak_text(f"{who} in {where}: {body}", interrupt=False)
     def on_group_room_action(self, msg):
-        if self.groups_panel:
-            self.groups_panel.handle_server_action(msg)
+        act = msg.get("action")
+        item = msg.get("message") or {}
+        room_id = msg.get("room_id") or item.get("room_id") or (msg.get("room") or {}).get("room_id")
+        panel = self.get_chat("room:" + room_id) if room_id else None
+        try:
+            if act == "group_room_open_response":
+                if panel and msg.get("ok"):
+                    panel.apply_open(msg)
+            elif act == "group_room_history_response":
+                if panel:
+                    panel.apply_room_history(msg)
+            elif act in ("group_room_message", "group_room_file"):
+                if panel:
+                    panel.on_room_file(msg) if act == "group_room_file" else panel.on_room_message(item)
+                else:
+                    self._room_message_elsewhere(item)
+            elif act == "group_room_read":
+                if panel:
+                    panel.apply_room_read(msg.get("username"), msg.get("read_at"))
+            elif act == "group_room_typing":
+                if panel:
+                    panel.apply_room_typing(msg.get("username"), msg.get("typing"))
+            elif act == "group_room_edited":
+                if panel:
+                    panel.apply_room_edited(item, msg.get("by"))
+            elif act == "group_room_deleted":
+                if panel:
+                    panel.apply_remote_delete(msg.get("message_id"))
+            elif act == "group_room_members":
+                if panel:
+                    panel.apply_members(msg.get("members"))
+            elif act == "group_room_voice_data":
+                if panel:
+                    panel.on_room_voice_data(msg)
+            elif act == "group_room_read_status":
+                speak_text(f"Read by {len(msg.get('read_by') or [])} of {msg.get('total')}: {', '.join(msg.get('read_by') or []) or 'nobody yet'}",
+                           interrupt=True)
+            elif act == "group_room_event":
+                if panel:
+                    panel.room_event(msg)
+                room = msg.get("room") or {}
+                if msg.get("event") == "invited":
+                    wx.GetApp().play_sound("receive.wav")
+                    speak_text(f"{self.format_user_label(msg.get('by', ''))} added you to the room {room.get('name', '')}. "
+                               "It's in the Groups tab.", interrupt=False)
+                elif msg.get("event") == "deleted" and not panel:
+                    speak_text(f"The room {msg.get('name', '')} was deleted.", interrupt=False)
+            elif act == "group_room_result" and not msg.get("ok"):
+                reason = str(msg.get("reason") or "That room action didn't work.")
+                if panel:
+                    panel.append_error(reason)
+                else:
+                    wx.Bell()
+                    speak_text(reason, interrupt=True)
+            elif act == "group_room_result" and msg.get("event") == "invited":
+                speak_text(f"Invited {msg.get('username')}", interrupt=True)
+        finally:
+            if self.groups_panel:
+                self.groups_panel.handle_server_action(msg)
     def on_manage_modules(self, _):
         if self._module_dialog and self._module_dialog.IsShown():
             self._module_dialog.Raise(); return
@@ -5537,6 +5632,7 @@ class MainFrame(wx.Frame):
         app.user_config['link_open_mode'] = ('full', 'browser', 'ask')[max(0, dlg.link_open_choice.GetSelection())]
         app.user_config['fetch_link_titles'] = dlg.fetch_link_titles_cb.IsChecked()
         app.user_config['link_list_sort'] = 'sender' if dlg.link_sort_choice.GetSelection() == 1 else 'newest'
+        app.user_config['room_alerts'] = ('mentions', 'all', 'none')[max(0, dlg.room_alerts_choice.GetSelection())]
         for chat in self.all_chats():
             chat.refresh_all_rows()
         app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
@@ -7347,16 +7443,12 @@ class CreateGroupRoomDialog(wx.Dialog):
         super().__init__(parent, title="Create Group Room")
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
-        for label, ctrl in (
-            ("Room name:", wx.TextCtrl(panel)),
-            ("Description:", wx.TextCtrl(panel)),
-        ):
+        self.name_ctrl = wx.TextCtrl(panel, name="Room name")
+        self.topic_ctrl = wx.TextCtrl(panel, name="Topic")
+        self.description_ctrl = wx.TextCtrl(panel, name="Description")
+        for label, ctrl in (("Room &name:", self.name_ctrl), ("&Topic:", self.topic_ctrl), ("&Description:", self.description_ctrl)):
             s.Add(wx.StaticText(panel, label=label), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
             s.Add(ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
-            if label.startswith("Room"):
-                self.name_ctrl = ctrl
-            else:
-                self.description_ctrl = ctrl
         s.Add(wx.StaticText(panel, label="Visibility:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
         self.visibility = wx.Choice(panel, choices=["public", "private"])
         self.visibility.SetSelection(0)
@@ -7375,6 +7467,7 @@ class CreateGroupRoomDialog(wx.Dialog):
     def values(self):
         return {
             "name": self.name_ctrl.GetValue().strip(),
+            "topic": self.topic_ctrl.GetValue().strip(),
             "description": self.description_ctrl.GetValue().strip(),
             "visibility": self.visibility.GetStringSelection(),
             "expiration": self.expiration.GetStringSelection(),
@@ -7382,11 +7475,18 @@ class CreateGroupRoomDialog(wx.Dialog):
 
 
 class GroupRoomSettingsDialog(wx.Dialog):
-    ACTIONS = ("view", "send_messages", "send_files", "join_voice", "invite", "moderate_messages", "manage_members", "manage_room")
+    ACTIONS = ("view", "send_messages", "send_files", "send_voice", "join_voice", "invite", "set_topic", "moderate_messages",
+               "moderate_members", "manage_members", "manage_room")
     ROLES = ("guest", "user", "moderator", "admin", "owner")
     def __init__(self, parent, room):
         super().__init__(parent, title=f"Room Settings — {room.get('name', '')}", size=(620, 600))
         self.room = room; panel = wx.Panel(self); s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(wx.StaticText(panel, label="Room &name:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.name = wx.TextCtrl(panel, value=room.get("name", ""), name="Room name")
+        s.Add(self.name, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        s.Add(wx.StaticText(panel, label="&Topic:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.topic = wx.TextCtrl(panel, value=room.get("topic", ""), name="Topic")
+        s.Add(self.topic, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         s.Add(wx.StaticText(panel, label="Description:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
         self.description = wx.TextCtrl(panel, value=room.get("description", ""))
         s.Add(self.description, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
@@ -7397,7 +7497,7 @@ class GroupRoomSettingsDialog(wx.Dialog):
         self.expiration = wx.Choice(panel, choices=["unchanged", "never", "day", "week", "month", "year", "empty"]); self.expiration.SetSelection(0)
         s.Add(self.expiration, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         s.Add(wx.StaticText(panel, label="Allowed room actions by role. Space toggles a selected permission:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
-        choices = [f"{action.replace('_', ' ')} — {role}" for action in self.ACTIONS for role in self.ROLES]
+        choices = [f"{action.replace('_', ' ')}, {ROOM_ROLE_LABELS.get(role, role)}" for action in self.ACTIONS for role in self.ROLES]
         self.permission_list = wx.CheckListBox(panel, choices=choices)
         permissions = room.get("permissions", {})
         for index, (action, role) in enumerate((a, r) for a in self.ACTIONS for r in self.ROLES): self.permission_list.Check(index, role in permissions.get(action, []))
@@ -7411,159 +7511,148 @@ class GroupRoomSettingsDialog(wx.Dialog):
             for role in self.ROLES:
                 if self.permission_list.IsChecked(index): permissions[action].append(role)
                 index += 1
-        return {"description": self.description.GetValue(), "visibility": self.visibility.GetStringSelection(), "expiration": self.expiration.GetStringSelection(), "permissions": permissions}
+        return {"name": self.name.GetValue().strip(), "topic": self.topic.GetValue().strip(), "description": self.description.GetValue(),
+                "visibility": self.visibility.GetStringSelection(), "expiration": self.expiration.GetStringSelection(), "permissions": permissions}
 
 
 class GroupRoomsPanel(wx.Panel):
+    """The room directory (Groups tab): your rooms and public rooms, with search. Open a room to chat in it as a chat tab."""
     def __init__(self, parent, frame, sock, username):
         super().__init__(parent)
-        self.frame, self.sock, self.username = frame, sock, username
-        self.rooms, self.members, self.current_room = [], [], None
-        root = wx.BoxSizer(wx.HORIZONTAL)
-        left = wx.BoxSizer(wx.VERTICAL)
-        left.Add(wx.StaticText(self, label="Group rooms:"), 0, wx.BOTTOM, 4)
-        self.room_list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.room_list.InsertColumn(0, "Room", width=180); self.room_list.InsertColumn(1, "Role", width=90); self.room_list.InsertColumn(2, "Members", width=75)
-        self.room_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_open_room)
-        self.room_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_room_selected)
-        left.Add(self.room_list, 1, wx.EXPAND | wx.BOTTOM, 6)
-        room_buttons = wx.BoxSizer(wx.HORIZONTAL)
-        for label, handler in (("&Create", self.on_create), ("&Join", self.on_join), ("&Leave", self.on_leave), ("&Refresh", self.refresh_rooms), ("Room se&ttings", self.on_room_settings)):
-            button = wx.Button(self, label=label); button.Bind(wx.EVT_BUTTON, handler); room_buttons.Add(button, 1, wx.RIGHT, 4)
-        left.Add(room_buttons, 0, wx.EXPAND)
-
-        center = wx.BoxSizer(wx.VERTICAL)
-        self.room_heading = wx.StaticText(self, label="No room selected")
-        center.Add(self.room_heading, 0, wx.BOTTOM, 4)
-        self.messages = wx.ListBox(self, style=wx.LB_SINGLE)
-        self.messages.SetToolTip("Room message history. Use arrow keys to review messages.")
-        center.Add(self.messages, 1, wx.EXPAND | wx.BOTTOM, 6)
-        center.Add(wx.StaticText(self, label="Message:"), 0, wx.BOTTOM, 3)
-        self.message_ctrl = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER)
-        self.message_ctrl.Bind(wx.EVT_TEXT_ENTER, self.on_send_message)
-        center.Add(self.message_ctrl, 0, wx.EXPAND | wx.BOTTOM, 5)
-        send_row = wx.BoxSizer(wx.HORIZONTAL)
-        send_btn = wx.Button(self, label="&Send message"); send_btn.Bind(wx.EVT_BUTTON, self.on_send_message)
-        file_btn = wx.Button(self, label="Send &file"); file_btn.Bind(wx.EVT_BUTTON, self.on_send_file)
-        call_btn = wx.Button(self, label="Join &voice"); call_btn.Bind(wx.EVT_BUTTON, self.on_join_voice)
-        for button in (send_btn, file_btn, call_btn): send_row.Add(button, 1, wx.RIGHT, 5)
-        center.Add(send_row, 0, wx.EXPAND)
-
-        right = wx.BoxSizer(wx.VERTICAL)
-        right.Add(wx.StaticText(self, label="Room members:"), 0, wx.BOTTOM, 4)
-        self.member_list = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.member_list.InsertColumn(0, "User", width=140); self.member_list.InsertColumn(1, "Role", width=90)
-        self.member_list.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.on_direct_message)
-        self.member_list.Bind(wx.EVT_CONTEXT_MENU, self.on_member_menu)
-        right.Add(self.member_list, 1, wx.EXPAND)
-        invite_btn = wx.Button(self, label="&Invite member"); invite_btn.Bind(wx.EVT_BUTTON, self.on_invite_member); right.Add(invite_btn, 0, wx.EXPAND | wx.TOP, 6)
-        right.Add(wx.StaticText(self, label="Activate a member or use the context menu to send a direct message."), 0, wx.TOP, 6)
-        root.Add(left, 1, wx.EXPAND | wx.ALL, 8); root.Add(center, 2, wx.EXPAND | wx.ALL, 8); root.Add(right, 1, wx.EXPAND | wx.ALL, 8)
-        self.SetSizer(root)
-
+        self.frame, self.username = frame, username
+        self._sock = sock
+        self.rooms = []
+        s = wx.BoxSizer(wx.VERTICAL)
+        search_row = wx.BoxSizer(wx.HORIZONTAL)
+        search_row.Add(wx.StaticText(self, label="Searc&h rooms:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.search = wx.TextCtrl(self, style=wx.TE_PROCESS_ENTER, name="Search rooms")
+        self.search.SetToolTip("Words from a room's name, topic or description. Enter searches; empty shows every room.")
+        self.search.Bind(wx.EVT_TEXT_ENTER, lambda e: self.refresh_rooms())
+        search_row.Add(self.search, 1, wx.EXPAND)
+        s.Add(search_row, 0, wx.EXPAND | wx.ALL, 8)
+        self.list_label = wx.StaticText(self, label="&Rooms:")
+        s.Add(self.list_label, 0, wx.LEFT | wx.RIGHT, 8)
+        self.room_list = wx.ListBox(self, style=wx.LB_SINGLE, name="Rooms")
+        self.room_list.SetToolTip("Enter opens the room. Rooms you're not in are joined first when they're public.")
+        self.room_list.Bind(wx.EVT_LISTBOX_DCLICK, lambda e: self.on_open())
+        self.room_list.Bind(wx.EVT_KEY_DOWN, self.on_list_key)
+        s.Add(self.room_list, 1, wx.EXPAND | wx.ALL, 8)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, fn in (("&Open", self.on_open), ("&Create room...", self.on_create), ("&Leave", self.on_leave),
+                          ("&Delete room", self.on_delete), ("Re&fresh", self.refresh_rooms)):
+            b = wx.Button(self, label=label)
+            b.Bind(wx.EVT_BUTTON, lambda e, f=fn: f())
+            row.Add(b, 0, wx.ALL, 4)
+        s.Add(row, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 4)
+        s.Add(wx.StaticText(self, label="In a room, the Members tab (Control Page Down) has the topic, members, invites and moderation."),
+              0, wx.ALL, 8)
+        self.SetSizer(s)
+        wx.CallLater(1500, self.refresh_rooms)
+    @property
+    def sock(self):
+        return getattr(wx.GetApp(), "sock", None) or self._sock
+    @sock.setter
+    def sock(self, value):
+        self._sock = value
     def _send(self, payload):
-        try: self.sock.sendall((json.dumps(payload) + "\n").encode())
-        except Exception as exc: wx.MessageBox(str(exc), "Group Rooms", wx.OK | wx.ICON_ERROR, self)
-
-    def refresh_rooms(self, _=None): self._send({"action": "group_room_list"})
-    def _selected_room(self):
-        index = self.room_list.GetFirstSelected()
-        return self.rooms[index] if 0 <= index < len(self.rooms) else None
-    def on_room_selected(self, _):
-        room = self._selected_room()
-        if room and room.get("role"): self._send({"action": "group_room_open", "room_id": room["room_id"]})
-    def on_open_room(self, _): self.on_room_selected(None)
-    def on_create(self, _):
-        with CreateGroupRoomDialog(self) as dlg:
-            if dlg.ShowModal() == wx.ID_OK: self._send({"action": "group_room_create", **dlg.values()})
-    def on_join(self, _):
-        room = self._selected_room()
-        if room: self._send({"action": "group_room_join", "room_id": room["room_id"]})
-    def on_leave(self, _):
-        if self.current_room: self._send({"action": "group_room_leave", "room_id": self.current_room["room_id"]})
-    def on_room_settings(self, _):
-        if not self.current_room: return
-        with GroupRoomSettingsDialog(self, self.current_room) as dlg:
-            if dlg.ShowModal() == wx.ID_OK: self._send({"action": "group_room_update", "room_id": self.current_room["room_id"], "changes": dlg.changes()})
-    def on_invite_member(self, _):
-        if not self.current_room: return
-        with wx.TextEntryDialog(self, "Username to add:", "Invite Room Member") as dlg:
-            if dlg.ShowModal() != wx.ID_OK: return
-            username = dlg.GetValue().strip()
-        if username: self._send({"action": "group_room_add_member", "room_id": self.current_room["room_id"], "username": username, "role": "user"})
-    def on_send_message(self, _):
-        body = self.message_ctrl.GetValue().strip()
-        if self.current_room and body:
-            self._send({"action": "group_room_message", "room_id": self.current_room["room_id"], "body": body}); self.message_ctrl.Clear(); self.message_ctrl.SetFocus()
-    def on_send_file(self, _):
-        if not self.current_room: return
-        with wx.FileDialog(self, "Send file to room", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
-            if dlg.ShowModal() != wx.ID_OK: return
-            path = dlg.GetPath()
         try:
-            with open(path, "rb") as stream: encoded = base64.b64encode(stream.read()).decode("ascii")
-            self._send({"action": "group_room_file", "room_id": self.current_room["room_id"], "room_name": self.current_room["name"], "filename": os.path.basename(path), "data": encoded})
-        except Exception as exc: wx.MessageBox(str(exc), "Room File", wx.OK | wx.ICON_ERROR, self)
-    def on_join_voice(self, _):
-        if not self.current_room: return
-        self.frame.on_group_calls(None)
-        if self.frame._group_call_dlg:
-            self.frame._group_call_dlg.group_txt.SetValue(self.current_room["name"]); self.frame._group_call_dlg.on_join(None)
-    def _selected_member(self):
-        index = self.member_list.GetFirstSelected(); return self.members[index] if 0 <= index < len(self.members) else None
-    def on_direct_message(self, _):
-        member = self._selected_member()
-        if member: self.frame.open_direct_chat(member["username"])
-    def on_member_menu(self, _):
-        member = self._selected_member()
-        if not member: return
-        menu = wx.Menu(); dm = menu.Append(wx.ID_ANY, "Direct message")
-        self.Bind(wx.EVT_MENU, self.on_direct_message, dm)
-        role_menu = wx.Menu()
-        for role in ("guest", "user", "moderator", "admin"):
-            item = role_menu.Append(wx.ID_ANY, f"Set role: {role}")
-            self.Bind(wx.EVT_MENU, lambda event, value=role, target=member["username"]: self._send({"action": "group_room_set_role", "room_id": self.current_room["room_id"], "username": target, "role": value}), item)
-        menu.AppendSubMenu(role_menu, "Change role")
-        self.PopupMenu(menu); menu.Destroy()
-    def _show_rooms(self, rooms):
-        self.rooms = list(rooms or []); self.room_list.DeleteAllItems()
-        for room in self.rooms:
-            index = self.room_list.InsertItem(self.room_list.GetItemCount(), room.get("name", "")); self.room_list.SetItem(index, 1, room.get("role") or "not joined"); self.room_list.SetItem(index, 2, str(room.get("member_count", 0)))
-    def _show_open_room(self, msg):
-        self.current_room = msg["room"]; self.members = list(msg.get("members", [])); self.room_heading.SetLabel(f"{self.current_room['name']} — role: {self.current_room.get('role', '')}")
-        self.messages.Clear()
-        for item in msg.get("messages", []): self._append_message(item)
-        self.member_list.DeleteAllItems()
-        for member in self.members:
-            index = self.member_list.InsertItem(self.member_list.GetItemCount(), member["username"]); self.member_list.SetItem(index, 1, member["role"])
-        self.message_ctrl.SetFocus()
-    def _append_message(self, item):
-        label = f"{item.get('sender', '')}: " + (f"sent file {item.get('filename', '')}" if item.get("kind") == "file" else item.get("body", "")); self.messages.Append(label); self.messages.SetSelection(self.messages.GetCount() - 1)
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            return True
+        except Exception as exc:
+            speak_text(f"Couldn't reach the server: {exc}", interrupt=True)
+            return False
+    def refresh_rooms(self, _=None):
+        self._send({"action": "group_room_list", "query": self.search.GetValue().strip()})
+    def _selected_room(self):
+        n = self.room_list.GetSelection()
+        return self.rooms[n] if self.rooms and 0 <= n < len(self.rooms) else None
+    def _label(self, r):
+        parts = [r.get("name", ""), r.get("role_label") or ("not joined" if not r.get("role") else r["role"]),
+                 f"{r.get('member_count', 0)} member{'s' if r.get('member_count', 0) != 1 else ''}"]
+        if r.get("unread"):
+            parts.append(f"{r['unread']} unread")
+        if r.get("visibility") == "private":
+            parts.append("private")
+        if r.get("topic"):
+            parts.append(f"topic: {r['topic']}")
+        return ", ".join(parts)
+    def _show_rooms(self, rooms, query=""):
+        keep = (self._selected_room() or {}).get("room_id")
+        self.rooms = list(rooms or [])
+        self.room_list.Set([self._label(r) for r in self.rooms] or ["No rooms found. Create one with Create room."])
+        self.list_label.SetLabel(f"&Rooms, {len(self.rooms)}" + (f" matching {query}" if query else "") + ":")
+        ids = [r["room_id"] for r in self.rooms]
+        self.room_list.SetSelection(ids.index(keep) if keep in ids else 0)
+    def on_list_key(self, event):
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and not event.HasAnyModifiers():
+            self.on_open()
+            return
+        if event.GetKeyCode() in (wx.WXK_DELETE, wx.WXK_NUMPAD_DELETE) and not event.HasAnyModifiers():
+            self.on_leave()
+            return
+        event.Skip()
+    def on_open(self):
+        room = self._selected_room()
+        if not room:
+            return
+        if room.get("role"):
+            self.frame.open_room_chat(room)
+        elif room.get("visibility") == "public":
+            self._pending_open = room["room_id"]
+            self._send({"action": "group_room_join", "room_id": room["room_id"]})
+        else:
+            speak_text("That private room needs an invitation from a member.", interrupt=True)
+    def on_create(self):
+        with CreateGroupRoomDialog(self) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                values = dlg.values()
+                self._pending_open = "created"
+                self._send(dict(values, action="group_room_create"))
+    def on_leave(self):
+        room = self._selected_room()
+        if room and room.get("role") and wx.MessageBox(f"Leave the room {room['name']}?", "Leave Room",
+                                                       wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) == wx.YES:
+            self._send({"action": "group_room_leave", "room_id": room["room_id"]})
+    def on_delete(self):
+        room = self._selected_room()
+        if not room:
+            return
+        if room.get("role") != "owner" and not getattr(self.frame, "am_admin", False):
+            speak_text("Only the room owner can delete it.", interrupt=True)
+            return
+        if wx.MessageBox(f"Delete the room {room['name']} and all its messages for everyone? This can't be undone.", "Delete Room",
+                         wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING, self) == wx.YES:
+            self._send({"action": "group_room_delete_room", "room_id": room["room_id"]})
     def handle_server_action(self, msg):
         action = msg.get("action")
-        if action == "group_room_list_response" and msg.get("ok"): self._show_rooms(msg.get("rooms", []))
-        elif action == "group_room_open_response" and msg.get("ok"): self._show_open_room(msg)
-        elif action == "group_room_message": self._append_message(msg.get("message", {}))
-        elif action == "group_room_file":
-            item = msg.get("message", {}); self._append_message(item)
-            try:
-                save_dir = os.path.join(os.path.expanduser("~"), "Documents", "ThriveMessenger", "group-files"); os.makedirs(save_dir, exist_ok=True)
-                path = os.path.join(save_dir, os.path.basename(item.get("filename", "room-file")))
-                if os.path.exists(path):
-                    stem, extension = os.path.splitext(path)
-                    counter = 1
-                    while os.path.exists(f"{stem}_{counter}{extension}"):
-                        counter += 1
-                    path = f"{stem}_{counter}{extension}"
-                with open(path, "wb") as stream: stream.write(base64.b64decode(msg.get("data", "")))
-            except Exception as exc: wx.MessageBox(str(exc), "Room File", wx.OK | wx.ICON_ERROR, self)
-        elif action == "group_room_members" and self.current_room and msg.get("room_id") == self.current_room.get("room_id"):
-            self._send({"action": "group_room_open", "room_id": self.current_room["room_id"]})
-        elif action in ("group_room_result", "group_room_event"):
-            if action == "group_room_result" and not msg.get("ok"): wx.MessageBox(msg.get("reason", "Room action failed."), "Group Rooms", wx.OK | wx.ICON_WARNING, self)
-            self.refresh_rooms()
+        if action == "group_room_list_response" and msg.get("ok"):
+            self._show_rooms(msg.get("rooms", []), msg.get("query", ""))
+            return
+        if action == "group_room_result":
+            pending = getattr(self, "_pending_open", None)
             room = msg.get("room")
-            if room and room.get("role"): self._send({"action": "group_room_open", "room_id": room["room_id"]})
+            if msg.get("ok") and room and (pending == "created" and msg.get("event") == "created" or
+                                           pending == room.get("room_id") and msg.get("event") == "joined"):
+                self._pending_open = None
+                self.frame.open_room_chat(room)
+            if msg.get("ok") or msg.get("request") in ("group_room_create", "group_room_join", "group_room_leave", "group_room_delete_room"):
+                self.refresh_rooms()
+        elif action == "group_room_event" and msg.get("event") in ("invited", "deleted", "kicked", "banned", "created", "updated", "topic"):
+            self.refresh_rooms()
+        elif action == "group_room_message":
+            self.refresh_rooms()
+
+
+def RoomChat(frame, room):
+    """Open (or find) a room's chat tab, in the chat window chosen by the user's settings."""
+    panel = frame.get_chat("room:" + room["room_id"])
+    if panel:
+        return panel
+    window = frame.chat_window_for_new_chat()
+    panel = RoomChatPanel(frame, room, frame.sock, frame.user, wx_parent=window.page_parent())
+    window.attach(panel)
+    frame.register_chat(panel)
+    return panel
 
 
 class GroupCallDialog(wx.Dialog):
@@ -8806,6 +8895,37 @@ class LinksListDialog(wx.Dialog):
         if chat:
             wx.CallAfter(chat.focus_messages)
 
+class MessageJumpDialog(wx.Dialog):
+    """A list of messages (or dates) to jump to. Each item reads "sender, time, first words". Enter jumps; Escape cancels."""
+    def __init__(self, parent, title, labels):
+        super().__init__(parent.GetTopLevelParent(), title=title, size=(760, 480), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.choice = None
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(wx.StaticText(panel, label=f"&{title}, {len(labels)} (Enter goes there):"), 0, wx.ALL, 6)
+        self.list = wx.ListBox(panel, choices=labels, style=wx.LB_SINGLE, name=title)
+        if labels:
+            self.list.SetSelection(0)
+        s.Add(self.list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 6)
+        buttons = self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL)
+        self.FindWindowById(wx.ID_OK).SetLabel("&Go to")
+        s.Add(buttons, 0, wx.EXPAND | wx.ALL, 6)
+        panel.SetSizer(s)
+        self.list.Bind(wx.EVT_LISTBOX_DCLICK, lambda e: self._go())
+        self.Bind(wx.EVT_BUTTON, lambda e: self._go(), id=wx.ID_OK)
+        self.list.Bind(wx.EVT_KEY_DOWN, self._on_key)
+        self.list.SetFocus()
+    def _on_key(self, event):
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and not event.HasAnyModifiers():
+            self._go()
+            return
+        event.Skip()
+    def _go(self):
+        n = self.list.GetSelection()
+        if n != wx.NOT_FOUND:
+            self.choice = n
+            self.EndModal(wx.ID_OK)
+
 class ChatPanel(wx.Panel):
     """One conversation. Lives in a ChatWindow: as a tab (tabbed mode) or as the only content (classic mode)."""
     def __init__(self, frame, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None, can_call=False, show_call=False, wx_parent=None):
@@ -9167,6 +9287,12 @@ class ChatPanel(wx.Panel):
             return
         elif event.ControlDown() and not event.AltDown() and event.GetKeyCode() == ord('E'):
             self.on_insert_emoji()
+            return
+        elif event.ControlDown() and not event.AltDown() and not event.ShiftDown() and event.GetKeyCode() == ord('G'):
+            if self.inner.GetSelection() != 0:
+                self.inner.SetSelection(0)
+            self.hist.SetFocus()
+            wx.CallAfter(self.show_goto_menu)
             return
         elif event.ControlDown() and not event.AltDown() and event.GetKeyCode() == ord('R'):
             self.toggle_recording(voicemail=event.ShiftDown())
@@ -9691,8 +9817,9 @@ class ChatPanel(wx.Panel):
         self._hist_state["loaded"] = True
         self.btn_earlier.Show(self._hist_state["has_more"]); self.msg_page.Layout()
         if not items:
-            if earlier:
+            if earlier and not getattr(self, "_bulk", None):
                 speak_text("No earlier messages", interrupt=True)
+            self._bulk_page_arrived()
             return
         sel = self.hist.GetSelection()
         was_at_end = sel == wx.NOT_FOUND or sel >= self.hist.GetCount() - 1
@@ -9708,7 +9835,11 @@ class ChatPanel(wx.Panel):
             self._known_ids.add(row["id"])
             inserted += 1
         self._prefetch_link_titles()
-        if earlier:
+        if earlier and getattr(self, "_bulk", None):
+            if selected_row in self._history_rows:
+                self.hist.SetSelection(self._history_rows.index(selected_row))
+            self._bulk_page_arrived()
+        elif earlier:
             # Land on the newest of the older messages, so Up keeps going back in time.
             self.hist.SetSelection(max(0, inserted - 1))
             speak_text(f"Loaded {inserted} earlier message{'s' if inserted != 1 else ''}", interrupt=True)
@@ -9880,6 +10011,16 @@ class ChatPanel(wx.Panel):
         if event.GetKeyCode() in (wx.WXK_LEFT, wx.WXK_RIGHT) and not event.HasAnyModifiers():
             self._move_link(1 if event.GetKeyCode() == wx.WXK_RIGHT else -1)
             return
+        if event.AltDown() and not event.ControlDown() and not event.ShiftDown():
+            if event.GetKeyCode() == wx.WXK_LEFT:
+                self.jump_back()
+                return
+            if event.GetKeyCode() in (wx.WXK_DOWN, wx.WXK_UP):
+                self.jump_next_link(1 if event.GetKeyCode() == wx.WXK_DOWN else -1)
+                return
+        if event.ControlDown() and not event.AltDown() and event.GetKeyCode() in (wx.WXK_HOME, wx.WXK_END):
+            self.jump_edge(event.GetKeyCode() == wx.WXK_END)
+            return
         if event.GetKeyCode() == wx.WXK_SPACE and not event.HasAnyModifiers() and not voice_row:
             if self.activate_selected_link():
                 return
@@ -9898,6 +10039,199 @@ class ChatPanel(wx.Panel):
                 self.on_history_item_activated(event)
             return
         event.Skip()
+    # --- getting around long histories -------------------------------------------------------------------------
+    def _row_brief(self, row):
+        """How a message reads in jump lists: "sender, time, first words"."""
+        sender = row.get("sender", "")
+        who = "you" if sender == self.user else (self.frame.format_user_label(sender) if hasattr(self.frame, "format_user_label") else sender)
+        words = self._visible_text(row).split()
+        first = " ".join(words[:10]) + ("..." if len(words) > 10 else "")
+        if row.get("voice"):
+            first = first or "voice message"
+        return f"{who}, {format_timestamp(row.get('time'))}, {first}"
+    def jump_to_row(self, row, remember=True):
+        """Move to a message (focus lands on it), remembering where you were so Alt+Left comes back."""
+        if row not in self._history_rows:
+            speak_text("That message isn't loaded any more", interrupt=True)
+            return
+        cur = self._selected_history_index()
+        if remember and cur is not None and self._history_rows[cur] is not row:
+            back = getattr(self, "_jump_back", [])
+            back.append(self._history_rows[cur])
+            self._jump_back = back[-50:]
+        self._link_cursor = None
+        idx = self._history_rows.index(row)
+        self.hist.SetSelection(idx)
+        self.hist.EnsureVisible(idx)
+        if wx.Window.FindFocus() is not self.hist:
+            self.focus_messages(row)
+        else:
+            # The selection moved under the screen reader's focus; say the message.
+            speak_text(self.hist.GetString(idx), interrupt=True)
+        self._schedule_read_mark()
+    def jump_back(self):
+        back = getattr(self, "_jump_back", [])
+        while back:
+            row = back.pop()
+            if row in self._history_rows:
+                self.jump_to_row(row, remember=False)
+                return
+        speak_text("Nothing to go back to", interrupt=True)
+    def jump_next_link(self, step):
+        """Alt+Down / Alt+Up: the next or previous message that has links."""
+        idx = self._selected_history_index()
+        start = (len(self._history_rows) if step < 0 else -1) if idx is None else idx
+        i = start + step
+        while 0 <= i < len(self._history_rows):
+            if self._row_links(self._history_rows[i]):
+                self.jump_to_row(self._history_rows[i])
+                return
+            i += step
+        if step < 0 and self._hist_state.get("has_more"):
+            speak_text("No earlier messages with links are loaded. Go to, Messages with links, loads the whole history.", interrupt=True)
+        else:
+            speak_text("No more messages with links" if step > 0 else "No earlier messages with links", interrupt=True)
+    def jump_edge(self, last):
+        if self._history_rows:
+            self.jump_to_row(self._history_rows[-1 if last else 0])
+    def _with_full_history(self, then):
+        """Load every older message first (in pages), then run `then`; jump lists then cover the whole conversation."""
+        if self.is_remote_directory_chat or not self._hist_state.get("has_more"):
+            then()
+            return
+        self._bulk = {"then": then, "pages": 0}
+        speak_text("Loading older messages first", interrupt=True)
+        self._bulk_next()
+    def _bulk_next(self):
+        seqs = [r.get("seq") for r in self._history_rows if r.get("seq")]
+        if not seqs:
+            self._bulk_done()
+            return
+        self.request_history(before=min(seqs))
+    def _bulk_page_arrived(self):
+        bulk = getattr(self, "_bulk", None)
+        if not bulk:
+            return
+        bulk["pages"] += 1
+        if self._hist_state.get("has_more") and bulk["pages"] < 50:
+            wx.CallAfter(self._bulk_next)
+        else:
+            self._bulk_done()
+    def _bulk_done(self):
+        bulk, self._bulk = getattr(self, "_bulk", None), None
+        if bulk:
+            speak_text(f"{len(self._history_rows)} messages loaded", interrupt=True)
+            wx.CallAfter(bulk["then"])
+    def _pick_and_jump(self, title, rows, empty="No messages found"):
+        rows = list(rows)
+        if not rows:
+            speak_text(empty, interrupt=True)
+            return
+        dlg = MessageJumpDialog(self, title, [self._row_brief(r) for r in rows])
+        chosen = dlg.ShowModal() == wx.ID_OK and dlg.choice
+        dlg.Destroy()
+        if chosen is not False and chosen is not None:
+            self.jump_to_row(rows[chosen])
+        else:
+            self.hist.SetFocus()
+    def goto(self, kind, who=None):
+        """Go to menu entries. Lists are newest first; Enter jumps to the message."""
+        def run():
+            rows = list(reversed(self._history_rows))
+            real = [r for r in rows if not r.get("error") and r.get("sender") != "System"]
+            if kind == "links":
+                self._pick_and_jump("Go to a message with links", [r for r in real if self._row_links(r)], "No messages with links")
+            elif kind == "from":
+                label = self.frame.format_user_label(who) if hasattr(self.frame, "format_user_label") else who
+                self._pick_and_jump(f"Go to a message from {label}", [r for r in real if str(r.get("sender")).lower() == str(who).lower()],
+                                    f"No messages from {label}")
+            elif kind == "mine":
+                self._pick_and_jump("Go to one of my messages", [r for r in real if r.get("sender") == self.user], "You haven't sent any messages here")
+            elif kind == "unread":
+                self._pick_and_jump("Go to an unread message", [r for r in real if r.get("sender") != self.user and not r.get("read_sent")],
+                                    "No unread messages")
+            elif kind == "date":
+                days = []
+                for r in self._history_rows:
+                    dt = parse_timestamp_value(r.get("time"))
+                    day = dt.date() if dt else None
+                    if day and (not days or days[-1][0] != day):
+                        days.append((day, r, 0))
+                    if day:
+                        d, first, n = days[-1]
+                        days[-1] = (d, first, n + 1)
+                if not days:
+                    speak_text("No messages", interrupt=True)
+                    return
+                days.reverse()
+                labels = [f"{d.strftime('%A, %B')} {get_day_with_suffix(d.day)}, {d.year}, {n} message{'s' if n != 1 else ''}" for d, _, n in days]
+                dlg = MessageJumpDialog(self, "Go to a date", labels)
+                chosen = dlg.ShowModal() == wx.ID_OK and dlg.choice
+                dlg.Destroy()
+                if chosen is not False and chosen is not None:
+                    self.jump_to_row(days[chosen][1])
+                else:
+                    self.hist.SetFocus()
+            elif kind == "search":
+                with wx.TextEntryDialog(self, "Find messages containing:", "Search This Conversation") as dlg:
+                    if dlg.ShowModal() != wx.ID_OK:
+                        self.hist.SetFocus()
+                        return
+                    words = [w for w in dlg.GetValue().lower().split() if w]
+                if not words:
+                    return
+                hits = [r for r in real if all(w in (self._visible_text(r) + " " + str(r.get("sender", ""))).lower() for w in words)]
+                self._pick_and_jump(f"Messages matching {' '.join(words)}", hits, "Nothing matched")
+        if kind in ("links", "from", "mine", "unread", "date", "search"):
+            self._with_full_history(run)
+    def _people_here(self):
+        """Who can have written in this conversation, for "Messages from"."""
+        return [self.contact]
+    def _goto_menu(self):
+        m = wx.Menu()
+        def add(label, fn, enabled=True):
+            item = m.Append(wx.ID_ANY, label)
+            item.Enable(enabled)
+            self.Bind(wx.EVT_MENU, lambda e: fn(), item)
+        add("Messages with &links...", lambda: self.goto("links"))
+        people = [p for p in self._people_here() if p and p != self.user]
+        if len(people) == 1:
+            label = self.frame.format_user_label(people[0]) if hasattr(self.frame, "format_user_label") else people[0]
+            add(f"Messages &from {label}...", lambda p=people[0]: self.goto("from", p))
+        elif people:
+            sub = wx.Menu()
+            for p in people:
+                item = sub.Append(wx.ID_ANY, f"{self.frame.format_user_label(p) if hasattr(self.frame, 'format_user_label') else p}...")
+                self.Bind(wx.EVT_MENU, lambda e, p=p: self.goto("from", p), item)
+            m.AppendSubMenu(sub, "Messages &from")
+        add("&My messages...", lambda: self.goto("mine"))
+        add("&Unread messages...", lambda: self.goto("unread"))
+        add("By &date...", lambda: self.goto("date"))
+        add("&Search...", lambda: self.goto("search"))
+        m.AppendSeparator()
+        add("&Back to where I was\tAlt+Left", self.jump_back, bool(getattr(self, "_jump_back", [])))
+        add("&Next message with a link\tAlt+Down", lambda: self.jump_next_link(1))
+        add("&Previous message with a link\tAlt+Up", lambda: self.jump_next_link(-1))
+        add("F&irst message\tCtrl+Home", lambda: self.jump_edge(False))
+        add("Las&t message\tCtrl+End", lambda: self.jump_edge(True))
+        return m
+    def show_goto_menu(self):
+        menu = self._goto_menu()
+        self.hist.PopupMenu(menu)
+        menu.Destroy()
+    def _links_in_message_menu(self, links):
+        """One submenu per link, named by title and address, to open or copy it."""
+        lim = wx.Menu()
+        for n, link in enumerate(links, 1):
+            sub = wx.Menu()
+            for label, fn in (("&Open", lambda l: self._open_link(l)), ("Open in &full view", lambda l: self._open_link(l, mode='full')),
+                              ("Open in default &browser", lambda l: self._open_link(l, mode='browser')),
+                              ("&Copy link", self._copy_link), ("Copy &title", self._copy_link_title)):
+                item = sub.Append(wx.ID_ANY, label)
+                self.Bind(wx.EVT_MENU, lambda e, f=fn, l=link: f(l), item)
+            title = link_title_for(link["url"])
+            lim.AppendSubMenu(sub, f"&{n} {title}, {link['url']}" if title else f"&{n} {link['url']}")
+        return lim
     # --- links ------------------------------------------------------------------------------------------------
     def _hidden_links(self, row):
         return (wx.GetApp().user_config.get('hidden_links') or {}).get(str(row.get("id") or "")) or []
@@ -10079,6 +10413,18 @@ class ChatPanel(wx.Panel):
                 self._server_items(items) if items is not None else self._link_items_from_rows(self._history_rows), what))
         else:
             self.remove_link_items(self._link_items_from_rows(self._history_rows), "Remove all links in this conversation")
+    def _can_remove_links_for_everyone(self, item):
+        me = str(self.user or "").lower()
+        return bool(item.get("id")) and not str(item.get("id")).startswith("h") and not self.is_remote_directory_chat \
+            and (str(item.get("sender") or "").lower() == me or self._am_admin())
+    def _send_link_removal(self, by_id):
+        try:
+            self.sock.sendall((json.dumps({"action": "msg_remove_links", "request_id": uuid.uuid4().hex,
+                                           "items": [{"id": k, "raw": v} for k, v in by_id.items()]}) + "\n").encode())
+            return True
+        except Exception as e:
+            self.append_error(f"Could not remove the links: {e}")
+            return False
     def remove_link_items(self, items, what, parent=None):
         """Links in your own messages (any message, for admins) are removed for everyone, like deleting;
         links other people sent are hidden on this device only. Asks first. True if something was done."""
@@ -10087,8 +10433,7 @@ class ChatPanel(wx.Panel):
             speak_text("No links to remove", interrupt=True)
             return False
         me = str(self.user or "").lower()
-        everyone = [i for i in items if i.get("id") and not str(i.get("id")).startswith("h") and not self.is_remote_directory_chat
-                    and (str(i.get("sender") or "").lower() == me or self._am_admin())]
+        everyone = [i for i in items if self._can_remove_links_for_everyone(i)]
         local = [i for i in items if i not in everyone]
         def count(n):
             return f"{n} link{'s' if n != 1 else ''}"
@@ -10104,11 +10449,7 @@ class ChatPanel(wx.Panel):
             by_id = {}
             for i in everyone:
                 by_id.setdefault(i["id"], []).append(i["raw"])
-            try:
-                self.sock.sendall((json.dumps({"action": "msg_remove_links", "request_id": uuid.uuid4().hex,
-                                               "items": [{"id": k, "raw": v} for k, v in by_id.items()]}) + "\n").encode())
-            except Exception as e:
-                self.append_error(f"Could not remove the links: {e}")
+            if not self._send_link_removal(by_id):
                 return False
         if local:
             app = wx.GetApp()
@@ -10126,34 +10467,19 @@ class ChatPanel(wx.Panel):
         self._link_cursor = None
         return True
     def _add_links_menu(self, menu, idx):
-        """The Links group, below the usual message options."""
+        """Below the usual message options: this message's links, link lists and removal, and Go to."""
         pos, links = self._current_link(idx)
         self.request_link_titles([l["url"] for l in links])
+        menu.AppendSeparator()
+        if links:
+            menu.AppendSubMenu(self._links_in_message_menu(links), f"Lin&ks in this message ({len(links)})")
+        else:
+            menu.Append(wx.ID_ANY, "Lin&ks in this message (none)").Enable(False)
         lm = wx.Menu()
-        def per_link(parent_menu, label, fn):
-            # The link picked with Left/Right, or the only link; with several, a submenu of this message's links.
-            if not links:
-                parent_menu.Append(wx.ID_ANY, label).Enable(False)
-            elif pos is not None or len(links) == 1:
-                link = links[pos or 0]
-                item = parent_menu.Append(wx.ID_ANY, label)
-                self.Bind(wx.EVT_MENU, lambda e, l=link: fn(l), item)
-            else:
-                sub = wx.Menu()
-                for n, l in enumerate(links, 1):
-                    item = sub.Append(wx.ID_ANY, f"&{n} {link_label(l)}")
-                    self.Bind(wx.EVT_MENU, lambda e, l=l: fn(l), item)
-                parent_menu.AppendSubMenu(sub, label)
         def plain(parent_menu, label, fn, enabled=True):
             item = parent_menu.Append(wx.ID_ANY, label)
             item.Enable(enabled)
             self.Bind(wx.EVT_MENU, lambda e: fn(), item)
-        per_link(lm, "&Open link", self._open_link)
-        per_link(lm, "Open link in &full view", lambda l: self._open_link(l, mode='full'))
-        per_link(lm, "Open link in default &browser", lambda l: self._open_link(l, mode='browser'))
-        per_link(lm, "&Copy link", self._copy_link)
-        per_link(lm, "Copy link &title", self._copy_link_title)
-        lm.AppendSeparator()
         show = wx.Menu()
         plain(show, "In this &message", lambda: self.show_links_list("message"), bool(links))
         plain(show, "In this &conversation", lambda: self.show_links_list("conversation"))
@@ -10161,14 +10487,23 @@ class ChatPanel(wx.Panel):
         plain(show, "In &all conversations", lambda: self.show_links_list("all"), not self.is_remote_directory_chat)
         lm.AppendSubMenu(show, "&Show list of links")
         rm = wx.Menu()
-        per_link(rm, "&This link", lambda l: self.remove_links("link", l))
+        if not links:
+            rm.Append(wx.ID_ANY, "&This link").Enable(False)
+        elif pos is not None or len(links) == 1:
+            plain(rm, "&This link", lambda l=links[pos or 0]: self.remove_links("link", l))
+        else:
+            sub = wx.Menu()
+            for n, l in enumerate(links, 1):
+                item = sub.Append(wx.ID_ANY, f"&{n} {link_label(l)}")
+                self.Bind(wx.EVT_MENU, lambda e, l=l: self.remove_links("link", l), item)
+            rm.AppendSubMenu(sub, "&This link")
         plain(rm, "All links in this &message", lambda: self.remove_links("message"), bool(links))
         plain(rm, "A &link in this conversation...", lambda: self.show_links_list("conversation", pick_to_remove=True))
         plain(rm, "All links in this &conversation", lambda: self.remove_links("conversation"))
         plain(rm, "All links in &all conversations", lambda: self.remove_links("all"), not self.is_remote_directory_chat)
         lm.AppendSubMenu(rm, "&Remove links")
-        menu.AppendSeparator()
-        menu.AppendSubMenu(lm, f"Lin&ks ({len(links)} in this message)" if links else "Lin&ks")
+        menu.AppendSubMenu(lm, "Link l&ists and removal")
+        menu.AppendSubMenu(self._goto_menu(), "&Go to\tCtrl+G")
     def set_typing_label(self, username, is_typing):
         app = wx.GetApp()
         if is_typing and app.user_config.get('typing_indicators', True):
@@ -10179,6 +10514,554 @@ class ChatPanel(wx.Panel):
             self.typing_lbl.SetLabel(f"{label} is typing...")
         else:
             self.typing_lbl.SetLabel("")
+
+ROOM_ROLE_LABELS = {"guest": "guest", "user": "member", "moderator": "moderator", "admin": "admin", "owner": "owner"}
+ROOM_ROLE_RANK = {"guest": 0, "user": 1, "moderator": 2, "admin": 3, "owner": 4}
+
+class RoomMembersPanel(wx.Panel):
+    """A room's topic and members: role, muted, and whether they've read the newest message. Applications key for actions."""
+    def __init__(self, parent, chat):
+        super().__init__(parent)
+        self.chat = chat
+        self.SetName("Members")
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(wx.StaticText(self, label="&Topic:"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 6)
+        self.topic = wx.TextCtrl(self, style=wx.TE_READONLY | wx.TE_MULTILINE, size=(-1, 50), name="Room topic")
+        s.Add(self.topic, 0, wx.EXPAND | wx.ALL, 6)
+        self.members_label = wx.StaticText(self, label="&Members:")
+        s.Add(self.members_label, 0, wx.LEFT | wx.RIGHT, 6)
+        self.list = wx.ListBox(self, style=wx.LB_SINGLE, name="Room members")
+        s.Add(self.list, 1, wx.EXPAND | wx.ALL, 6)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        for label, fn in (("&Invite...", self.on_invite), ("Change t&opic...", self.on_topic), ("Room &settings...", self.on_settings),
+                          ("&Banned people...", self.on_bans), ("&Leave room", self.on_leave)):
+            b = wx.Button(self, label=label)
+            b.Bind(wx.EVT_BUTTON, lambda e, f=fn: f())
+            row.Add(b, 0, wx.ALL, 4)
+        s.Add(row, 0)
+        self.SetSizer(s)
+        self.list.Bind(wx.EVT_CONTEXT_MENU, self.on_menu)
+        self.list.Bind(wx.EVT_LISTBOX_DCLICK, lambda e: self._dm())
+        self.list.Bind(wx.EVT_KEY_DOWN, self.on_key)
+    def focus_default(self):
+        self.list.SetFocus()
+    def refresh(self):
+        self.show()
+    def _label(self, m, newest):
+        me = str(m["username"]).lower() == str(self.chat.user).lower()
+        name = "you" if me else self.chat.frame.format_user_label(m["username"])
+        parts = [name, m.get("role_label") or ROOM_ROLE_LABELS.get(m.get("role"), m.get("role", ""))]
+        if m.get("muted"):
+            parts.append("muted")
+        if newest and not me:
+            parts.append("has read the newest message" if float(m.get("last_read_at") or 0) >= newest else "hasn't read the newest message")
+        return ", ".join(parts)
+    def show(self):
+        room = self.chat.room
+        self.topic.SetValue(room.get("topic") or "No topic set.")
+        newest = max([float(r.get("sent_at") or 0) for r in self.chat._history_rows if r.get("sent_at")] or [0])
+        sel = self.list.GetSelection()
+        self.list.Set([self._label(m, newest) for m in self.chat.members])
+        self.members_label.SetLabel(f"&Members, {len(self.chat.members)} (Applications key for actions):")
+        if self.chat.members:
+            self.list.SetSelection(min(max(sel, 0), len(self.chat.members) - 1))
+    def _selected(self):
+        n = self.list.GetSelection()
+        return self.chat.members[n] if 0 <= n < len(self.chat.members) else None
+    def _dm(self):
+        m = self._selected()
+        if m and str(m["username"]).lower() != str(self.chat.user).lower():
+            self.chat.frame.open_direct_chat(m["username"])
+    def on_key(self, event):
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and not event.HasAnyModifiers():
+            self._dm()
+            return
+        event.Skip()
+    def on_menu(self, event):
+        m = self._selected()
+        if not m:
+            return
+        chat, target = self.chat, m["username"]
+        menu = wx.Menu()
+        def add(parent, label, payload=None, fn=None, enabled=True):
+            item = parent.Append(wx.ID_ANY, label)
+            item.Enable(enabled)
+            self.Bind(wx.EVT_MENU, lambda e: fn() if fn else chat.room_send(payload), item)
+        me = str(target).lower() == str(chat.user).lower()
+        add(menu, "&Direct message", fn=self._dm, enabled=not me)
+        mention = lambda: (chat.inner.SetSelection(0), chat.input_ctrl.WriteText(f"@{target} "), chat.input_ctrl.SetFocus())
+        add(menu, "&Mention in a message", fn=mention)
+        mine = ROOM_ROLE_RANK.get(chat.room.get("role"), -1)
+        theirs = ROOM_ROLE_RANK.get(m.get("role"), 0)
+        can_mod = not me and mine >= ROOM_ROLE_RANK["moderator"] and theirs < mine
+        roles = wx.Menu()
+        for role in ("guest", "user", "moderator", "admin"):
+            add(roles, f"Make {ROOM_ROLE_LABELS[role]}", {"action": "group_room_set_role", "username": target, "role": role},
+                enabled=not me and mine >= ROOM_ROLE_RANK["admin"] and ROOM_ROLE_RANK[role] < mine and theirs < mine)
+        add(roles, "Make owner (hand the room over)", fn=lambda: chat.confirm_and_send(
+            f"Hand this room over to {target}? You'll become an admin.", {"action": "group_room_set_role", "username": target, "role": "owner"}),
+            enabled=not me and mine == ROOM_ROLE_RANK["owner"])
+        menu.AppendSubMenu(roles, "Change &role")
+        mute = wx.Menu()
+        for label, minutes in (("10 minutes", 10), ("1 hour", 60), ("1 day", 1440), ("1 week", 10080)):
+            add(mute, label, {"action": "group_room_mute", "username": target, "minutes": minutes}, enabled=can_mod)
+        add(mute, "&Unmute", {"action": "group_room_mute", "username": target, "minutes": 0}, enabled=can_mod and m.get("muted"))
+        menu.AppendSubMenu(mute, "M&ute")
+        add(menu, "&Remove from room (kick)", fn=lambda: chat.confirm_and_send(f"Remove {target} from this room? They can come back if it's public.",
+                                                                                {"action": "group_room_kick", "username": target}), enabled=can_mod)
+        add(menu, "&Ban from room...", fn=lambda: self._ban(target), enabled=can_mod)
+        self.PopupMenu(menu)
+        menu.Destroy()
+    def _ban(self, target):
+        with wx.TextEntryDialog(self, f"Reason for banning {target} (optional):", "Ban From Room") as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            reason = dlg.GetValue().strip()
+        self.chat.room_send({"action": "group_room_ban", "username": target, "reason": reason})
+    def on_invite(self):
+        with wx.TextEntryDialog(self, "Username to invite:", "Invite to Room") as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            name = dlg.GetValue().strip()
+        if name:
+            self.chat.room_send({"action": "group_room_add_member", "username": name, "role": "user"})
+    def on_topic(self):
+        with wx.TextEntryDialog(self, "Room topic:", "Change Topic", value=self.chat.room.get("topic", "")) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.chat.room_send({"action": "group_room_topic", "topic": dlg.GetValue().strip()})
+    def on_settings(self):
+        with GroupRoomSettingsDialog(self, self.chat.room) as dlg:
+            if dlg.ShowModal() == wx.ID_OK:
+                self.chat.room_send({"action": "group_room_update", "changes": dlg.changes()})
+    def on_bans(self):
+        bans = self.chat.bans
+        if not bans:
+            speak_text("Nobody is banned here" if ROOM_ROLE_RANK.get(self.chat.room.get("role"), 0) >= 2 else
+                       "Only moderators can see who is banned", interrupt=True)
+            return
+        labels = [f"{b['username']}, banned by {b['banned_by']}" + (f", {b['reason']}" if b.get("reason") else "") for b in bans]
+        dlg = wx.SingleChoiceDialog(self, "Choose someone to unban:", "Banned People", labels)
+        if dlg.ShowModal() == wx.ID_OK:
+            self.chat.room_send({"action": "group_room_unban", "username": bans[dlg.GetSelection()]["username"]})
+        dlg.Destroy()
+    def on_leave(self):
+        self.chat.confirm_and_send(f"Leave the room {self.chat.room.get('name')}?", {"action": "group_room_leave"})
+
+
+class RoomChatPanel(ChatPanel):
+    """A chat room in a chat tab: everything a conversation has (links, voice messages, read receipts, Go to, edit and
+    delete), plus a Members tab. Room messages come and go through group_room_* actions."""
+    INNER_TAB_NAMES = ("Messages", "Members")
+    def __init__(self, frame, room, sock, user, wx_parent=None):
+        self.room = dict(room)
+        self.room_id = room["room_id"]
+        self.members, self.bans = [], []
+        self._room_loaded = False
+        self._last_read_sent_at = 0.0
+        self._announced_all_read = None
+        super().__init__(frame, "room:" + self.room_id, sock, user, logging_enabled=False, is_contact=True,
+                         can_call=False, show_call=False, wx_parent=wx_parent)
+        self.SetName(f"Room {self.room.get('name', '')}")
+        for page in (self.transfers_page, self.archive_page):
+            idx = self.inner.FindPage(page)
+            if idx != wx.NOT_FOUND:
+                self.inner.RemovePage(idx)
+            page.Destroy()
+        self.members_page = RoomMembersPanel(self.inner, self)
+        self.inner.AddPage(self.members_page, "Members")
+        self.btn_call.Hide()
+        self.msg_page.Layout()
+        if bool(wx.GetApp().user_config.get('start_chats_fresh', False)):
+            wx.CallAfter(self.request_history)  # rooms always need their member list
+    # --- identity -------------------------------------------------------------------------------------------
+    def display_name(self):
+        return f"{self.room.get('name', 'Room')} room"
+    def _people_here(self):
+        return [m["username"] for m in self.members]
+    def _is_logging_enabled_now(self):
+        return bool(wx.GetApp().user_config.get('save_chat_history_default', False))
+    def _contact_log_dir(self):
+        safe = re.sub(r'[^A-Za-z0-9 ._-]', '_', str(self.room.get("name") or self.room_id)).strip() or "room"
+        return os.path.join(os.path.expanduser('~'), 'Documents', 'ThriveMessenger', 'rooms', safe)
+    def _my_rank(self):
+        return ROOM_ROLE_RANK.get(self.room.get("role"), -1)
+    def room_send(self, payload):
+        payload = dict(payload, room_id=self.room_id)
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            return True
+        except Exception as e:
+            self.append_error(f"Couldn't reach the server: {e}")
+            return False
+    def confirm_and_send(self, question, payload):
+        if wx.MessageBox(question, self.display_name(), wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) == wx.YES:
+            self.room_send(payload)
+    # --- history ----------------------------------------------------------------------------------------------
+    def request_history(self, before=None):
+        if self._hist_state["pending"]:
+            return
+        if not self._room_loaded:
+            ok = self.room_send({"action": "group_room_open", "limit": self.HISTORY_PAGE})
+        else:
+            ok = self.room_send({"action": "group_room_history", "limit": self.HISTORY_PAGE, "before": before})
+        self._hist_state["pending"] = bool(ok)
+    def load_earlier(self):
+        times = [r.get("sent_at") for r in self._history_rows if r.get("sent_at")]
+        if not self._hist_state["has_more"] or not times:
+            speak_text("No earlier messages", interrupt=True)
+            return
+        self.request_history(before=min(times))
+    def _bulk_next(self):
+        times = [r.get("sent_at") for r in self._history_rows if r.get("sent_at")]
+        if not times:
+            self._bulk_done()
+            return
+        self.request_history(before=min(times))
+    def _room_row(self, item):
+        row = {"sender": item.get("sender", ""), "text": item.get("body", ""), "time": item.get("sent_at"), "error": False,
+               "epoch": float(item.get("sent_at") or 0), "sent_at": float(item.get("sent_at") or 0), "id": item.get("message_id"),
+               "mentions": item.get("mentions") or []}
+        if item.get("edited_at"):
+            row["edited"] = True
+        if item.get("deleted"):
+            row["text"] = "(message deleted)"
+        if item.get("kind") == "file":
+            row["text"] = f"sent a file: {item.get('filename', '')}"
+        if item.get("kind") == "voice":
+            v = item.get("voice") or {}
+            cached = os.path.join(voice_cache_dir(), f"room-{re.sub(r'[^A-Za-z0-9_-]', '', str(item.get('message_id')))}.mp3")
+            row["voice"] = {"path": cached if os.path.isfile(cached) else "", "duration": float(v.get("duration") or 0), "voicemail": False,
+                            "server_id": item.get("message_id"), "stored": bool(v.get("stored"))}
+        if row["sender"] == self.user or float(row["sent_at"]) <= self._my_read_at():
+            row["read_sent"] = True
+        return row
+    def _my_read_at(self):
+        me = next((m for m in self.members if str(m["username"]).lower() == str(self.user).lower()), None)
+        return max(float((me or {}).get("last_read_at") or 0), self._last_read_sent_at)
+    def apply_open(self, msg):
+        self.room = dict(msg.get("room") or self.room)
+        self.members = list(msg.get("members") or [])
+        self.bans = list(msg.get("bans") or [])
+        first = not self._room_loaded
+        self._room_loaded = True
+        self._hist_state["pending"] = False
+        self._hist_state["loaded"] = True
+        if first:
+            self._hist_state["has_more"] = bool(msg.get("has_more"))
+            self.btn_earlier.Show(self._hist_state["has_more"])
+            self.msg_page.Layout()
+            self._merge_room_messages(msg.get("messages") or [], older=False)
+        if self.window:
+            self.window.refresh_chat_label(self)
+        self.members_page.show()
+        self.refresh_all_rows()
+    def apply_members(self, members):
+        self.members = list(members or [])
+        me = next((m for m in self.members if str(m["username"]).lower() == str(self.user).lower()), None)
+        if me:
+            self.room["role"] = me.get("role", self.room.get("role"))
+        self.members_page.show()
+        self.refresh_all_rows()
+    def apply_room_history(self, msg):
+        self._hist_state["pending"] = False
+        self._hist_state["has_more"] = bool(msg.get("has_more"))
+        self.btn_earlier.Show(self._hist_state["has_more"])
+        self.msg_page.Layout()
+        added = self._merge_room_messages(msg.get("messages") or [], older=True)
+        if getattr(self, "_bulk", None):
+            self._bulk_page_arrived()
+        elif added:
+            self.hist.SetSelection(max(0, added - 1))
+            speak_text(f"Loaded {added} earlier message{'s' if added != 1 else ''}", interrupt=True)
+        else:
+            speak_text("No earlier messages", interrupt=True)
+    def _merge_room_messages(self, items, older):
+        items = [i for i in items if i.get("message_id") not in self._known_ids]
+        sel = self.hist.GetSelection()
+        was_at_end = sel == wx.NOT_FOUND or sel >= self.hist.GetCount() - 1
+        selected_row = self._history_rows[sel] if 0 <= sel < len(self._history_rows) else None
+        for item in items:
+            row = self._room_row(item)
+            pos = len(self._history_rows)
+            while pos > 0 and self._history_rows[pos - 1].get("epoch", 0) > row["epoch"]:
+                pos -= 1
+            self._history_rows.insert(pos, row)
+            self.hist.Insert(self._row_display(row), pos)
+            self._known_ids.add(row["id"])
+        if items:
+            self._prefetch_link_titles()
+        if not older and was_at_end and self.hist.GetCount():
+            self.hist.SetSelection(self.hist.GetCount() - 1)
+        elif selected_row in self._history_rows and (not older or getattr(self, "_bulk", None)):
+            self.hist.SetSelection(self._history_rows.index(selected_row))
+        return len(items)
+    # --- live messages --------------------------------------------------------------------------------------
+    def on_room_message(self, item):
+        if item.get("message_id") in self._known_ids:
+            return
+        cid = item.get("client_id")
+        if cid and item.get("sender") == self.user:
+            for i, r in enumerate(self._history_rows):
+                if r.get("client_id") == cid and not r.get("id"):
+                    r.update(id=item["message_id"], sent_at=float(item.get("sent_at") or 0), epoch=float(item.get("sent_at") or 0), read_sent=True)
+                    self._known_ids.add(item["message_id"])
+                    self._refresh_row_display(i)
+                    return
+        row = self._room_row(item)
+        app = wx.GetApp()
+        self._history_rows.append(row)
+        self.hist.Append(self._row_display(row))
+        self._known_ids.add(row["id"])
+        if self.hist.GetSelection() in (wx.NOT_FOUND, self.hist.GetCount() - 2) or wx.Window.FindFocus() is not self.hist:
+            self.hist.SetSelection(self.hist.GetCount() - 1)
+        if find_links(row["text"]):
+            self._prefetch_link_titles()
+        mentioned = str(self.user).lower() in {m.lower() for m in row.get("mentions") or []}
+        if row["sender"] != self.user:
+            label = self.frame.format_user_label(row["sender"])
+            if mentioned:
+                app.play_sound("receive.wav")
+                speak_text(f"{label} mentioned you in {self.room.get('name')}: {row['text']}", interrupt=False)
+            elif self.is_active_chat() and app.user_config.get('read_messages_aloud', False):
+                speak_text(f"{label} says {row['text']}")
+            elif not self.is_active_chat():
+                self.mark_tab_unread()
+            if self.is_active_chat():
+                self.mark_newest_read_if_active()
+        if self._is_logging_enabled_now():
+            display, _ = self._build_message_display(row["text"], row["sender"], row["time"])
+            self._save_message_to_log(display + "\n")
+    def on_room_file(self, msg):
+        item = msg.get("message") or {}
+        self.on_room_message(item)
+        if item.get("sender") == self.user:
+            return
+        try:
+            save_dir = os.path.join(os.path.expanduser("~"), "Documents", "ThriveMessenger", "room-files")
+            os.makedirs(save_dir, exist_ok=True)
+            stem, ext = os.path.splitext(os.path.basename(item.get("filename") or "room-file"))
+            path, n = os.path.join(save_dir, stem + ext), 1
+            while os.path.exists(path):
+                path, n = os.path.join(save_dir, f"{stem}_{n}{ext}"), n + 1
+            with open(path, "wb") as fh:
+                fh.write(base64.b64decode(msg.get("data", "")))
+            for r in self._history_rows:
+                if r.get("id") == item.get("message_id"):
+                    r["files"] = [path]
+            speak_text(f"{self.frame.format_user_label(item.get('sender'))} shared {os.path.basename(path)} in {self.room.get('name')}. "
+                       "It's saved in Documents, Thrive Messenger, room files.", interrupt=False)
+        except Exception as e:
+            speak_text(f"A room file couldn't be saved: {e}", interrupt=False)
+    def on_send(self, _):
+        txt = self.input_ctrl.GetValue().strip()
+        if not txt:
+            return
+        self._send_stop_typing()
+        if self._editing_message_id:
+            self._send_message_edit(txt)
+            return
+        client_id = uuid.uuid4().hex
+        if not self.room_send({"action": "group_room_message", "body": txt, "client_id": client_id}):
+            return
+        self.append(txt, self.user, time.time(), client_id=client_id)
+        wx.GetApp().play_sound("send.wav")
+        self.input_ctrl.Clear()
+        self.input_ctrl.SetFocus()
+    def on_send_file(self, _):
+        with wx.FileDialog(self, "Share a file in this room", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() != wx.ID_OK:
+                return
+            path = dlg.GetPath()
+        if os.path.getsize(path) > 10 * 1024 * 1024:
+            speak_text("That file is too big to share in a room. The limit is 10 megabytes.", interrupt=True)
+            return
+        with open(path, "rb") as fh:
+            data = base64.b64encode(fh.read()).decode("ascii")
+        if self.room_send({"action": "group_room_file", "filename": os.path.basename(path), "data": data}):
+            speak_text(f"Sharing {os.path.basename(path)}", interrupt=True)
+    def on_place_call(self, _):
+        speak_text("Calls aren't available in rooms yet.", interrupt=True)
+    def _send_voice(self, path, wav, seconds, voicemail):
+        client_id = uuid.uuid4().hex
+        if not self.room_send({"action": "group_room_message", "client_id": client_id,
+                               "voice": {"b64": base64.b64encode(wav).decode("ascii"), "mime": "audio/wav"}}):
+            return
+        self.append(f"Voice message ({format_seconds(seconds)})", self.user, time.time(), client_id=client_id,
+                    voice={"path": path, "duration": seconds, "voicemail": False})
+        wx.GetApp().play_sound("voice_message_send.wav")
+        speak_text("Voice message sent", interrupt=False)
+    def fetch_voice(self, row):
+        v = row.get("voice") or {}
+        if not v.get("server_id") or not v.get("stored"):
+            speak_text("This voice message isn't available any more.", interrupt=True)
+            return
+        self._pending_voice_row = row
+        if self.room_send({"action": "group_room_voice_fetch", "message_id": v["server_id"]}):
+            speak_text("Getting the voice message", interrupt=True)
+    def on_room_voice_data(self, msg):
+        row = getattr(self, "_pending_voice_row", None)
+        if not row or (row.get("voice") or {}).get("server_id") != msg.get("message_id"):
+            return
+        self._pending_voice_row = None
+        if not msg.get("ok") or not msg.get("b64"):
+            speak_text("This voice message isn't available any more.", interrupt=True)
+            return
+        os.makedirs(voice_cache_dir(), exist_ok=True)
+        path = os.path.join(voice_cache_dir(), f"room-{re.sub(r'[^A-Za-z0-9_-]', '', str(msg.get('message_id')))}.mp3")
+        with open(path, "wb") as fh:
+            fh.write(base64.b64decode(msg["b64"]))
+        row["voice"]["path"] = path
+        row["files"] = [path]
+        self._play_voice_row(row)
+    # --- typing -------------------------------------------------------------------------------------------------
+    def on_input_text(self, event):
+        if wx.GetApp().user_config.get('typing_indicators', True):
+            txt = self.input_ctrl.GetValue().strip()
+            if txt and not self._sent_typing:
+                self._sent_typing = self.room_send({"action": "group_room_typing", "typing": True})
+            if txt:
+                self._typing_timer.Start(TYPING_IDLE_STOP_MS, oneShot=True)
+            elif self._sent_typing:
+                self._send_stop_typing()
+        event.Skip()
+    def _send_stop_typing(self):
+        if self._sent_typing:
+            try:
+                self.sock.sendall((json.dumps({"action": "group_room_typing", "room_id": self.room_id, "typing": False}) + "\n").encode())
+            except Exception:
+                pass
+        self._sent_typing = False
+    def apply_room_typing(self, username, typing):
+        if str(username).lower() != str(self.user).lower():
+            self.set_typing_label(username, typing)
+    # --- read receipts in rooms -----------------------------------------------------------------------------
+    def _send_read(self, upto):
+        if not self._receipts_on():
+            return
+        target = None
+        for row in self._history_rows[:upto + 1]:
+            if row.get("sender") not in (self.user, "System") and row.get("id") and row.get("sent_at"):
+                row["read_sent"] = True
+                target = row
+        if target and float(target["sent_at"]) > self._last_read_sent_at:
+            self._last_read_sent_at = float(target["sent_at"])
+            self.room_send({"action": "group_room_read", "message_id": target["id"]})
+    def _read_count(self, row):
+        others = [m for m in self.members if str(m["username"]).lower() != str(row.get("sender")).lower()]
+        return sum(1 for m in others if float(m.get("last_read_at") or 0) >= float(row.get("sent_at") or 0)), len(others)
+    def _status_suffix(self, row):
+        if not self._receipts_on() or row.get("sender") != self.user or row.get("error") or not row.get("id"):
+            return ""
+        n, total = self._read_count(row)
+        if total <= 0:
+            return ""
+        if n == 0:
+            return ", sent"
+        return ", read by everyone" if n >= total else f", read by {n} of {total}"
+    def apply_room_read(self, username, read_at):
+        for m in self.members:
+            if str(m["username"]).lower() == str(username).lower():
+                m["last_read_at"] = max(float(m.get("last_read_at") or 0), float(read_at or 0))
+        self.refresh_all_rows()
+        self.members_page.show()
+        own = [r for r in self._history_rows if r.get("sender") == self.user and r.get("id")]
+        if own and self._receipts_on():
+            n, total = self._read_count(own[-1])
+            if total and n >= total and self._announced_all_read != own[-1]["id"]:
+                self._announced_all_read = own[-1]["id"]
+                wx.GetApp().play_sound("message_read.wav")
+                speak_text(f"Read by everyone in {self.room.get('name')}", interrupt=False)
+    # --- edit, delete, links ----------------------------------------------------------------------------------
+    def _can_edit_row(self, row):
+        if row.get("error") or not row.get("id") or row.get("sender") in ("System", "", None):
+            return False
+        return row.get("sender") == self.user or self._my_rank() >= ROOM_ROLE_RANK["moderator"]
+    def _can_delete_for_everyone(self, row):
+        return self._can_edit_row(row)
+    def _can_remove_links_for_everyone(self, item):
+        return bool(item.get("id")) and (str(item.get("sender") or "").lower() == str(self.user).lower()
+                                         or self._my_rank() >= ROOM_ROLE_RANK["moderator"])
+    def _send_link_removal(self, by_id):
+        return self.room_send({"action": "group_room_remove_links", "items": [{"message_id": k, "raw": v} for k, v in by_id.items()]})
+    def _server_links(self, scope, callback):
+        if scope == "conversation":
+            self._with_full_history(lambda: callback(None))
+        else:
+            ChatPanel._server_links(self, scope, callback)
+    def show_links_list(self, scope, pick_to_remove=False):
+        if scope == "conversation":
+            where = f"in the {self.room.get('name')} room"
+            heading = f"Choose a link to remove {where}" if pick_to_remove else f"Links {where}"
+            self._with_full_history(lambda: LinksListDialog(self, heading, self._link_items_from_rows(self._history_rows), pick_to_remove))
+        else:
+            ChatPanel.show_links_list(self, scope, pick_to_remove)
+    def _send_message_edit(self, txt):
+        msg_id = self._editing_message_id
+        if not self.room_send({"action": "group_room_edit", "message_id": msg_id, "body": txt}):
+            return
+        self._editing_message_id = None
+        self.typing_lbl.SetLabel("")
+        self.input_ctrl.Clear()
+        self.input_ctrl.SetFocus()
+    def on_remove_selected_message(self, _):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        row = self._history_rows[idx]
+        if self._can_delete_for_everyone(row):
+            if wx.MessageBox("Delete this message for everyone in the room? This can't be undone.", "Delete Message",
+                             wx.YES_NO | wx.NO_DEFAULT | wx.ICON_QUESTION, self) != wx.YES:
+                self.hist.SetFocus()
+                return
+            self.room_send({"action": "group_room_delete", "message_id": row["id"]})
+            self._delete_row_locally(idx, allow_undo=False)
+            return
+        self._delete_row_locally(idx, allow_undo=True)
+        speak_text("Removed from this device only. Only the sender or a room moderator can delete it for everyone.", interrupt=True)
+    def apply_room_edited(self, item, by=None):
+        mid = item.get("message_id")
+        idx = self._row_index_for_id(mid)
+        if idx is None:
+            return
+        row = self._history_rows[idx]
+        row["text"] = "(message deleted)" if item.get("deleted") else item.get("body", "")
+        row["edited"] = True
+        self._refresh_row_display(idx)
+        if by and str(by).lower() != str(self.user).lower() and self.is_chat_visible():
+            label = self.frame.format_user_label(by)
+            speak_text(f"{label} removed a link" if item.get("links_removed") else f"{label} edited a message", interrupt=False)
+    def room_event(self, msg):
+        """Joins, leaves, moderation and topic changes: shown as a System line and spoken when this room is open."""
+        ev, who, by = msg.get("event"), msg.get("username", ""), msg.get("by", "")
+        me = str(who).lower() == str(self.user).lower()
+        whos = "You" if me else self.frame.format_user_label(who)
+        bys = self.frame.format_user_label(by) if by else ""
+        text = {
+            "joined": f"{whos} joined the room.",
+            "left": f"{whos} left the room.",
+            "kicked": f"{whos} {'were' if me else 'was'} removed from the room by {bys}.",
+            "banned": f"{whos} {'were' if me else 'was'} banned from the room by {bys}." + (f" Reason: {msg['reason']}" if msg.get("reason") else ""),
+            "unbanned": f"{whos} can join the room again.",
+            "muted": f"{whos} {'are' if me else 'is'} muted for {msg.get('minutes')} minutes by {bys}.",
+            "unmuted": f"{whos} can post again.",
+            "topic": f"{bys} changed the topic: {(msg.get('room') or {}).get('topic') or 'no topic'}",
+            "updated": f"{bys} changed the room settings.",
+            "deleted": f"{bys} deleted this room.",
+        }.get(ev)
+        if msg.get("room"):
+            role = self.room.get("role")
+            self.room.update(msg["room"])
+            self.room["role"] = role
+            self.members_page.show()
+        if text:
+            self.append(text, "System", time.time(), announce=False)
+            if self.is_chat_visible():
+                speak_text(text, interrupt=False)
+        gone = (me and ev in ("kicked", "banned", "left")) or ev == "deleted"
+        if gone:
+            self.input_ctrl.Enable(False)
+        elif ev in ("joined", "left", "kicked", "banned", "unbanned", "muted", "unmuted"):
+            self.room_send({"action": "group_room_open", "limit": 1})  # refresh members (and bans, for moderators)
 
 CHAT_TAB_KEYS_HELP = ("Ctrl+Tab and Ctrl+Shift+Tab switch conversations, Ctrl+1 to Ctrl+9 jump to one (Ctrl+9 is the last), "
                       "Ctrl+W or Ctrl+F4 closes the current one, Ctrl+0 goes to the contact list, "
