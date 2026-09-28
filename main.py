@@ -9246,6 +9246,35 @@ class MessageJumpDialog(wx.Dialog):
             self.choice = n
             self.EndModal(wx.ID_OK)
 
+def focus_tab_strip(book):
+    """Put keyboard focus on the tabs themselves. wx's SetFocus on a notebook moves focus into the current page."""
+    if not book:
+        return
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.user32.SetFocus(book.GetHandle())
+            return
+        except Exception:
+            pass
+    if hasattr(book, "SetFocusIgnoringChildren"):
+        book.SetFocusIgnoringChildren()
+    else:
+        book.SetFocus()
+
+def tab_strip_has_focus(book):
+    if not book:
+        return False
+    if wx.Window.FindFocus() is book:
+        return True
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            return ctypes.windll.user32.GetFocus() == book.GetHandle()
+        except Exception:
+            pass
+    return False
+
 class ChatPanel(wx.Panel):
     """One conversation. Lives in a ChatWindow: as a tab (tabbed mode) or as the only content (classic mode)."""
     def __init__(self, frame, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None, can_call=False, show_call=False, wx_parent=None):
@@ -9511,11 +9540,11 @@ class ChatPanel(wx.Panel):
         self.show_inner_tab((self.inner.GetSelection() + step) % count)
     def on_inner_tab_changing(self, event):
         if event.GetEventObject() is self.inner:
-            self._tabs_had_focus = wx.Window.FindFocus() is self.inner
+            self._tabs_had_focus = tab_strip_has_focus(self.inner)
         event.Skip()
     def on_inner_tab_changed(self, event):
         if event.GetEventObject() is self.inner:
-            on_strip = getattr(self, "_tabs_had_focus", False) or wx.Window.FindFocus() is self.inner
+            on_strip = getattr(self, "_tabs_had_focus", False) or tab_strip_has_focus(self.inner)
             self._tabs_had_focus = False
             if on_strip:
                 # Arrowing along the tab strip only selects tabs: focus stays on the tabs and the screen reader
@@ -9524,7 +9553,7 @@ class ChatPanel(wx.Panel):
                 if hasattr(page, "refresh"):
                     page.refresh()
                 # Windows hands focus to the new page; put it back on the tabs.
-                wx.CallAfter(lambda: self and self.inner.SetFocus())
+                wx.CallAfter(lambda: self and focus_tab_strip(self.inner))
             else:
                 self._after_inner_switch(self.inner.GetSelection())
         event.Skip()
@@ -9625,7 +9654,13 @@ class ChatPanel(wx.Panel):
                 else:
                     self._handle_enter_action()
                 return
-            event.Skip()  # Enter on a message, a list or a button keeps its normal meaning
+            if focused is self.hist and not event.HasAnyModifiers():
+                self.on_history_item_activated(event)  # Enter on a message: open its link, or read it in full
+                return
+            if tab_strip_has_focus(self.inner) and not event.HasAnyModifiers():
+                self.on_inner_tabs_key(event)  # Enter on the tabs moves into the page
+                return
+            event.Skip()  # Enter on a list or a button keeps its normal meaning
             return
         elif event.ControlDown() and event.GetKeyCode() == ord('L'):
             self.on_place_call(None)
@@ -11703,7 +11738,7 @@ class ChatWindow(wx.Frame):
         self.notebook.SetSelection(idx)
     def _on_tabs_changing(self, event):
         if event.GetEventObject() is self.notebook:
-            self._strip_had_focus = wx.Window.FindFocus() is self.notebook
+            self._strip_had_focus = tab_strip_has_focus(self.notebook)
         event.Skip()
     def _on_tabs_key(self, event):
         cur = self.current_chat()
@@ -11716,10 +11751,10 @@ class ChatWindow(wx.Frame):
         announce = self._announce_switch
         self._announce_switch = False
         if cur and self.IsActive():
-            on_strip = getattr(self, "_strip_had_focus", False) or wx.Window.FindFocus() is self.notebook
+            on_strip = getattr(self, "_strip_had_focus", False) or tab_strip_has_focus(self.notebook)
             self._strip_had_focus = False
             if on_strip:
-                wx.CallAfter(lambda: self and self.notebook.SetFocus())
+                wx.CallAfter(lambda: self and focus_tab_strip(self.notebook))
             if announce and not on_strip:
                 # Say the tab name first; clearing unread afterwards keeps the count in the announcement.
                 self._announce_current()
