@@ -42,14 +42,30 @@ URLs:
 - Privacy policy: https://im.tappedin.fm/thrive-messenger/privacy/
 - Privacy choices: https://im.tappedin.fm/thrive-messenger/privacy-choices/
 - Terms: https://im.tappedin.fm/thrive-messenger/terms/
+- Account deletion: https://im.tappedin.fm/thrive-messenger/account-deletion/
+
+TestFlight contact:
+
+- Feedback and review email: feedback@tappedin.fm
+- Phone: use the established TappedIn review-contact number stored in App Store Connect.
 
 ## Review notes
 
 Thrive Messenger is a client for compatible Thrive Messenger servers. The default server is `im.tappedin.fm` on TLS port 2005. Accounts, room permissions, moderation, retention, file limits, and optional features are controlled by the connected server.
 
+Testers may add and sign in to an existing compatible Thrive Messenger server that they use or administer. Testers who do not already have access to a server are welcome to use the TappedIn test service. They may also contact us through the support methods listed for this testing version to request a hosted Thrive Messenger server that we can configure for them to administer. Server hosting and configuration are optional; the client can connect to compatible independently hosted servers.
+
 This build is free and has no advertising, in-app purchases, subscriptions, or external purchase links. It does not use third-party analytics or advertising SDKs. Voice audio is sent only while a user is in an active direct or group call. The default TappedIn server relays call audio to current participants and does not intentionally retain call audio. Self-hosted server operators publish and control their own policies.
 
 Provide a dedicated App Review username and password before submission. The account must be able to sign in, view contacts, join a test room, send a direct and room message, and enter a voice room. Do not place review credentials in public source control.
+
+## TestFlight beta description
+
+Thrive Messenger is an accessible client for direct messaging, group rooms, file sharing, moderation, and voice conversations on compatible Thrive Messenger servers.
+
+To test the app, add and sign in to an existing Thrive Messenger server that you use or administer. If you do not have a server, you are welcome to use our TappedIn test service. You may also contact us through the support methods provided for this beta to request a hosted Thrive Messenger server. We can configure the hosted server so you can administer it and test server-management features. Using a hosted server is optional; Thrive Messenger also supports compatible independently hosted servers.
+
+When reporting feedback, include the app version, iOS or iPadOS version, server hostname, the action you were performing, and the exact accessible error wording. Do not include passwords, passkeys, private keys, or complete authentication tokens.
 
 Original project: https://github.com/G4p-Studios/ThriveMessenger
 Original developer site: https://galaxy4productions.com
@@ -86,4 +102,5 @@ For all categories: not used for third-party advertising, developer advertising,
 - Screenshots captured from the final UI without private account data.
 - App Store Connect build reaches `VALID`.
 - Privacy questionnaire reviewed against the live default-server retention configuration.
+- In-app account deletion verified against the default server, including confirmation, session/passkey revocation, and unlinking locally stored SSO identities without deleting external provider accounts.
 - EU DSA trader status verified by the Account Holder/Admin using real display contact information and supporting documentation.

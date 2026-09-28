@@ -153,6 +153,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 *   Bot Rules Manager is available from File menu, Settings > Administration, and Server Side Commands. Admins can load, edit, and reset bot rules without editing files manually.
 *   Directory can optionally allow direct messaging users on other configured servers. If duplicate usernames exist across servers, the client lets you choose which server user to message and remembers that default.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
+*   Settings includes a destructive **Delete Account from This Server** action. The user must type their username and approve a final confirmation. Successful deletion removes the server account, revokes Thrive credentials and other sessions, and unlinks locally stored SSO identities; it does not delete external Mastodon, WordPress, or other provider accounts.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
 * Alt P will check for updates to the program and allow you to auto download them.

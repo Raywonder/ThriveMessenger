@@ -13,7 +13,40 @@ struct LoginView: View {
 
 struct ContactsView: View {
     @Bindable var session: ThriveSession
-    var body: some View { List(session.contacts) { contact in NavigationLink { DirectChatView(session: session, contact: contact.name) } label: { Label(contact.name, systemImage: contact.online ? "circle.fill" : "circle").accessibilityLabel("\(contact.name), \(contact.online ? "online" : "offline")") } }.navigationTitle("Contacts").overlay { if session.contacts.isEmpty { ContentUnavailableView("No Contacts", systemImage: "person.2") } } }
+    private var contactsByLetter: [(letter: String, contacts: [Contact])] {
+        Dictionary(grouping: session.contacts) { contact in
+            guard let first = contact.name.trimmingCharacters(in: .whitespacesAndNewlines).first else { return "#" }
+            let letter = String(first).uppercased()
+            return letter.rangeOfCharacter(from: .letters) == nil ? "#" : letter
+        }
+        .map { (letter: $0.key, contacts: $0.value.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }) }
+        .sorted { lhs, rhs in
+            if lhs.letter == "#" { return false }
+            if rhs.letter == "#" { return true }
+            return lhs.letter.localizedCaseInsensitiveCompare(rhs.letter) == .orderedAscending
+        }
+    }
+
+    var body: some View {
+        List {
+            ForEach(contactsByLetter, id: \.letter) { section in
+                Section {
+                    ForEach(section.contacts) { contact in
+                        NavigationLink { DirectChatView(session: session, contact: contact.name) } label: {
+                            Label(contact.name, systemImage: contact.online ? "circle.fill" : "circle")
+                                .accessibilityLabel("\(contact.name), \(contact.online ? "online" : "offline")")
+                        }
+                    }
+                } header: {
+                    Text(section.letter)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityLabel("Contacts beginning with \(section.letter)")
+                }
+            }
+        }
+        .navigationTitle("Contacts")
+        .overlay { if session.contacts.isEmpty { ContentUnavailableView("No Contacts", systemImage: "person.2") } }
+    }
 }
 
 struct DirectChatView: View {
@@ -58,7 +91,9 @@ struct MessageList: View {
 
 struct SettingsView: View {
     @Bindable var session: ThriveSession
-    var body: some View { Form { Section("Connected Server") { LabeledContent("Host", value: session.host); LabeledContent("Port", value: String(session.port)) }; Section { Button("Sign Out", role: .destructive) { session.disconnect() } }; Section("About") { LabeledContent("Version", value: "15.10.0"); Link("Thrive Messenger website", destination: URL(string: "https://im.tappedin.fm/thrive-messenger/")!); Link("Privacy Policy", destination: URL(string: "https://im.tappedin.fm/thrive-messenger/privacy/")!); Link("Support", destination: URL(string: "https://im.tappedin.fm/thrive-messenger/support/")!); Link("Original project by G4p Studios", destination: URL(string: "https://galaxy4productions.com")!); Link("Open-source project", destination: URL(string: "https://github.com/G4p-Studios/ThriveMessenger")!) }; Section { Text("This TappedIn distribution is based on the original open-source Thrive Messenger project and includes additional server, group, voice, administration, update, and platform work.").font(.footnote).foregroundStyle(.secondary) } }.navigationTitle("Settings") }
+    @State private var showingDeleteConfirmation = false
+    @State private var deletionConfirmation = ""
+    var body: some View { Form { Section("Connected Server") { LabeledContent("Host", value: session.host); LabeledContent("Port", value: String(session.port)) }; Section { Button("Sign Out", role: .destructive) { session.disconnect() } }; Section("Authenticated Devices") { LabeledContent("Signed-in locations", value: String(session.authenticatedDevices.count)); Picker("Keep new authentication for", selection: $session.sessionDuration) { Text("One hour").tag("hour"); Text("One day").tag("day"); Text("One week").tag("week"); Text("One month").tag("month"); Text("One year").tag("year"); Text("Forever").tag("forever") }; ForEach(session.authenticatedDevices) { device in VStack(alignment: .leading) { Text(device.name + (device.current ? " (This device)" : "")); Text("\(device.platform) — authenticated \(device.authenticatedAt) — expires \(device.expiresAt ?? "never")").font(.caption).foregroundStyle(.secondary); Button("Sign Out \(device.name)", role: .destructive) { Task { await session.deauthenticate(device) } } }.accessibilityElement(children: .contain) }; Button("Refresh Devices") { Task { await session.refreshAuthenticatedDevices() } } }; Section("Account") { Button("Delete Account", role: .destructive) { deletionConfirmation = ""; showingDeleteConfirmation = true }.accessibilityHint("Permanently deletes this account from the connected Thrive server after confirmation") }; Section("About") { LabeledContent("Version", value: "15.10.0"); Link("Thrive Messenger website", destination: URL(string: "https://tappedin.fm/thrive-messenger/")!); Link("Privacy Policy", destination: URL(string: "https://tappedin.fm/thrive-messenger/privacy/")!); Link("Support", destination: URL(string: "https://tappedin.fm/thrive-messenger/support/")!); Link("Original project by G4p Studios", destination: URL(string: "https://galaxy4productions.com")!); Link("Open-source project", destination: URL(string: "https://github.com/G4p-Studios/ThriveMessenger")!) }; Section { Text("This TappedIn distribution is based on the original open-source Thrive Messenger project and includes additional server, group, voice, administration, update, and platform work.").font(.footnote).foregroundStyle(.secondary) } }.navigationTitle("Settings").task { await session.refreshAuthenticatedDevices() }.alert("Permanently Delete Account?", isPresented: $showingDeleteConfirmation) { TextField("Type your username", text: $deletionConfirmation).textInputAutocapitalization(.never).autocorrectionDisabled(); Button("Cancel", role: .cancel) {}; Button("Delete Account", role: .destructive) { Task { await session.deleteAccount(confirming: deletionConfirmation) } }.disabled(deletionConfirmation.caseInsensitiveCompare(session.username) != .orderedSame) } message: { Text("This permanently deletes your account and associated Thrive data from \(session.host), revokes signed-in devices, and unlinks connected identities such as Mastodon or WordPress. It does not delete those external accounts. Type \(session.username) to confirm.") } }
 }
 
 struct ActiveCallView: View {
