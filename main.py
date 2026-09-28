@@ -11747,6 +11747,10 @@ class ChatWindow(wx.Frame):
             return
         event.Skip()
     def on_page_changed(self, event):
+        if event.GetEventObject() is not self.notebook:
+            # A conversation's own tabs (Messages, Chat Archive, File Transfers) bubble up here too; they're not a chat switch.
+            event.Skip()
+            return
         cur = self.current_chat()
         announce = self._announce_switch
         self._announce_switch = False
