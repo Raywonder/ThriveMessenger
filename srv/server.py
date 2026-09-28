@@ -2,6 +2,8 @@ import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, u
 import smtplib, secrets
 import re
 import urllib.request, urllib.parse
+import http.client
+import html as _html_lib
 from email.mime.text import MIMEText
 try:
     from argon2 import PasswordHasher
@@ -881,6 +883,296 @@ def _read_status(sender, other, since=None, limit=50):
     return [{"id": u, "time": (c or "") + "Z", "msg": (b or "")[:200], "delivered": bool(d),
              "delivered_at": (da + "Z") if da else None, "read": bool(r), "read_at": (r + "Z") if r else None}
             for u, c, b, d, da, r in rows]
+
+# --- links in messages ---------------------------------------------------------------------------------------
+# One link finder shared by the links list and link removal (the client uses the same rules).
+_LINK_SCHEME_RE = re.compile(r'(?:https?|ipfs|ipns|web3)://[^\s<>()"\']+', re.IGNORECASE)
+_LINK_BARE_RE = re.compile(r'(?<![\w@./:-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,63})(?::\d{1,5})?(?:/[^\s<>()"\']*)?)',
+                           re.IGNORECASE)
+# Bare names only count as links with www. or a familiar web ending, so "server.py" or "notes.txt" aren't links.
+_LINK_BARE_TLDS = {"com", "org", "net", "io", "fm", "cc", "app", "dev", "co", "uk", "us", "ca", "edu", "gov", "info", "me", "tv",
+                   "ai", "software", "blog", "xyz", "de", "au", "nz", "ie", "eu", "biz", "site", "online", "store", "tech", "news",
+                   "link", "live", "page", "social", "eth", "gg", "ly", "to", "be", "nl", "fr", "es", "it", "in", "jp"}
+_LINK_TRAIL = ".,;:!?'\""
+
+def _find_links(text):
+    """Links in message text, in order, without duplicates: [{"raw": text as written, "url": openable URL}]."""
+    text = str(text or "")
+    found, taken = [], []
+    for m in _LINK_SCHEME_RE.finditer(text):
+        raw = m.group(0).rstrip(_LINK_TRAIL)
+        if "://" in raw and raw.split("://", 1)[1]:
+            found.append((m.start(), raw, raw)); taken.append((m.start(), m.start() + len(raw)))
+    for m in _LINK_BARE_RE.finditer(text):
+        start, raw = m.start(1), m.group(1).rstrip(_LINK_TRAIL)
+        if any(a <= start < b for a, b in taken):
+            continue
+        if raw.lower().startswith("www.") or m.group(2).lower() in _LINK_BARE_TLDS:
+            found.append((start, raw, "https://" + raw))
+    out, seen = [], set()
+    for _, raw, url in sorted(found):
+        if url.lower() not in seen:
+            seen.add(url.lower()); out.append({"raw": raw, "url": url})
+    return out
+
+LINK_TITLE_OK_TTL = 7 * 86400
+LINK_TITLE_FAIL_TTL = 86400
+LINK_TITLE_PORTS = {80, 443, 8080, 8443}
+LINK_TITLE_MAX_BYTES = 256 * 1024
+_link_fetch_slots = threading.BoundedSemaphore(4)
+_link_title_rate = {}
+
+def _link_public_ips(host, port):
+    """The host's addresses, but only if EVERY one is a public internet address; else [] (blocks SSRF and DNS tricks)."""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return []
+    ips = []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        except ValueError:
+            return []
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped:
+            ip = mapped
+        if (not ip.is_global or ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified):
+            return []
+        if str(ip) not in ips:
+            ips.append(str(ip))
+    return ips
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connects to the address we already checked, never re-resolving the name (no DNS rebinding)."""
+    def __init__(self, host, port, ip, timeout):
+        super().__init__(host, port, timeout=timeout)
+        self._pinned_ip = ip
+    def connect(self):
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, ip, timeout):
+        super().__init__(host, port, timeout=timeout, context=ssl.create_default_context())
+        self._pinned_ip = ip
+    def connect(self):
+        raw = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+def _parse_html_title(data, content_type=""):
+    m = re.search(r'charset=["\']?([\w-]+)', content_type or "", re.I)
+    charset = m.group(1) if m else None
+    if not charset:
+        m = re.search(rb'<meta[^>]+charset=["\']?([\w-]+)', data[:4096], re.I)
+        charset = m.group(1).decode("ascii", "ignore") if m else "utf-8"
+    try:
+        text = data.decode(charset, errors="replace")
+    except LookupError:
+        text = data.decode("utf-8", errors="replace")
+    title = ""
+    for pat in (r'<meta[^>]+property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:title',
+                r'<title[^>]*>(.*?)</title>'):
+        m = re.search(pat, text, re.I | re.S)
+        if m and m.group(1).strip():
+            title = m.group(1)
+            break
+    title = re.sub(r"\s+", " ", _html_lib.unescape(re.sub(r"<[^>]+>", "", title))).strip()
+    return title[:200]
+
+def _fetch_link_title(url, max_redirects=3, deadline_seconds=8.0):
+    """The page title for a public http(s) URL, or "" (private/odd addresses, errors, non-HTML, slow sites).
+    No cookies, no credentials, pinned public IPs, re-checked on every redirect, at most 256 KB read."""
+    deadline = time.time() + deadline_seconds
+    for _ in range(max_redirects + 1):
+        try:
+            parts = urllib.parse.urlsplit(url)
+            scheme = parts.scheme.lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return ""
+        if scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password or port not in LINK_TITLE_PORTS:
+            return ""
+        ips = _link_public_ips(parts.hostname, port)
+        remaining = deadline - time.time()
+        if not ips or remaining <= 0:
+            return ""
+        cls = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
+        conn = cls(parts.hostname, port, ips[0], timeout=min(5.0, remaining))
+        try:
+            path = (parts.path or "/") + (("?" + parts.query) if parts.query else "")
+            conn.request("GET", path, headers={"User-Agent": "ThriveMessenger-LinkTitles/1.0 (+https://im.tappedin.fm)",
+                                               "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+                                               "Accept-Language": "en", "Connection": "close"})
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                if not location:
+                    return ""
+                url = urllib.parse.urljoin(url, location)
+                continue
+            ctype = (resp.getheader("Content-Type") or "").lower()
+            if resp.status != 200 or "html" not in ctype:
+                return ""
+            data = b""
+            while len(data) < LINK_TITLE_MAX_BYTES and time.time() < deadline:
+                chunk = resp.read(16384)
+                if not chunk:
+                    break
+                data += chunk
+                if b"</title>" in data.lower() and b"og:title" not in data.lower() and len(data) > 32768:
+                    break
+            return _parse_html_title(data, ctype)
+        except Exception:
+            return ""
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return ""
+
+def _cached_link_titles(urls):
+    """(titles we already know, urls still to fetch)."""
+    known, missing = {}, []
+    now = time.time()
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        for u in urls:
+            row = con.execute("SELECT title, fetched_at FROM link_titles WHERE url=?", (u,)).fetchone()
+            ttl = LINK_TITLE_OK_TTL if row and row[0] else LINK_TITLE_FAIL_TTL
+            if row and now - float(row[1] or 0) < ttl:
+                known[u] = row[0] or ""
+            else:
+                missing.append(u)
+    finally:
+        con.close()
+    return known, missing
+
+def _store_link_title(url, title):
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        con.execute("INSERT OR REPLACE INTO link_titles (url, title, fetched_at) VALUES (?,?,?)", (url, title or "", time.time()))
+        con.commit()
+    finally:
+        con.close()
+
+def _link_titles_request(sock, user, urls, request_id=""):
+    """Answer with cached titles now-ish; fetch the rest in the background (a few at a time server-wide).
+    An empty title means "use the URL"."""
+    clean = []
+    for u in urls or []:
+        u = str(u or "").strip()
+        if u.lower().startswith(("http://", "https://")) and len(u) <= 2048 and u not in clean:
+            clean.append(u)
+    clean = clean[:25]
+    # At most 120 new fetches per user per 10 minutes.
+    window = int(time.time() // 600)
+    key = (str(user).lower(), window)
+    known, missing = _cached_link_titles(clean)
+    allowed = max(0, 120 - _link_title_rate.get(key, 0))
+    skipped, missing = missing[allowed:], missing[:allowed]
+    _link_title_rate[key] = _link_title_rate.get(key, 0) + len(missing)
+    for k in [k for k in _link_title_rate if k[1] != window]:
+        _link_title_rate.pop(k, None)
+    def reply(titles):
+        try:
+            _send_json_line(sock, {"action": "link_titles", "titles": titles, "request_id": str(request_id or "")[:64]})
+        except Exception:
+            pass
+    if not missing:
+        reply(dict(known, **{u: "" for u in skipped}))
+        return
+    def work():
+        titles = dict(known, **{u: "" for u in skipped})
+        for u in missing:
+            with _link_fetch_slots:
+                t = _fetch_link_title(u)
+            try:
+                _store_link_title(u, t)
+            except Exception:
+                pass
+            titles[u] = t
+        reply(titles)
+    threading.Thread(target=work, daemon=True).start()
+
+def _links_list(user, other=None, limit_messages=3000):
+    """Every link in `user`'s direct messages (optionally only with `other`), newest first."""
+    where = "deleted_at IS NULL AND (lower(frm)=lower(?) OR lower(to_user)=lower(?))"
+    params = [user, user]
+    if other:
+        where += " AND (lower(frm)=lower(?) OR lower(to_user)=lower(?))"
+        params += [other, other]
+    where += " AND body LIKE '%.%'"
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        rows = con.execute(f"SELECT msg_uid, frm, to_user, created_at, body FROM direct_message_history WHERE {where} "
+                           "ORDER BY id DESC LIMIT ?", params + [int(limit_messages)]).fetchall()
+        items = []
+        for uid, frm, to, created, body in rows:
+            if not uid:
+                continue
+            for link in _find_links(body):
+                items.append({"id": uid, "from": frm, "to": to, "time": (created or "") + "Z",
+                              "url": link["url"], "raw": link["raw"]})
+                if len(items) >= 2000:
+                    break
+            if len(items) >= 2000:
+                break
+        urls = list({i["url"] for i in items})
+        titles = {}
+        for start in range(0, len(urls), 500):
+            chunk = urls[start:start + 500]
+            q = "SELECT url, title FROM link_titles WHERE url IN (%s)" % ",".join("?" * len(chunk))
+            titles.update({u: t for u, t in con.execute(q, chunk).fetchall() if t})
+    finally:
+        con.close()
+    for i in items:
+        i["title"] = titles.get(i["url"], "")
+    return items
+
+def _remove_links(actor, items):
+    """Take links out of messages for everyone: [{"id": msg_uid, "raw": [link text, ...] or omitted for all}].
+    Same rule as editing: only the sender or an admin. Each changed message goes out as msg_edited.
+    Returns (links removed, ids refused)."""
+    removed, denied, events = 0, [], []
+    now_iso = _iso_utc_now()
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        for item in list(items or [])[:500]:
+            uid = str((item or {}).get("id") or "").strip()
+            if not uid:
+                continue
+            row = con.execute("SELECT id, frm, to_user, body, deleted_at FROM direct_message_history WHERE msg_uid=? "
+                              "ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+            if not row or row[4]:
+                denied.append(uid)
+                continue
+            row_id, frm, to, body, _ = row
+            if str(frm or "").lower() != str(actor or "").lower() and not _is_admin(actor):
+                denied.append(uid)
+                continue
+            present = [l["raw"] for l in _find_links(body)]
+            wanted = item.get("raw")
+            if isinstance(wanted, str):
+                wanted = [wanted]
+            targets = [r for r in present if wanted is None or r in wanted]
+            if not targets:
+                continue
+            new_body = body
+            for raw in sorted(targets, key=len, reverse=True):
+                new_body = new_body.replace(raw, "[link removed]")
+            con.execute("UPDATE direct_message_history SET body=?, edited_at=?, edited_by=? WHERE id=?", (new_body, now_iso, actor, row_id))
+            removed += len(targets)
+            events.append(({frm, to, actor}, {"action": "msg_edited", "id": uid, "from": frm, "to": to, "msg": new_body,
+                                               "edited_by": actor, "edited_at": now_iso, "links_removed": len(targets)}))
+        con.commit()
+    finally:
+        con.close()
+    for users, event in events:
+        _send_to_all_sessions(users, event)
+    return removed, denied
 
 def _send_to_all_sessions(usernames, payload):
     """Send one event to every signed-in device of each user (names matched ignoring case)."""
@@ -3550,6 +3842,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
     cur.execute("CREATE TABLE IF NOT EXISTS pending_voicemail (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS pending_bot_messages (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS link_titles (url TEXT PRIMARY KEY, title TEXT, fetched_at REAL)")
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_message_cursors (
         bot TEXT NOT NULL,
         channel TEXT NOT NULL DEFAULT 'thrive',
@@ -6074,6 +6367,20 @@ def handle_client(cs, addr):
 
             elif action == "msg_read":
                 _mark_messages_read(user, msg.get("ids") or [])
+
+            elif action == "link_titles":
+                _link_titles_request(sock, user, msg.get("urls") or [], msg.get("request_id"))
+
+            elif action == "links_list":
+                other = str(msg.get("with") or "").strip()
+                other = (_canonical_username(other) or other) if other else None
+                _send_json_line(sock, {"action": "links_list", "with": other or "", "scope": str(msg.get("scope") or "")[:32],
+                                       "request_id": str(msg.get("request_id") or "")[:64], "items": _links_list(user, other)})
+
+            elif action == "msg_remove_links":
+                removed, denied = _remove_links(user, msg.get("items") or [])
+                _send_json_line(sock, {"action": "msg_remove_links_result", "removed": removed, "denied": denied,
+                                       "request_id": str(msg.get("request_id") or "")[:64]})
 
             elif action == "read_status":
                 other = _canonical_username(msg.get("with")) or str(msg.get("with") or "")
