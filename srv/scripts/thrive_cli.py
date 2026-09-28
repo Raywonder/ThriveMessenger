@@ -426,6 +426,26 @@ def split_message(text: str, max_chars: int) -> List[str]:
     return [f"Part {idx} of {total}: {chunk}" for idx, chunk in enumerate(chunks, start=1)]
 
 
+def cmd_read_status(args: argparse.Namespace) -> None:
+    """Delivered/read status of messages one user sent another (read from the local server database).
+    Agents use this before re-sending a reminder: if it's read, don't send it again."""
+    srv_dir = str(Path(__file__).resolve().parent.parent)
+    if srv_dir not in sys.path:
+        sys.path.insert(0, srv_dir)
+    import server as thrive_server
+    thrive_server.DB = str(args.db)
+    since = args.since
+    if args.minutes:
+        from datetime import timedelta
+        since = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=args.minutes)).isoformat()
+    rows = thrive_server._read_status(args.sender, args.to, since=since, limit=args.limit if not args.ids else 500)
+    if args.ids:
+        wanted = set(args.ids)
+        rows = [r for r in rows if r["id"] in wanted]
+    emit({"status": "ok", "from": args.sender, "to": args.to, "messages": rows,
+          "unread": sum(1 for r in rows if not r["read"])}, args.json)
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     message = args.message
     if message == "-":
@@ -694,6 +714,15 @@ def build_parser() -> argparse.ArgumentParser:
     contacts.add_argument("--mutual", action="store_true", help="Also add users as contacts for each bot.")
     contacts.add_argument("--bot-mesh-contacts", action="store_true", help="Add each bot as a contact for each other bot.")
     contacts.set_defaults(func=cmd_admin_link_bot_contacts)
+
+    rs = sub.add_parser("read-status", help="Show whether messages one user sent another were delivered and read.")
+    rs.add_argument("--from", dest="sender", required=True, help="Who sent the messages (e.g. SystemMonitor).")
+    rs.add_argument("--to", required=True, help="Who they were sent to (e.g. tappedinfm).")
+    rs.add_argument("--since", help="Only messages sent at or after this UTC time (ISO).")
+    rs.add_argument("--minutes", type=int, help="Only messages from the last N minutes.")
+    rs.add_argument("--limit", type=int, default=20, help="How many recent messages (default 20).")
+    rs.add_argument("--ids", nargs="*", default=[], help="Only these message ids.")
+    rs.set_defaults(func=cmd_read_status)
 
     send = sub.add_parser("send", help="Send a direct message.")
     add_login_args(send)

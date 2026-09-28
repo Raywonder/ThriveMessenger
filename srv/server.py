@@ -748,7 +748,7 @@ def _deliver_pending_bot_messages(sock, username):
                 delivered += 1
             con = sqlite3.connect(DB)
             con.execute("DELETE FROM pending_bot_messages WHERE msg_uid=?", (uid,))
-            con.execute("UPDATE direct_message_history SET delivered=1 WHERE msg_uid=?", (uid,))
+            con.execute("UPDATE direct_message_history SET delivered=1, delivered_at=COALESCE(delivered_at, ?) WHERE msg_uid=?", (_iso_utc_now(), uid))
             con.commit(); con.close()
         except Exception:
             break
@@ -769,7 +769,7 @@ def _deliver_pending_voicemail(sock, username):
                 _send_json_line(sock, payload)
             con = sqlite3.connect(DB)
             con.execute("DELETE FROM pending_voicemail WHERE msg_uid=?", (uid,))
-            con.execute("UPDATE direct_message_history SET delivered=1 WHERE msg_uid=?", (uid,))
+            con.execute("UPDATE direct_message_history SET delivered=1, delivered_at=COALESCE(delivered_at, ?) WHERE msg_uid=?", (_iso_utc_now(), uid))
             con.commit(); con.close()
         except Exception:
             break
@@ -778,10 +778,12 @@ HISTORY_DEFAULT_LIMIT = 200
 HISTORY_MAX_LIMIT = 1000
 
 def _history_item(row):
-    rowid, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path = row
+    rowid, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path = row[:8]
+    delivered, read_at = (row[8], row[9]) if len(row) > 9 else (0, None)
     item = {"seq": rowid, "id": msg_uid or f"h{rowid}", "from": frm, "to": to_user, "msg": body or "",
             "time": (created_at or "") + ("Z" if created_at and not str(created_at).endswith("Z") else ""),
-            "edited": bool(edited_at)}
+            "edited": bool(edited_at), "delivered": bool(delivered),
+            "read_at": (read_at + "Z") if read_at else None}
     label = re.match(r"^(Voice message|Voicemail) \((\d+):(\d\d)\)$", body or "")
     if label:
         item["voice"] = {"duration": int(label.group(2)) * 60 + int(label.group(3)),
@@ -802,7 +804,7 @@ def _history_query(user, other, before_seq=None, limit=HISTORY_DEFAULT_LIMIT, da
     con = sqlite3.connect(DB, timeout=10)
     try:
         rows = con.execute(
-            f"SELECT id, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path FROM direct_message_history "
+            f"SELECT id, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path, delivered, read_at FROM direct_message_history "
             f"WHERE {where} ORDER BY id DESC LIMIT ?", params + [limit + 1]).fetchall()
     finally:
         con.close()
@@ -838,6 +840,47 @@ def _voice_for_participant(user, msg_uid):
         return None
     with open(path, "rb") as fh:
         return base64.b64encode(fh.read()).decode("ascii")
+
+def _mark_messages_read(reader, ids):
+    """Mark messages sent TO `reader` as read (only the recipient can), then tell each sender's devices."""
+    ids = [str(i) for i in (ids or []) if i][:500]
+    if not ids:
+        return 0
+    now = _iso_utc_now()
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        q = "SELECT msg_uid, frm FROM direct_message_history WHERE msg_uid IN (%s) AND lower(to_user)=lower(?) AND read_at IS NULL AND deleted_at IS NULL" % ",".join("?" * len(ids))
+        rows = con.execute(q, ids + [reader]).fetchall()
+        for uid, _ in rows:
+            con.execute("UPDATE direct_message_history SET read_at=?, delivered=1, delivered_at=COALESCE(delivered_at, ?) WHERE msg_uid=?", (now, now, uid))
+        con.commit()
+    finally:
+        con.close()
+    by_sender = {}
+    for uid, frm in rows:
+        by_sender.setdefault(frm, []).append(uid)
+    for frm, uids in by_sender.items():
+        _send_to_all_sessions({frm}, {"action": "msg_read_update", "ids": uids, "by": reader, "read_at": now + "Z"})
+    if rows:
+        # The reader's other devices learn these are read too.
+        _send_to_all_sessions({reader}, {"action": "msg_read_sync", "ids": [u for u, _ in rows], "read_at": now + "Z"})
+    return len(rows)
+
+def _read_status(sender, other, since=None, limit=50):
+    """What `sender` sent to `other`, newest first, with delivered/read status (for agents deciding whether to resend)."""
+    where = "lower(frm)=lower(?) AND lower(to_user)=lower(?) AND deleted_at IS NULL"
+    params = [sender, other]
+    if since:
+        where += " AND created_at >= ?"; params.append(str(since).rstrip("Z"))
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        rows = con.execute(f"SELECT msg_uid, created_at, body, delivered, delivered_at, read_at FROM direct_message_history WHERE {where} "
+                           "ORDER BY id DESC LIMIT ?", params + [max(1, min(int(limit or 50), 500))]).fetchall()
+    finally:
+        con.close()
+    return [{"id": u, "time": (c or "") + "Z", "msg": (b or "")[:200], "delivered": bool(d),
+             "delivered_at": (da + "Z") if da else None, "read": bool(r), "read_at": (r + "Z") if r else None}
+            for u, c, b, d, da, r in rows]
 
 def _send_to_all_sessions(usernames, payload):
     """Send one event to every signed-in device of each user (names matched ignoring case)."""
@@ -1163,8 +1206,8 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
             """
             INSERT INTO direct_message_history(
                 frm, to_user, frm_canonical, to_canonical, body, source,
-                sensitivity, handled_by_bot, delivered, created_at, msg_uid, attachment_path
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                sensitivity, handled_by_bot, delivered, created_at, msg_uid, attachment_path, delivered_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 frm,
@@ -1179,6 +1222,7 @@ def _record_direct_message_history(frm, to, body, *, handled_by_bot=False, deliv
                 _iso_utc_now(),
                 str(msg_uid) if msg_uid else None,
                 attachment_path,
+                _iso_utc_now() if delivered else None,
             ),
         )
         con.commit()
@@ -2247,7 +2291,7 @@ class _BotVoiceText(object):
             return f"[{self.label}, transcribed] {transcript}"
         return f"[{self.label} that couldn't be transcribed. Ask them to type it instead.]"
 
-def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
+def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text, msg_uid=None):
     """Answer virtual-bot DMs off the socket thread so slow agent turns never block the sender."""
     if not _is_virtual_bot(to_user):
         return False
@@ -2257,6 +2301,9 @@ def _maybe_send_bot_reply(sender_sock, sender_user, to_user, text):
             _send_bot_event(sender_sock, sender_user, {"action": "typing", "from": to_user, "typing": True})
             try:
                 body = text.resolve() if isinstance(text, _BotVoiceText) else text
+                if msg_uid:
+                    # The bot's agent has picked it up; mark it read once the message row is saved.
+                    threading.Timer(1.0, _mark_messages_read, args=(to_user, [msg_uid])).start()
                 _run_bot_reply(sender_sock, sender_user, to_user, body)
             except Exception as e:
                 print(f"Bot reply worker failed for {to_user}: {e}")
@@ -3497,7 +3544,7 @@ def init_db():
         created_at TEXT NOT NULL
     )''')
     dmh_cols = [row[1] for row in cur.execute("PRAGMA table_info(direct_message_history)")]
-    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by", "attachment_path"):
+    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by", "attachment_path", "delivered_at", "read_at"):
         if col not in dmh_cols:
             cur.execute(f"ALTER TABLE direct_message_history ADD COLUMN {col} TEXT")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
@@ -5957,7 +6004,7 @@ def handle_client(cs, addr):
                     reason = f"Message couldn't be sent because {to} has you blocked."
                 elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
-                elif _maybe_send_bot_reply(sock, frm, to, bot_text):
+                elif _maybe_send_bot_reply(sock, frm, to, bot_text, msg_uid=msg["id"]):
                     handled_by_bot = True
                     delivered_to_user = True
                     reason = None
@@ -6008,7 +6055,8 @@ def handle_client(cs, addr):
                         _send_json_line(sock, {"action": "voicemail_saved", "to": to, "id": msg["id"]})
                     if client_msg_id:
                         try:
-                            _send_json_line(sock, {"action": "msg_sent", "id": msg["id"], "client_id": client_msg_id, "to": to})
+                            _send_json_line(sock, {"action": "msg_sent", "id": msg["id"], "client_id": client_msg_id, "to": to,
+                                                   "delivered": bool(delivered_to_user and not handled_by_bot)})
                         except Exception:
                             pass
                 if not reason:
@@ -6023,6 +6071,14 @@ def handle_client(cs, addr):
                             pass
                 if reason: 
                     sock.sendall(json.dumps({"action": "msg_failed", "to": to, "reason": reason}).encode() + b"\n")
+
+            elif action == "msg_read":
+                _mark_messages_read(user, msg.get("ids") or [])
+
+            elif action == "read_status":
+                other = _canonical_username(msg.get("with")) or str(msg.get("with") or "")
+                _send_json_line(sock, {"action": "read_status", "with": other, "request_id": str(msg.get("request_id") or "")[:64],
+                                       "messages": _read_status(user, other, since=msg.get("since"), limit=msg.get("limit"))})
 
             elif action in ("history_request", "history_days", "voice_fetch"):
                 other = _canonical_username(msg.get("with")) or str(msg.get("with") or "").strip()
