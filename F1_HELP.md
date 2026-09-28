@@ -6,6 +6,15 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.18
+- **Check for Updates is back** in the Help menu, with **Alt+P** from anywhere in the main window. On a Mac it's also in the Thrive Messenger menu. Thrive says "Checking for updates", then tells you either that you're up to date or that a new version is ready to install.
+- The message box hint now says what Enter really does: nothing by default, unless you set Enter to send in Settings.
+
+## Updates
+- Thrive checks for updates by itself when it starts.
+- To check now, choose **Help, Check for Updates…** or press **Alt+P**. On a Mac it's also in the **Thrive Messenger** menu.
+- If a new version is available, Thrive asks whether to download and install it, then restarts on the new version. If you're up to date, it says so.
+
 ## What's New in Alpha 15.17
 - **Links in chats:** a message says how many links it has. Left Arrow and Right Arrow move between them, and Enter opens one in a full view inside Thrive. Escape comes back. Link lists and link removal are in the message menu.
 - **Go to** (Control+G): jump to messages with links, from a person, your own, unread, by date, or by search. Alt+Left goes back.
@@ -150,6 +159,7 @@ Each conversation has three tabs:
 - `Escape`: Close dialogs/chat
 - `Enter`: in the contact list, open a chat with the selected contact. In the message box, it does what Settings, **Enter key action** says (Do nothing by default, or Send message).
 - `Alt+S`: send the message
+- `Alt+P`: Check for Updates (also in the Help menu)
 - `Shift+Enter`: New line in chat message box
 - `Ctrl+Enter`: send a file in a chat
 - `Alt` shortcuts in Contacts screen:
@@ -162,7 +172,7 @@ Each conversation has three tabs:
   - `Alt+Y` User Directory
   - `Alt+V` Server Commands (admin)
   - `Alt+T` Settings
-  - `Alt+P` Check Updates
+  - `Alt+P` Check for Updates
   - `Alt+O` Logout
   - `Alt+X` Exit
 - In a chat window:
@@ -191,6 +201,7 @@ Thrive for Mac has the same features. Where Windows uses Control, the Mac uses C
 - Go to a conversation: `Command+1` to `Command+9`. Close it: `Command+W`. Go to the contact list: `Command+0`.
 - Switch the inner tabs (Messages, Chat Archive, File Transfers): `Control+Page Down` / `Control+Page Up`, or `Command+Option+Right` / `Command+Option+Left`.
 - Insert emoji: `Command+E`. Record a voice message: `Command+R`. Leave a voicemail: `Command+Shift+R`.
+- Check for Updates: in the **Thrive Messenger** menu and the **Help** menu, or `Option+P`.
 - Go to: `Command+G`. First and last message: `Command+Home` and `Command+End`.
 - Shortcuts that use Alt on Windows use Option on a Mac, for example `Option+R` to react and `Option+Down` for the next message with a link.
 - On a message: `Command+C` copies, `Command+S` saves to Chat Archive, and `Command+Delete` deletes.

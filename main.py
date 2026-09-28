@@ -17,7 +17,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.17"
+VERSION_TAG = "v2026-alpha15.18"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -1014,7 +1014,7 @@ def ensure_help_docs():
         "general": "<h1>Thrive Messenger Help</h1><p>Press F1 in each window for contextual help. Press Escape or Command+W to close this help window and return.</p>",
         "login": "<h1>Login Help</h1><p>Use Server dropdown to pick a server. Use Manage Servers to add/edit endpoints. Use Set as Primary to choose your default server. Then enter username and password and sign in.</p><p>Server host supports normal DNS and Web3-style domains (including Freename/ENS/Unstoppable-style names).</p>",
         "main": "<h1>Contacts Window Help</h1><p>Manage contacts, statuses, files, and chats. Default action is Start Chat for the focused contact. User actions are available from User and context menus. File Transfers window shows sent/received files and their saved locations.</p>",
-        "chat": "<h1>Chat Window Help</h1><p>Enter sends message, Ctrl+Enter sends file, and Cmd+Enter inserts a new line. Message history is keyboard navigable and links can be activated from selected items. Typing indicators and readout can be toggled in Settings.</p>",
+        "chat": "<h1>Chat Window Help</h1><p>Alt+S sends the message. What Enter does is set in Settings (Enter key action: Do nothing by default, Send message or Place call). Ctrl+Enter sends a file, and Cmd+Enter inserts a new line. Message history is keyboard navigable and links can be activated from selected items. Typing indicators and readout can be toggled in Settings.</p>",
         "directory": "<h1>User Directory Help</h1><p>Shows users from current and configured servers with server labels. Use Sort and Filter options for contacts. If a selected server does not support a feature, the related action is dimmed and explains why.</p>",
         "admin": "<h1>Admin Commands Help</h1><p>Commands start with '/'. Example: /alert message, /create username password, /admin username.</p><p>To get more help in the command text box, type ? or help (with or without a leading slash).</p>",
         "settings": "<h1>Settings Help</h1><p>Configure sound pack, default sound pack selection, sound volume, call input/output levels, and chat accessibility options. Settings are remembered by the app.</p><p>Administration server host supports standard DNS hostnames and Web3-style domains.</p>",
@@ -5271,7 +5271,8 @@ class MainFrame(wx.Frame):
         self.btn_update.Bind(wx.EVT_BUTTON, self.on_check_updates)
         self.btn_logout.Bind(wx.EVT_BUTTON, self.on_logout); self.btn_exit.Bind(wx.EVT_BUTTON, self.on_exit)
         self.search_command_id = wx.NewIdRef()
-        accel_entries = [(wx.ACCEL_NORMAL, wx.WXK_F3, int(self.search_command_id)), (wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), self.btn_update.GetId()), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
+        self.check_updates_id = wx.NewIdRef()
+        accel_entries = [(wx.ACCEL_NORMAL, wx.WXK_F3, int(self.search_command_id)), (wx.ACCEL_ALT, ord('B'), self.btn_block.GetId()), (wx.ACCEL_ALT, ord('A'), self.btn_add.GetId()), (wx.ACCEL_ALT, ord('S'), self.btn_send.GetId()), (wx.ACCEL_ALT, ord('D'), self.btn_delete.GetId()), (wx.ACCEL_ALT, ord('F'), self.btn_send_file.GetId()), (wx.ACCEL_ALT, ord('I'), self.btn_info.GetId()), (wx.ACCEL_ALT, ord('U'), self.btn_status.GetId()), (wx.ACCEL_ALT, ord('Y'), self.btn_directory.GetId()), (wx.ACCEL_ALT, ord('V'), self.btn_admin.GetId()), (wx.ACCEL_ALT, ord('T'), self.btn_settings.GetId()), (wx.ACCEL_ALT, ord('P'), int(self.check_updates_id)), (wx.ACCEL_ALT, ord('O'), self.btn_logout.GetId()), (wx.ACCEL_ALT, ord('X'), self.btn_exit.GetId()),]
         accel_tbl = wx.AcceleratorTable(accel_entries); self.SetAcceleratorTable(accel_tbl)
         self.Bind(wx.EVT_MENU, self.on_focus_contact_search, id=int(self.search_command_id))
         self.gs_main = wx.GridSizer(1, 5, 5, 5); self.gs_main.Add(self.btn_block, 0, wx.EXPAND); self.gs_main.Add(self.btn_add, 0, wx.EXPAND); self.gs_main.Add(self.btn_send, 0, wx.EXPAND); self.gs_main.Add(self.btn_send_file, 0, wx.EXPAND); self.gs_main.Add(self.btn_delete, 0, wx.EXPAND)
@@ -5547,6 +5548,8 @@ class MainFrame(wx.Frame):
         self.mi_demo_videos = demo_menu.Append(wx.ID_ANY, "Open Demo Videos Folder")
         help_menu.AppendSubMenu(demo_menu, "Watch Demo Videos")
         self.mi_submit_logs = help_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
+        help_menu.AppendSeparator()
+        self.mi_check_updates = help_menu.Append(int(self.check_updates_id), "Check for Updates…\tAlt+P")
 
         menubar.Append(file_menu, "&File")
         menubar.Append(contacts_menu, "&Contacts")
@@ -5554,6 +5557,14 @@ class MainFrame(wx.Frame):
         menubar.Append(view_menu, "&View")
         menubar.Append(help_menu, "&Help")
         self.SetMenuBar(menubar)
+        self.mi_app_check_updates = None
+        if sys.platform == 'darwin':
+            # Standard Mac place: the app menu, right after About.
+            try:
+                apple_menu = menubar.OSXGetAppleMenu()
+                self.mi_app_check_updates = apple_menu.Insert(1, wx.ID_ANY, "Check for Updates…")
+            except Exception:
+                self.mi_app_check_updates = None
 
         self.Bind(wx.EVT_MENU, self.on_send, self.mi_start_chat)
         self.Bind(wx.EVT_MENU, self.on_add, self.mi_add_contact)
@@ -5591,6 +5602,9 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, lambda e: self.on_watch_demo_video("admin_tools"), self.mi_demo_admin_tools)
         self.Bind(wx.EVT_MENU, self.on_open_demo_videos, self.mi_demo_videos)
         self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
+        self.Bind(wx.EVT_MENU, self.on_check_updates_menu, self.mi_check_updates)
+        if self.mi_app_check_updates is not None:
+            self.Bind(wx.EVT_MENU, self.on_check_updates_menu, self.mi_app_check_updates)
 
     def _apply_voiceover_hints(self, search_label):
         apply_voiceover_hint(search_label, "Press F3 to search contacts.")
@@ -6294,9 +6308,16 @@ class MainFrame(wx.Frame):
         menu.Bind(wx.EVT_MENU, _on_clear_global, mi_clear_global)
         self.PopupMenu(menu)
         menu.Destroy()
+    def on_check_updates_menu(self, event=None):
+        self.on_check_updates(event, silent=False)
     def on_check_updates(self, event=None, silent=False):
+        if not self.btn_update.IsEnabled():
+            if not silent: speak_text("Already checking for updates.")
+            return
         self.btn_update.Disable()
+        if not silent: speak_text("Checking for updates.")
         def _callback(tag, version_str, error):
+            if not self: return
             self.btn_update.Enable()
             if tag:
                 result = wx.MessageBox(
@@ -6305,9 +6326,9 @@ class MainFrame(wx.Frame):
                 if result == wx.YES:
                     self._start_update_download(tag)
             elif error and not silent:
-                wx.MessageBox(f"Could not check for updates:\n{error}", "Update Check Failed", wx.ICON_ERROR)
+                wx.MessageBox(f"Could not check for updates:\n{error}", "Update Check Failed", wx.ICON_ERROR, self)
             elif not error and not silent:
-                wx.MessageBox(f"You are running the latest version, {VERSION_TAG}.", "No Updates", wx.ICON_INFORMATION)
+                wx.MessageBox(f"You're up to date. {VERSION_TAG} is the latest version.", "No Updates", wx.ICON_INFORMATION, self)
         check_for_update(_callback)
     def _start_update_download(self, tag):
         import urllib.request
@@ -9344,7 +9365,7 @@ class ChatPanel(wx.Panel):
         apply_voiceover_hint(self.btn_call, "Place a voice call to this contact.")
         apply_voiceover_hint(btn_saved, "Open the Chat Archive tab: saved messages grouped by year, month and day.")
         apply_voiceover_hint(self.btn_add_contact, "Add this person to your contacts.")
-        apply_voiceover_hint(self.input_ctrl, "Message input. Enter sends, Command+Enter inserts a new line, Control+Enter sends file.")
+        apply_voiceover_hint(self.input_ctrl, "Message input. Use the Send button to send, or set Enter to send in Settings. Command+Enter inserts a new line, Control+Enter sends file.")
 
         if dark_mode_on:
             self.hist.SetBackgroundColour(dark_color); self.hist.SetForegroundColour(light_text_color)

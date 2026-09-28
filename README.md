@@ -128,11 +128,16 @@ As long as you have a PC with Windows 7 or higher, an internet connection and a 
 
 ### TappedIn downloads
 
-The TappedIn build (Alpha 15.17) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+The TappedIn build (Alpha 15.18) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
 
 * Windows installer or portable ZIP.
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.18
+
+* **Check for Updates** is back in the Help menu (Alt + P), and on a Mac also in the Thrive Messenger menu. Thrive says whether you're up to date or offers the new version.
+* The message box hint now matches the Enter key setting (Enter does nothing by default).
 
 ### What's new in Alpha 15.17
 
