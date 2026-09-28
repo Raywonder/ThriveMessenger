@@ -23,7 +23,8 @@ python -m pip install \
   "wxPython>=4.2.5,<4.3" \
   "sounddevice>=0.5.1" \
   "pyobjc-core" \
-  "pyobjc-framework-Cocoa"
+  "pyobjc-framework-Cocoa" \
+  "pyobjc-framework-ServiceManagement"
 
 rm -rf build dist "${OUT_DIR}"
 mkdir -p "${OUT_DIR}"
@@ -42,6 +43,7 @@ pyinstaller \
   --add-data "F1_HELP.md:." \
   --hidden-import AppKit \
   --hidden-import Foundation \
+  --hidden-import ServiceManagement \
   main.py
 
 APP_PATH="dist/${APP_NAME}.app"

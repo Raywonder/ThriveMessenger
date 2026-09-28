@@ -32,6 +32,11 @@ LOGIN_RESPONSE_TIMEOUT = 20
 IDLE_KEEPALIVE_SECONDS = 15 * 60
 KEEPALIVE_CHECK_INTERVAL = 30
 KEEPALIVE_RESPONSE_TIMEOUT = 10
+# Heartbeat: ping after 20 s of silence, probe again at 25 s, and treat 45 s of silence as a dead connection.
+HEARTBEAT_INTERVAL = 20
+HEARTBEAT_PROBE_AFTER = 25
+HEARTBEAT_DEAD_AFTER = 45
+RECONNECT_MAX_DELAY = 30
 DEMO_VIDEOS = {
     "onboarding": {
         "filename": "promo-onboarding.mp4",
@@ -450,6 +455,9 @@ def load_user_config():
         'fetch_link_titles': True,
         'link_list_sort': 'newest',
         'room_alerts': 'mentions',
+        'start_at_login': True,
+        'start_minimized': False,
+        'announce_autostart': True,
         'hidden_links': {},
         'keep_contact_list_open': True,
         'save_chat_history_default': False,
@@ -1689,6 +1697,120 @@ def apply_zip_update(zip_path):
         f.write(build_windows_zip_update_batch(zip_path, program_dir, exe_path, pid, temp_extract))
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
 
+
+# --- reactions ----------------------------------------------------------------------------------------------------
+REACTIONS = [("\U0001F44D", "thumbs up"), ("\U0001F44E", "thumbs down"), ("❤️", "heart"), ("\U0001F602", "laugh"),
+             ("\U0001F62E", "wow"), ("\U0001F622", "sad"), ("\U0001F389", "celebrate"), ("✅", "check mark"), ("\U0001F440", "seen")]
+_REACTION_NAMES = dict(REACTIONS)
+
+def reaction_name(emoji):
+    if emoji in _REACTION_NAMES:
+        return _REACTION_NAMES[emoji]
+    try:
+        import unicodedata
+        return unicodedata.name(str(emoji)[0]).lower()
+    except Exception:
+        return str(emoji)
+
+# --- start at sign-in ------------------------------------------------------------------------------------------
+AUTOSTART_ARG = "--autostart"
+_WIN_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_WIN_CHOICE_KEY = r"Software\ThriveMessenger"
+_MAC_AGENT = os.path.expanduser("~/Library/LaunchAgents/fm.tappedin.thrivemessenger.plist")
+_LINUX_DESKTOP = os.path.expanduser("~/.config/autostart/thrive-messenger.desktop")
+
+def _mac_app_path():
+    exe = os.path.realpath(sys.executable)
+    marker = ".app/Contents/MacOS/"
+    return exe.split(marker)[0] + ".app" if marker in exe else ""
+
+def _mac_login_service():
+    try:
+        from ServiceManagement import SMAppService
+        return SMAppService.mainAppService()
+    except Exception:
+        return None
+
+def autostart_supported():
+    """Only an installed app registers itself (never a copy run from source)."""
+    return bool(getattr(sys, "frozen", False))
+
+def autostart_state():
+    """Whether Thrive really starts at sign-in right now (the user may have changed it outside Thrive)."""
+    try:
+        if sys.platform == "win32":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
+                return bool(winreg.QueryValueEx(key, "ThriveMessenger")[0])
+        if sys.platform == "darwin":
+            svc = _mac_login_service()
+            if svc is not None and int(svc.status()) in (1, 2):  # enabled, or waiting for approval in System Settings
+                return True
+            return os.path.isfile(_MAC_AGENT)
+        return os.path.isfile(_LINUX_DESKTOP)
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+def set_autostart(enabled):
+    """Turn start-at-sign-in on or off for this user. Windows: HKCU Run key. Mac: Login Items (SMAppService), or a
+    LaunchAgent if that isn't available. Linux: an XDG autostart entry. Returns (ok, message)."""
+    if not autostart_supported():
+        return False, "Start at sign-in only applies to the installed app."
+    try:
+        if sys.platform == "win32":
+            import winreg
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_KEY) as key:
+                if enabled:
+                    winreg.SetValueEx(key, "ThriveMessenger", 0, winreg.REG_SZ, f'"{sys.executable}" {AUTOSTART_ARG}')
+                else:
+                    try:
+                        winreg.DeleteValue(key, "ThriveMessenger")
+                    except FileNotFoundError:
+                        pass
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_CHOICE_KEY) as key:
+                # The installer reads this so an update never switches it back on after you turned it off.
+                winreg.SetValueEx(key, "StartAtLogin", 0, winreg.REG_SZ, "1" if enabled else "0")
+            return True, ""
+        if sys.platform == "darwin":
+            svc = _mac_login_service()
+            if svc is not None:
+                try:
+                    ok = svc.registerAndReturnError_(None) if enabled else svc.unregisterAndReturnError_(None)
+                    ok = ok[0] if isinstance(ok, tuple) else ok
+                    if ok or (not enabled and int(svc.status()) == 0):
+                        if os.path.isfile(_MAC_AGENT) and enabled:
+                            os.remove(_MAC_AGENT)
+                        if not enabled and os.path.isfile(_MAC_AGENT):
+                            os.remove(_MAC_AGENT)
+                        return True, ("Allow Thrive in System Settings, General, Login Items." if enabled and int(svc.status()) == 2 else "")
+                except Exception:
+                    pass
+            app = _mac_app_path()
+            if enabled and app:
+                os.makedirs(os.path.dirname(_MAC_AGENT), exist_ok=True)
+                with open(_MAC_AGENT, "w") as fh:
+                    fh.write('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>'
+                             '<key>Label</key><string>fm.tappedin.thrivemessenger</string>'
+                             '<key>ProgramArguments</key><array><string>/usr/bin/open</string><string>-g</string><string>-a</string>'
+                             f'<string>{app}</string><string>--args</string><string>{AUTOSTART_ARG}</string></array>'
+                             '<key>RunAtLoad</key><true/></dict></plist>\n')
+            elif not enabled and os.path.isfile(_MAC_AGENT):
+                os.remove(_MAC_AGENT)
+            return True, ""
+        if enabled:
+            os.makedirs(os.path.dirname(_LINUX_DESKTOP), exist_ok=True)
+            with open(_LINUX_DESKTOP, "w") as fh:
+                fh.write(f"[Desktop Entry]\nType=Application\nName=Thrive Messenger\nExec={sys.executable} {AUTOSTART_ARG}\n"
+                         "X-GNOME-Autostart-enabled=true\n")
+        elif os.path.isfile(_LINUX_DESKTOP):
+            os.remove(_LINUX_DESKTOP)
+        return True, ""
+    except Exception as e:
+        return False, f"Couldn't change start at sign-in: {e}"
+
 class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
     def __init__(self, frame):
         super().__init__(); self.frame = frame; icon = wx.Icon(wx.ArtProvider.GetIcon(wx.ART_INFORMATION, wx.ART_OTHER, (16, 16))); self.SetIcon(icon, "Thrive Messenger"); self.Bind(wx.adv.EVT_TASKBAR_LEFT_DCLICK, self.on_restore); self.Bind(wx.EVT_MENU, self.on_restore, id=1); self.Bind(wx.EVT_MENU, self.on_exit, id=2)
@@ -1952,6 +2074,14 @@ class SettingsDialog(wx.Dialog):
         self.room_alerts_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
             "Only when someone mentions me", "Announce every message", "Nothing"], name="Room messages when the room isn't open")
         self.room_alerts_choice.SetSelection({'mentions': 0, 'all': 1, 'none': 2}.get(self.config.get('room_alerts', 'mentions'), 0))
+        self.start_at_login_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Start Thrive automatically when I sign in")
+        real = autostart_state() if autostart_supported() else None
+        self.start_at_login_cb.SetValue(bool(self.config.get('start_at_login', True)) if real is None else real)
+        self.start_at_login_cb.SetToolTip("Thrive opens quietly when you sign in to this computer, without taking focus, and connects as soon as the network is ready.")
+        self.start_minimized_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Start minimised to the tray (menu bar on a Mac)")
+        self.start_minimized_cb.SetValue(bool(self.config.get('start_minimized', False)))
+        self.announce_autostart_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Say \"Started\" when Thrive starts at sign-in")
+        self.announce_autostart_cb.SetValue(bool(self.config.get('announce_autostart', True)))
         self.keep_contact_list_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Keep the contact list open when a chat opens")
         self.keep_contact_list_cb.SetValue(bool(self.config.get('keep_contact_list_open', True)))
         self.keep_contact_list_cb.SetToolTip("Chat windows get their own taskbar and Alt+Tab entry, so the contact list stays available. Ctrl+0 in a chat returns to it.")
@@ -2116,6 +2246,9 @@ class SettingsDialog(wx.Dialog):
         link_sort_row.Add(self.link_sort_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         link_sort_row.Add(self.link_sort_choice, 1, wx.EXPAND)
         accessibility_box.Add(link_sort_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(self.start_at_login_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.start_minimized_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.announce_autostart_cb, 0, wx.ALL, 5)
         room_row = wx.BoxSizer(wx.HORIZONTAL)
         room_row.Add(self.room_alerts_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         room_row.Add(self.room_alerts_choice, 1, wx.EXPAND)
@@ -2188,7 +2321,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb, self.start_at_login_cb, self.start_minimized_cb, self.announce_autostart_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -2492,7 +2625,11 @@ class StatusDialog(wx.Dialog):
             self.status_text.SetValue(sel); self.sizer.Hide(self.custom_box); self.panel.Layout()
             self.SetSize((350, 150))
 
-def create_secure_socket(server_entry=None):
+_UNVERIFIED_TLS_OK = set()
+
+def create_secure_socket(server_entry=None, strict=False):
+    """A fresh connection every call: new DNS lookup, new TLS context and handshake.
+    strict=True (background reconnects) never falls back to an unverified or plain connection."""
     active = SERVER_CONFIG if server_entry is None else {
         'host': normalize_server_entry(server_entry)['host'],
         'port': normalize_server_entry(server_entry)['port'],
@@ -2508,6 +2645,10 @@ def create_secure_socket(server_entry=None):
         wrapped.settimeout(None)
         return wrapped
     except ssl.SSLCertVerificationError:
+        if strict and addr not in _UNVERIFIED_TLS_OK:
+            sock.close()
+            raise
+        _UNVERIFIED_TLS_OK.add(addr)  # reconnects keep the same trust decision as the first sign-in, never less
         sock.close(); sock = socket.create_connection(addr, timeout=6.0)
         context = ssl.create_default_context(); context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
         wrapped = context.wrap_socket(sock, server_hostname=active['host'])
@@ -2515,6 +2656,8 @@ def create_secure_socket(server_entry=None):
         return wrapped
     except (ssl.SSLError, OSError):
         sock.close()
+        if strict:
+            raise
         plain = socket.create_connection(addr, timeout=6.0)
         plain.settimeout(None)
         return plain
@@ -2600,6 +2743,15 @@ class ClientApp(wx.App):
             print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
             log_event("warn", "ipc_bind_unavailable_continuing")
         self.user_config = load_user_config()
+        self.autostart = AUTOSTART_ARG in sys.argv[1:]
+        if autostart_supported() and not self.user_config.get('start_at_login_initialized'):
+            # New default: on. Applied once, so a later choice in Settings (or System Settings) is respected.
+            set_autostart(bool(self.user_config.get('start_at_login', True)))
+            self.user_config['start_at_login_initialized'] = True
+            save_user_config(self.user_config)
+        if self.autostart and not self.user_config.get('start_at_login', True):
+            set_autostart(False)  # left over from an installer or an older copy; honour the setting
+            return False
         self.launch_invite_context = parse_invite_context_from_args()
         self.session_password = ""
         self.reconnect_in_progress = False
@@ -2625,6 +2777,12 @@ class ClientApp(wx.App):
                 else:
                     success, sock, sf, reason = self.perform_login(self.user_config['username'], self.user_config['password'], selected_server)
             if success: self.start_main_session(self.user_config['username'], sock, sf); return True
+            elif self.autostart and "invalid credentials" not in str(reason).lower():
+                # Signed in to the computer before the network or server was ready: keep trying quietly, no dialogs.
+                log_event("warn", "autostart_waiting_for_network", {"reason": str(reason)[:200]})
+                self._keepalive_frame = wx.Frame(None)  # invisible; keeps the app running while it waits
+                threading.Thread(target=self._autostart_retry, daemon=True).start()
+                return True
             else:
                 wx.MessageBox(f"Auto-login failed: {reason}", "Login Failed", wx.ICON_ERROR)
                 log_event("error", "auto_login_failed", {"reason": str(reason)})
@@ -2646,6 +2804,36 @@ class ClientApp(wx.App):
         # silently (fresh installs, or anyone not using auto-login). Show the login UI now.
         return bool(self._bootstrap_startup_ui())
 
+    def _autostart_retry(self):
+        username = self.user_config.get('username', '')
+        attempt = 0
+        while True:
+            attempt += 1
+            time.sleep(min(RECONNECT_MAX_DELAY, 2 ** min(attempt, 5)) * random.uniform(0.8, 1.1))
+            try:
+                server = resolve_default_server_entry(self.user_config)
+                if str(self.user_config.get('autologin_mode', 'password')) == 'passkey':
+                    success, sock, sf, reason = self.perform_passkey_login(username, server, suppress_errors=True, show_post_login=False)
+                else:
+                    success, sock, sf, reason = self.perform_login(username, self._saved_password(username), server, suppress_errors=True,
+                                                                   show_post_login=False, strict_tls=True)
+            except Exception as e:
+                success, reason = False, str(e)
+            if success:
+                wx.CallAfter(self._finish_autostart, username, sock, sf)
+                return
+            if "invalid credentials" in str(reason).lower():
+                wx.CallAfter(self._finish_autostart, username, None, None)
+                return
+    def _finish_autostart(self, username, sock, sf):
+        holder = getattr(self, "_keepalive_frame", None)
+        if sock:
+            self.start_main_session(username, sock, sf)
+        else:
+            self._bootstrap_startup_ui()
+        if holder:
+            holder.Destroy()
+            self._keepalive_frame = None
     def _transfer_history_path(self):
         return os.path.join(get_config_dir(), "transfer_history.json")
     def load_transfer_history(self):
@@ -2813,11 +3001,11 @@ class ClientApp(wx.App):
                     save_user_config(self.user_config); self.start_main_session(dlg.new_username, sock, sf); return True
             else: return False
     
-    def perform_login(self, username, password, server_entry=None, suppress_errors=False, show_post_login=True):
+    def perform_login(self, username, password, server_entry=None, suppress_errors=False, show_post_login=True, strict_tls=False):
         try:
             if server_entry:
                 set_active_server_config(server_entry)
-            ssock = create_secure_socket(server_entry)
+            ssock = create_secure_socket(server_entry, strict=strict_tls)
             login_request = {"action":"login","user":username,"pass":password, **_device_login_fields(self.user_config)}
             # Never wait forever for a server that accepts the connection but doesn't answer.
             ssock.settimeout(LOGIN_RESPONSE_TIMEOUT)
@@ -2900,6 +3088,8 @@ class ClientApp(wx.App):
     def _apply_reconnected_session(self, sock, sf):
         self.sock = sock
         self.sockfile = sf
+        self._disconnected = False
+        self._probe_deadline = 0
         self.reconnect_in_progress = False
         self.reconnect_stop_event.clear()
         self._last_activity = time.time()
@@ -2908,7 +3098,6 @@ class ClientApp(wx.App):
         self._set_socket_for_open_windows(sock)
         if getattr(self, 'frame', None):
             self.frame.refresh_connection_title(connected=True)
-        show_notification("Reconnected", f"Connected to {self._current_server_label()}.", timeout=5)
         self.play_sound("reconnected.wav")
         speak_text("Reconnected", interrupt=False)
         try:
@@ -2924,59 +3113,122 @@ class ClientApp(wx.App):
         wx.CallLater(800, self._flush_outbox)
         if getattr(self, 'frame', None):
             wx.CallLater(1200, self.frame.refresh_open_histories)
+            if getattr(self.frame, "groups_panel", None):
+                wx.CallLater(1500, self.frame.groups_panel.refresh_rooms)
 
     def _start_reconnect_loop(self):
-        if self.intentional_disconnect or self.reconnect_in_progress:
+        if self.intentional_disconnect:
+            return
+        worker = getattr(self, "_reconnect_thread", None)
+        if self.reconnect_in_progress and worker and worker.is_alive():
             return
         self.reconnect_in_progress = True
         self.reconnect_stop_event.clear()
-        threading.Thread(target=self._reconnect_worker, daemon=True).start()
+        self._reconnect_thread = threading.Thread(target=self._reconnect_worker, name="thrive-reconnect", daemon=True)
+        self._reconnect_thread.start()
+
+    def _saved_password(self, username):
+        password = self.session_password or self.user_config.get("password", "")
+        if not password:
+            try:
+                password = _load_password_from_keyring(username, self.user_config) or ""
+            except Exception:
+                password = ""
+        return password
 
     def _reconnect_worker(self):
-        username = getattr(self, "username", "") or self.user_config.get("username", "")
-        mode = str(self.user_config.get("autologin_mode", "password") or "password")
-        password = self.session_password or self.user_config.get("password", "")
-        if not username:
-            self.reconnect_in_progress = False
-            wx.CallAfter(show_notification, "Reconnect paused", "Saved login is not available. Sign in again when ready.", 7)
-            return
-        attempt = 0
-        while not self.intentional_disconnect and not self.reconnect_stop_event.is_set():
-            attempt += 1
-            if mode == "passkey":
-                success, sock, sf, reason = self.perform_passkey_login(
-                    username,
-                    self.active_server_entry,
-                    suppress_errors=True,
-                    show_post_login=False,
-                )
-            else:
-                if not password:
-                    success, sock, sf, reason = False, None, None, "Saved password is missing."
-                else:
-                    success, sock, sf, reason = self.perform_login(
-                        username,
-                        password,
-                        self.active_server_entry,
-                        suppress_errors=True,
-                        show_post_login=False,
-                    )
-            if success:
-                wx.CallAfter(self._apply_reconnected_session, sock, sf)
-                return
-            if attempt == 1 or attempt % 3 == 0:
-                wx.CallAfter(show_notification, "Reconnecting", f"Connection lost. Retrying ({attempt})...", 5)
-            if attempt == 4:
-                waiting = len(getattr(self, "outbox", []))
-                note = f" {waiting} message{'s' if waiting != 1 else ''} will be sent when it's back." if waiting else ""
-                wx.CallAfter(speak_text, f"Still reconnecting.{note}", False)
-            delay = min(30, max(2, attempt * 2))
-            for _ in range(delay):
-                if self.intentional_disconnect or self.reconnect_stop_event.is_set():
-                    self.reconnect_in_progress = False
+        """Retry until connected (or the user signs out): backoff 2, 4, 8, 16, then every 30 seconds, with a little jitter.
+        Every try is a fresh DNS lookup, TCP connection and TLS handshake, signing in with the saved credential."""
+        connected = False
+        try:
+            username = getattr(self, "username", "") or self.user_config.get("username", "")
+            attempt = 0
+            while not self.intentional_disconnect and not self.reconnect_stop_event.is_set():
+                attempt += 1
+                success, sock, sf = False, None, None
+                try:
+                    mode = str(self.user_config.get("autologin_mode", "password") or "password")
+                    if not username:
+                        reason = "No saved sign-in."
+                    elif mode == "passkey":
+                        success, sock, sf, reason = self.perform_passkey_login(username, self.active_server_entry, suppress_errors=True,
+                                                                               show_post_login=False)
+                    else:
+                        password = self._saved_password(username)
+                        if not password:
+                            reason = "Saved password is missing."
+                        else:
+                            success, sock, sf, reason = self.perform_login(username, password, self.active_server_entry, suppress_errors=True,
+                                                                           show_post_login=False, strict_tls=True)
+                except Exception as e:
+                    reason = f"{type(e).__name__}: {e}"
+                if success:
+                    connected = True
+                    log_event("info", "reconnected", {"attempts": attempt})
+                    wx.CallAfter(self._apply_reconnected_session, sock, sf)
                     return
-                time.sleep(1)
-        self.reconnect_in_progress = False
+                if attempt in (1, 10) or attempt % 60 == 0:
+                    log_event("warn", "reconnect_retry", {"attempt": attempt, "reason": str(reason)[:200]})
+                if attempt == 1:
+                    wx.CallAfter(show_notification, "Reconnecting", "Connection lost. Thrive keeps trying in the background.", 5)
+                delay = min(RECONNECT_MAX_DELAY, 2 ** min(attempt, 5))
+                delay = max(1.0, delay * random.uniform(0.8, 1.1))
+                end = time.monotonic() + delay
+                while time.monotonic() < end:
+                    if self.intentional_disconnect or self.reconnect_stop_event.is_set() or getattr(self, "_reconnect_now", False):
+                        break
+                    time.sleep(0.5)
+                if getattr(self, "_reconnect_now", False):
+                    self._reconnect_now = False  # woke from sleep or the network changed: try again right away
+        finally:
+            if not connected:
+                self.reconnect_in_progress = False
+
+    def _force_disconnect(self, sock, why):
+        """Treat this connection as dead: unblock the reader and start reconnecting."""
+        log_event("warn", "connection_dead", {"why": why})
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        if getattr(self, "sock", None) is sock and not self.intentional_disconnect:
+            wx.CallAfter(self.on_server_disconnect)
+
+    def _connection_watchdog(self):
+        """Every 10 seconds: catch a sleeping computer waking up, a stuck reconnect, or a connection nobody noticed was lost."""
+        if not getattr(self, "frame", None) or self.intentional_disconnect:
+            return
+        now = time.time()
+        gap = now - getattr(self, "_watchdog_last", now)
+        self._watchdog_last = now
+        if gap > 40:
+            self._on_wake()
+        worker = getattr(self, "_reconnect_thread", None)
+        if self.reconnect_in_progress and not (worker and worker.is_alive()):
+            self.reconnect_in_progress = False
+        if getattr(self, "_disconnected", False) and not self.reconnect_in_progress:
+            self._start_reconnect_loop()
+
+    def _on_wake(self, event=None):
+        """After sleep or a network change the old connection is usually dead; check it now instead of waiting."""
+        if event is not None:
+            event.Skip()
+        if self.reconnect_in_progress:
+            self._reconnect_now = True
+            return
+        sock = getattr(self, "sock", None)
+        if not sock or getattr(self, "_disconnected", False):
+            return
+        self._probe_deadline = time.time() + 15
+        self._probe_sent_at = time.time()
+        try:
+            sock.sendall((json.dumps({"action": "ping", "t": time.time()}) + "\n").encode())
+        except Exception:
+            self._force_disconnect(sock, "send failed after wake")
 
     def fetch_directory_for_server(self, server_entry, username, password):
         try:
@@ -3082,11 +3334,30 @@ class ClientApp(wx.App):
         self._start_keepalive_monitor()
         active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
         self.connected_server_names = {active.get("name") or active.get("host") or "Server"}
-        self.frame = MainFrame(self.username, self.sock); self.frame.Show()
+        self.frame = MainFrame(self.username, self.sock)
+        if getattr(self, "autostart", False):
+            # Started at sign-in: never take focus. One short "Started" at most (a setting).
+            if self.user_config.get('start_minimized', False):
+                self.frame.hide_to_tray()
+            else:
+                self.frame.ShowWithoutActivating()
+            if self.user_config.get('announce_autostart', True):
+                wx.CallLater(1500, speak_text, "Thrive started", False)
+        else:
+            self.frame.Show()
+        self._disconnected = False
+        self._watchdog_last = time.time()
+        if not getattr(self, "_watchdog_timer", None):
+            self._watchdog_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, lambda e: self._connection_watchdog(), self._watchdog_timer)
+            self._watchdog_timer.Start(10000)
+            if hasattr(wx, "EVT_POWER_RESUME"):
+                self.Bind(wx.EVT_POWER_RESUME, self._on_wake)
         if self.frame.current_status != "online":
             try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
             except Exception: pass
-        wx.CallLater(250, self.play_startup_sound)
+        if not getattr(self, "autostart", False):
+            wx.CallLater(250, self.play_startup_sound)
         threading.Thread(target=self.listen_loop, daemon=True).start()
         try:
             self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
@@ -3104,26 +3375,37 @@ class ClientApp(wx.App):
         threading.Thread(target=self._keepalive_monitor, args=(self._keepalive_stop, monitored_sock), daemon=True).start()
 
     def _keepalive_monitor(self, stop_event, monitored_sock):
-        while not stop_event.wait(KEEPALIVE_CHECK_INTERVAL):
+        """Heartbeat: a ping after 20 s of silence, a second probe at 25 s, and 45 s with nothing from the server
+        means the connection is half-open (server reset, network gone), so reconnect."""
+        last_ping, probed = 0.0, False
+        while not stop_event.wait(5):
             sock = getattr(self, "sock", None)
-            if not sock or sock is not monitored_sock or self.intentional_disconnect:
+            if sock is not monitored_sock:
+                return
+            if not sock or self.intentional_disconnect:
                 continue
-            idle_for = time.time() - getattr(self, "_last_activity", time.time())
-            if idle_for < IDLE_KEEPALIVE_SECONDS:
-                continue
-            previous_activity = self._last_activity
+            now = time.time()
+            idle = now - getattr(self, "_last_activity", now)
+            deadline = getattr(self, "_probe_deadline", 0)
+            if deadline and now > deadline:
+                self._probe_deadline = 0
+                if getattr(self, "_last_activity", 0) < getattr(self, "_probe_sent_at", 0):
+                    self._force_disconnect(sock, "no answer after wake")
+                    return
+            if idle >= HEARTBEAT_DEAD_AFTER:
+                self._force_disconnect(sock, f"silent for {int(idle)} seconds")
+                return
             try:
-                sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
+                if idle >= HEARTBEAT_PROBE_AFTER and not probed:
+                    sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())  # every server answers this
+                    probed = True
+                elif idle < HEARTBEAT_PROBE_AFTER:
+                    probed = False
+                if idle >= HEARTBEAT_INTERVAL and now - last_ping >= HEARTBEAT_INTERVAL:
+                    sock.sendall((json.dumps({"action": "ping", "t": now}) + "\n").encode())
+                    last_ping = now
             except Exception:
-                if not self.intentional_disconnect and getattr(self, "sock", None) is monitored_sock:
-                    wx.CallAfter(self.on_server_disconnect)
-                return
-            if stop_event.wait(KEEPALIVE_RESPONSE_TIMEOUT):
-                return
-            if (getattr(self, "_last_activity", previous_activity) <= previous_activity
-                    and not self.intentional_disconnect
-                    and getattr(self, "sock", None) is monitored_sock):
-                wx.CallAfter(self.on_server_disconnect)
+                self._force_disconnect(sock, "send failed")
                 return
 
     def sync_session_preferences(self):
@@ -3270,6 +3552,8 @@ class ClientApp(wx.App):
                     elif act == "msg_read_update": wx.CallAfter(self.frame.on_msg_read_update, msg)
                     elif act == "msg_read_sync": wx.CallAfter(self.frame.on_msg_read_sync, msg)
                     elif act == "link_titles": wx.CallAfter(self.frame.on_link_titles, msg)
+                    elif act == "reaction_update": wx.CallAfter(self.frame.on_reaction_update, msg)
+                    elif act == "reaction_failed": wx.CallAfter(speak_text, str(msg.get("reason") or "Reaction failed."), True)
                     elif act == "links_list": wx.CallAfter(self.frame.on_links_list, msg)
                     elif act == "msg_remove_links_result": wx.CallAfter(self.frame.on_remove_links_result, msg)
                     elif act == "history_days": wx.CallAfter(self.frame.on_history_days, msg)
@@ -3355,8 +3639,13 @@ class ClientApp(wx.App):
             speak_text(f"Sent {sent} waiting message{'s' if sent != 1 else ''}", interrupt=False)
 
     def on_server_disconnect(self):
-        if self.intentional_disconnect or self.reconnect_in_progress:
+        if self.intentional_disconnect:
             return
+        worker = getattr(self, "_reconnect_thread", None)
+        if self.reconnect_in_progress and worker and worker.is_alive():
+            return
+        already = getattr(self, "_disconnected", False)
+        self._disconnected = True
         try:
             self._keepalive_stop.set()
         except Exception:
@@ -3367,9 +3656,10 @@ class ClientApp(wx.App):
             pass
         if getattr(self, 'frame', None):
             self.frame.refresh_connection_title(connected=False)
-        show_notification("Connection lost", "Reconnecting in the background...", timeout=6)
-        self.play_sound("connection_lost.wav")
-        speak_text("Reconnecting", interrupt=False)
+        if not already:
+            # Said once per outage; the retries themselves are quiet.
+            self.play_sound("connection_lost.wav")
+            speak_text("Reconnecting", interrupt=False)
         self._start_reconnect_loop()
 
     def _return_to_login(self, message, title):
@@ -5633,6 +5923,14 @@ class MainFrame(wx.Frame):
         app.user_config['fetch_link_titles'] = dlg.fetch_link_titles_cb.IsChecked()
         app.user_config['link_list_sort'] = 'sender' if dlg.link_sort_choice.GetSelection() == 1 else 'newest'
         app.user_config['room_alerts'] = ('mentions', 'all', 'none')[max(0, dlg.room_alerts_choice.GetSelection())]
+        app.user_config['start_minimized'] = dlg.start_minimized_cb.IsChecked()
+        app.user_config['announce_autostart'] = dlg.announce_autostart_cb.IsChecked()
+        want = dlg.start_at_login_cb.IsChecked()
+        app.user_config['start_at_login'] = want
+        if autostart_supported() and autostart_state() != want:
+            ok, note = set_autostart(want)
+            if not ok or note:
+                speak_text(note or "Couldn't change start at sign-in.", interrupt=False)
         for chat in self.all_chats():
             chat.refresh_all_rows()
         app.user_config['delete_attached_files_with_message'] = dlg.delete_attached_files_cb.IsChecked()
@@ -6460,6 +6758,10 @@ class MainFrame(wx.Frame):
                 if win.IsShown():
                     win._restore_from_tray = True; win.Hide()
             self.Hide(); self.task_bar_icon = ThriveTaskBarIcon(self)
+    def hide_to_tray(self):
+        self.Hide()
+        if not self.task_bar_icon:
+            self.task_bar_icon = ThriveTaskBarIcon(self)
     def restore_from_tray(self):
         if self.task_bar_icon: self.task_bar_icon.Destroy(); self.task_bar_icon = None
         self.Show(); self.Raise()
@@ -6687,7 +6989,9 @@ class MainFrame(wx.Frame):
     def refresh_open_histories(self):
         """After a reconnect, fill in anything that arrived while we were away (merged, no duplicates)."""
         for chat in self.all_chats():
-            if chat._hist_state.get("loaded"):
+            if isinstance(chat, RoomChatPanel):
+                chat.resync()
+            elif chat._hist_state.get("loaded"):
                 chat._hist_state["pending"] = False
                 chat.request_history()
     def _chat_for_message_event(self, msg):
@@ -6705,6 +7009,15 @@ class MainFrame(wx.Frame):
         chat = self.get_chat(msg.get("by"))
         if chat:
             chat.apply_read_update(msg.get("ids"), msg.get("read_at"), by=msg.get("by"))
+    def on_reaction_update(self, msg):
+        if msg.get("scope") == "room":
+            panel = self.get_chat("room:" + str(msg.get("room_id") or ""))
+            if panel:
+                panel.apply_reaction_update(msg)
+            return
+        for chat in self.all_chats():
+            if not isinstance(chat, RoomChatPanel) and chat.apply_reaction_update(msg):
+                return
     def on_link_titles(self, msg):
         app = wx.GetApp()
         titles = {u: t for u, t in (msg.get("titles") or {}).items() if t}
@@ -9485,6 +9798,8 @@ class ChatPanel(wx.Panel):
             self.Bind(wx.EVT_MENU, self.on_edit_selected_message, mi_edit)
         self.Bind(wx.EVT_MENU, self.on_remove_selected_message, mi_remove)
         self.Bind(wx.EVT_MENU, self.on_undo_last_deleted_message, mi_undo)
+        if self._react_target(row):
+            menu.AppendSubMenu(self._reaction_menu(idx), "&React\tAlt+R")
         self._add_links_menu(menu, idx)
         self.PopupMenu(menu)
         menu.Destroy()
@@ -9710,6 +10025,8 @@ class ChatPanel(wx.Panel):
                "epoch": timestamp_epoch(item.get("time")), "id": item.get("id"), "seq": item.get("seq")}
         if item.get("edited"):
             row["edited"] = True
+        if item.get("reactions"):
+            row["reactions"] = item["reactions"]
         row["delivered"] = bool(item.get("delivered"))
         if item.get("read_at"):
             row["read_at"] = item["read_at"]
@@ -9804,7 +10121,7 @@ class ChatPanel(wx.Panel):
         if row.get("queued"):
             text = f"{text} (not sent yet, will send when reconnected)"
         display, _ = self._build_message_display(text, row.get("sender", "System"), row.get("time", time.time()), is_error=row.get("error", False))
-        return display + self._links_suffix(row) + self._status_suffix(row)
+        return display + self._links_suffix(row) + self._reactions_suffix(row) + self._status_suffix(row)
     def apply_history(self, msg):
         """Merge server history in time order, skipping anything already shown (no duplicates)."""
         self._hist_state["pending"] = False
@@ -10012,6 +10329,9 @@ class ChatPanel(wx.Panel):
             self._move_link(1 if event.GetKeyCode() == wx.WXK_RIGHT else -1)
             return
         if event.AltDown() and not event.ControlDown() and not event.ShiftDown():
+            if event.GetKeyCode() in (ord('R'), ord('r')):
+                self.show_reaction_menu()
+                return
             if event.GetKeyCode() == wx.WXK_LEFT:
                 self.jump_back()
                 return
@@ -10232,6 +10552,93 @@ class ChatPanel(wx.Panel):
             title = link_title_for(link["url"])
             lim.AppendSubMenu(sub, f"&{n} {title}, {link['url']}" if title else f"&{n} {link['url']}")
         return lim
+    # --- reactions ------------------------------------------------------------------------------------------------
+    def _who(self, name):
+        if str(name).lower() == str(self.user).lower():
+            return "you"
+        return self.frame.format_user_label(name) if hasattr(self.frame, "format_user_label") else str(name)
+    def _reactions_suffix(self, row):
+        """Reactions read as part of the message: ", thumbs up from Dom and you, heart from Clawdia"."""
+        parts = []
+        for g in row.get("reactions") or []:
+            users = [self._who(u) for u in g.get("users") or []]
+            if users:
+                who = users[0] if len(users) == 1 else ", ".join(users[:-1]) + " and " + users[-1]
+                parts.append(f"{reaction_name(g['emoji'])} from {who}")
+        return (", " + ", ".join(parts)) if parts else ""
+    def _react_target(self, row):
+        """(scope, room id) for reacting to this row, or None if the server doesn't know the message yet."""
+        mid = str(row.get("id") or "")
+        if not mid or mid.startswith("h") or row.get("error") or row.get("sender") == "System" or self.is_remote_directory_chat:
+            return None
+        return ("dm", "")
+    def _my_reactions(self, row):
+        return {g["emoji"] for g in row.get("reactions") or [] if any(str(u).lower() == str(self.user).lower() for u in g.get("users") or [])}
+    def toggle_reaction(self, emoji, idx=None):
+        idx = self._selected_history_index() if idx is None else idx
+        if idx is None:
+            return
+        row = self._history_rows[idx]
+        target = self._react_target(row)
+        if not target:
+            speak_text("You can react once the message has reached the server.", interrupt=True)
+            return
+        scope, room_id = target
+        on = emoji not in self._my_reactions(row)
+        try:
+            self.sock.sendall((json.dumps({"action": "react", "scope": scope, "room_id": room_id, "message_id": row["id"],
+                                           "emoji": emoji, "on": on}) + "\n").encode())
+            self._pending_reaction = (row["id"], emoji, on)
+        except Exception as e:
+            speak_text(f"Couldn't react: {e}", interrupt=True)
+    def apply_reaction_update(self, msg):
+        """A reaction was added or removed (by anyone, on any of their devices): update the message and say it once."""
+        idx = self._row_index_for_id(msg.get("message_id"))
+        if idx is None:
+            return False
+        row = self._history_rows[idx]
+        row["reactions"] = msg.get("reactions") or []
+        self._refresh_row_display(idx)
+        name = reaction_name(msg.get("emoji"))
+        if str(msg.get("username")).lower() == str(self.user).lower():
+            if getattr(self, "_pending_reaction", None) == (msg.get("message_id"), msg.get("emoji"), bool(msg.get("on"))):
+                self._pending_reaction = None
+                speak_text(f"{name} {'added' if msg.get('on') else 'removed'}", interrupt=True)
+        elif msg.get("on"):
+            mine = row.get("sender") == self.user
+            if self.is_chat_visible() or mine:
+                where = "" if self.is_chat_visible() else f" in {self.display_name()}"
+                speak_text(f"{self._who(msg.get('username'))} reacted {name}{' to your message' if mine else ''}{where}", interrupt=False)
+        return True
+    def _reaction_menu(self, idx):
+        menu = wx.Menu()
+        row = self._history_rows[idx]
+        mine = self._my_reactions(row)
+        for n, (emoji, name) in enumerate(REACTIONS, 1):
+            item = menu.AppendCheckItem(wx.ID_ANY, f"&{n} {name}")
+            item.Check(emoji in mine)
+            self.Bind(wx.EVT_MENU, lambda e, em=emoji: self.toggle_reaction(em, idx), item)
+        menu.AppendSeparator()
+        more = menu.Append(wx.ID_ANY, "&More...")
+        self.Bind(wx.EVT_MENU, lambda e: self._react_more(idx), more)
+        return menu
+    def _react_more(self, idx):
+        with EmojiPickerDialog(self) as dlg:
+            dlg.SetTitle("Choose a Reaction")
+            chosen = dlg.selected if dlg.ShowModal() == wx.ID_OK else None
+        self.hist.SetFocus()
+        if chosen:
+            self.toggle_reaction(chosen, idx)
+    def show_reaction_menu(self):
+        idx = self._selected_history_index()
+        if idx is None:
+            return
+        if not self._react_target(self._history_rows[idx]):
+            speak_text("You can react once the message has reached the server.", interrupt=True)
+            return
+        menu = self._reaction_menu(idx)
+        self.hist.PopupMenu(menu)
+        menu.Destroy()
     # --- links ------------------------------------------------------------------------------------------------
     def _hidden_links(self, row):
         return (wx.GetApp().user_config.get('hidden_links') or {}).get(str(row.get("id") or "")) or []
@@ -10720,7 +11127,7 @@ class RoomChatPanel(ChatPanel):
     def _room_row(self, item):
         row = {"sender": item.get("sender", ""), "text": item.get("body", ""), "time": item.get("sent_at"), "error": False,
                "epoch": float(item.get("sent_at") or 0), "sent_at": float(item.get("sent_at") or 0), "id": item.get("message_id"),
-               "mentions": item.get("mentions") or []}
+               "mentions": item.get("mentions") or [], "reactions": item.get("reactions") or []}
         if item.get("edited_at"):
             row["edited"] = True
         if item.get("deleted"):
@@ -10750,11 +11157,15 @@ class RoomChatPanel(ChatPanel):
             self._hist_state["has_more"] = bool(msg.get("has_more"))
             self.btn_earlier.Show(self._hist_state["has_more"])
             self.msg_page.Layout()
-            self._merge_room_messages(msg.get("messages") or [], older=False)
+        # First open, or a re-sync after reconnecting: add anything new, no duplicates.
+        self._merge_room_messages(msg.get("messages") or [], older=False)
         if self.window:
             self.window.refresh_chat_label(self)
         self.members_page.show()
         self.refresh_all_rows()
+    def resync(self):
+        self._hist_state["pending"] = False
+        self.room_send({"action": "group_room_open", "limit": self.HISTORY_PAGE})
     def apply_members(self, members):
         self.members = list(members or [])
         me = next((m for m in self.members if str(m["username"]).lower() == str(self.user).lower()), None)
@@ -10978,6 +11389,10 @@ class RoomChatPanel(ChatPanel):
         return row.get("sender") == self.user or self._my_rank() >= ROOM_ROLE_RANK["moderator"]
     def _can_delete_for_everyone(self, row):
         return self._can_edit_row(row)
+    def _react_target(self, row):
+        if not row.get("id") or row.get("sender") == "System" or row.get("error"):
+            return None
+        return ("room", self.room_id)
     def _can_remove_links_for_everyone(self, item):
         return bool(item.get("id")) and (str(item.get("sender") or "").lower() == str(self.user).lower()
                                          or self._my_rank() >= ROOM_ROLE_RANK["moderator"])

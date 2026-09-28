@@ -41,6 +41,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "startatlogin"; Description: "Start Thrive automatically when I sign in"; GroupDescription: "Startup:"
+
+[Registry]
+; Per-user Run key (no admin task). Skipped if you turned it off in Thrive's Settings, so updates never switch it back on.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "ThriveMessenger"; ValueData: """{app}\{#MyAppExeName}"" --autostart"; Flags: uninsdeletevalue; Tasks: startatlogin; Check: StartAtLoginNotRefused
 
 [Files]
 Source: "{#SourcePath}\dist-windows\thrive_messenger\thrive_messenger.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -59,6 +64,15 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser skipifnotsilent; Check: ShouldLaunchAfterSilent
 
 [Code]
+function StartAtLoginNotRefused: Boolean;
+var
+  Choice: String;
+begin
+  Result := True;
+  if RegQueryStringValue(HKEY_CURRENT_USER, 'Software\ThriveMessenger', 'StartAtLogin', Choice) then
+    Result := Choice <> '0';
+end;
+
 const
   UninstKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{98BD1985-BB56-4AF6-8A1A-8D8D5849933D}_is1';
 

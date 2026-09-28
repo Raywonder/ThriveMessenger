@@ -75,6 +75,18 @@ Each conversation has three tabs:
 - **Alt+Down** and **Alt+Up** go to the next or previous message with a link.
 - **Control+Home** and **Control+End** go to the first and last message.
 
+## Reactions
+- React to a message instead of replying: the message context menu has **React** (or press **Alt+R** on a message): thumbs up, thumbs down, heart, laugh, wow, sad, celebrate, check mark, seen, and **More...** for any emoji. Choosing one you already added takes it away.
+- Reactions are read as part of the message, for example "thumbs up from Dom and you, heart from Clawdia". When someone reacts to your message you hear it once, briefly.
+- Agents use reactions too: System Monitor adds "seen" when it starts on your request. A thumbs up from you tells an agent you've seen something, but it isn't approval of anything risky unless it answers a clear yes or no question.
+
+## Staying Connected
+- If the connection drops (the server restarts, the network changes, or your computer wakes from sleep), Thrive says "Reconnecting" once and keeps trying in the background, every 30 seconds at most, for as long as it takes, then says "Reconnected". Messages you type meanwhile are sent when it's back, and anything you missed is filled in.
+
+## Start at Sign-in
+- Settings, General tab: **Start Thrive automatically when I sign in** (on by default), **Start minimised to the tray** (the menu bar on a Mac), and **Say "Started" when Thrive starts at sign-in**. At sign-in Thrive never takes focus. If the network isn't ready yet, it waits quietly and connects when it can.
+- On a Mac this uses Login Items; if you turn it off in System Settings, Thrive's setting shows that.
+
 ## Chat Rooms
 - The **Groups** tab is the room directory: your rooms and public rooms, each read as "name, your role, members, unread, topic". Type in Search rooms and press Enter to filter. Enter on a room opens it; a public room you're not in is joined first.
 - **Create room** asks for a name, topic, description, public or private, and when it expires (never by default). Rooms and their history are kept on the server, so they survive restarts.
