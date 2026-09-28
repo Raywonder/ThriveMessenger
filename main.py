@@ -9352,6 +9352,7 @@ class ChatPanel(wx.Panel):
         self.inner.AddPage(self.archive_page, "Chat Archive")
         self.inner.AddPage(self.transfers_page, "File Transfers")
         self.inner.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_inner_tab_changed)
+        self.inner.Bind(wx.EVT_KEY_DOWN, self.on_inner_tabs_key)
         outer = wx.BoxSizer(wx.VERTICAL)
         outer.Add(self.inner, 1, wx.EXPAND)
         self.SetSizer(outer)
@@ -9420,8 +9421,11 @@ class ChatPanel(wx.Panel):
                 self.window.refresh_chat_label(self)
         if hasattr(self.frame, "_clear_unread"):
             self.frame._clear_unread(self.contact)
-    def on_host_activated(self):
+    def on_host_activated(self, move_focus=True):
         wx.CallAfter(self.mark_newest_read_if_active)
+        if not move_focus:
+            self.clear_tab_unread()
+            return
         if self.inner.GetSelection() == 0:
             self._focus_input()
         else:
@@ -9506,7 +9510,24 @@ class ChatPanel(wx.Panel):
         self.show_inner_tab((self.inner.GetSelection() + step) % count)
     def on_inner_tab_changed(self, event):
         if event.GetEventObject() is self.inner:
-            self._after_inner_switch(self.inner.GetSelection())
+            if wx.Window.FindFocus() is self.inner:
+                # Arrowing along the tab strip only selects tabs: focus stays on the tabs and the screen reader
+                # reads the tab itself. Enter or Tab moves into the page.
+                page = self.inner.GetPage(self.inner.GetSelection())
+                if hasattr(page, "refresh"):
+                    page.refresh()
+            else:
+                self._after_inner_switch(self.inner.GetSelection())
+        event.Skip()
+    def on_inner_tabs_key(self, event):
+        if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER, wx.WXK_SPACE) and not event.HasAnyModifiers():
+            idx = self.inner.GetSelection()
+            page = self.inner.GetPage(idx)
+            if idx == 0:
+                self._focus_input()
+            elif hasattr(page, "focus_default"):
+                page.focus_default()
+            return
         event.Skip()
     def _after_inner_switch(self, idx):
         page = self.inner.GetPage(idx)
@@ -11513,6 +11534,7 @@ class ChatWindow(wx.Frame):
             self.notebook = wx.Notebook(self)
             self.notebook.SetName("Conversations")
             self.notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self.on_page_changed)
+            self.notebook.Bind(wx.EVT_KEY_DOWN, self._on_tabs_key)
             self._sizer.Add(self.notebook, 1, wx.EXPAND)
         else:
             self.notebook = None
@@ -11660,15 +11682,23 @@ class ChatWindow(wx.Frame):
             return
         self._announce_switch = announce
         self.notebook.SetSelection(idx)
+    def _on_tabs_key(self, event):
+        cur = self.current_chat()
+        if cur and event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER, wx.WXK_SPACE) and not event.HasAnyModifiers():
+            cur.on_host_activated()
+            return
+        event.Skip()
     def on_page_changed(self, event):
         cur = self.current_chat()
         announce = self._announce_switch
         self._announce_switch = False
         if cur and self.IsActive():
-            if announce:
+            on_strip = wx.Window.FindFocus() is self.notebook
+            if announce and not on_strip:
                 # Say the tab name first; clearing unread afterwards keeps the count in the announcement.
                 self._announce_current()
-            cur.on_host_activated()
+            # Arrowing along the chat tabs keeps focus on the tabs; Enter or Tab moves into the chat.
+            cur.on_host_activated(move_focus=not on_strip)
         self._update_title()
         event.Skip()
     def on_key(self, event):
