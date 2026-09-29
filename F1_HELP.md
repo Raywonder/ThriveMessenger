@@ -7,6 +7,8 @@
 4. Sign in with your username/password.
 
 ## What's New in Alpha 15.20
+- **iPhone Settings** are now a list of categories (General, Notifications, Privacy, Profile and Authentication), each with a short description. Each category opens its own screen with tabs. See "iPhone settings" below.
+- **iPhone:** a new message in the chat you have open is now read out by VoiceOver (it used to arrive silently). You can change that, and what you hear for other chats, under Settings, Notifications.
 - **Listening without typing:** if the chat is in front but you haven't touched the keyboard for a minute, Thrive now reads new messages in full instead of only saying "New message from …". They stay unread until you press a key in that chat.
 - **Calmer updates:** if Thrive can't reach the update server (you're offline, or the network is slow), it no longer shows an error or wrongly says you're up to date. It tries again by itself after about 5 minutes, 30 minutes and 2 hours. An interrupted update download continues where it stopped.
 - **Update and error reports:** Thrive now tells our server whether updates install and reopen, and about errors, so we can fix problems before you notice them. No personal content is sent, and you can turn it off. See "Update and error reports" below.
@@ -258,8 +260,11 @@ Thrive for iPhone is a separate, native app, now in testing through TestFlight. 
 - In Members, swipe up or down on a member for mute, remove, ban and role changes, when your room role allows it.
 
 ### iPhone settings
-- **Send read receipts**, **Fetch link titles**, **Open links inside Thrive**, and **Room messages when the room isn't open** (only when someone mentions me, every message, or nothing).
-- **Sign out** is in the Account section.
+The Settings tab is a list of categories. Each one says in a line what's inside; nothing is changed on that list. Double-tap a category to open its own screen. At the top of that screen is a row of tabs (swipe to it, then double-tap a tab); VoiceOver says which tab you're on.
+- **General:** tabs **Links** (Open links inside Thrive) and **About** (version, and how to send feedback through TestFlight).
+- **Notifications:** tabs **Chats** and **Rooms**. **New message in the chat I'm in**: read it aloud (the default), play a sound, or nothing. **Messages in other chats**: read the message aloud (the default), say who it's from, or nothing (just count it). **Room messages when the room isn't open**: only when someone mentions me, every message, or nothing.
+- **Privacy:** tabs **Messages** (Send read receipts) and **Links** (Fetch link titles).
+- **Profile and Authentication:** tabs **Account** (who you're signed in as, the server, and **Sign out**) and **Servers**.
 - If the connection drops, a "Reconnecting" banner shows at the top and VoiceOver says "Reconnecting", then "Reconnected". Thrive also checks the connection when you come back to the app.
 
 ## Notes

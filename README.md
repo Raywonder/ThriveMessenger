@@ -136,6 +136,8 @@ The TappedIn build (Alpha 15.20) is on the [Thrive Messenger Setup page](https:/
 
 ### What's new in Alpha 15.20
 
+* **iPhone Settings** are a list of categories, each with a one-line description, and each opens its own screen with tabs. A new message in the chat you have open is now read out by VoiceOver, with settings for what you hear.
+
 * With the chat in front but no key pressed for a minute, new messages are read in full, and stay unread until you press a key.
 * No error and no false "up to date" when the update server can't be reached: Thrive retries quietly (about 5 min, 30 min, 2 h), and interrupted downloads resume.
 * **Update and error reports** (no personal content, can be turned off in Settings): To help us fix problems quickly, Thrive tells our server when an update installs, fails or doesn't reopen, and when the app hits an error. A report contains a random install number (not linked to your account), the Thrive version, your operating system version and a short error description. It never includes your messages, contacts, files, passwords, keys or user name. You can turn this off in Settings, General, "Send update results and error reports". Diagnostic logs are only sent when you choose Help, Submit Diagnostic Logs, and Thrive then gives you a reference to quote.

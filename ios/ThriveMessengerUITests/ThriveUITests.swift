@@ -18,7 +18,11 @@ final class ThriveUITests: XCTestCase {
         let field = app.textFields["Username"]
         XCTAssertTrue(field.waitForExistence(timeout: 10), "sign-in screen")
         field.tap(); field.typeText(user)
-        app.secureTextFields["Password"].tap(); app.secureTextFields["Password"].typeText(pass)
+        let pw = app.secureTextFields["Password"]
+        for _ in 0..<3 where !((pw.value(forKey: "hasKeyboardFocus") as? Bool) ?? false) {
+            pw.tap(); _ = app.keyboards.firstMatch.waitForExistence(timeout: 2)
+        }
+        pw.typeText(pass)
         app.buttons["Sign in"].tap()
         XCTAssertTrue(app.tabBars.buttons["Chats"].waitForExistence(timeout: 45), "signed in")
     }
@@ -62,6 +66,33 @@ final class ThriveUITests: XCTestCase {
         let roomMsg = app.descendants(matching: .any).matching(NSPredicate(format: "label CONTAINS 'room hello from the peer'")).firstMatch
         XCTAssertTrue(roomMsg.waitForExistence(timeout: 15), "room history shown")
         print("ROOM MESSAGE LABEL: \(roomMsg.label)")
+        try app.performAccessibilityAudit(for: [.sufficientElementDescription]) { _ in false }
+    }
+
+    /// Settings root is only categories with a hint each; a category opens its own screen with segmented tabs.
+    func testSettingsCategoriesAndTabs() throws {
+        try signIn()
+        app.tabBars.buttons["Settings"].tap()
+        for id in ["general", "notifications", "privacy", "profile"] {
+            XCTAssertTrue(app.buttons["settings.category.\(id)"].waitForExistence(timeout: 10), "category \(id)")
+        }
+        XCTAssertEqual(app.switches.count, 0, "nothing can be changed on the Settings root")
+        let notif = app.buttons["settings.category.notifications"]
+        print("CATEGORY LABEL: \(notif.label) | VALUE: \(notif.value ?? "")")
+        XCTAssertEqual(notif.value as? String, "What you hear when messages arrive.")
+        try app.performAccessibilityAudit(for: [.sufficientElementDescription, .hitRegion]) { _ in false }
+        notif.tap()
+        XCTAssertTrue(app.navigationBars["Notifications"].waitForExistence(timeout: 5), "category screen")
+        let tabs = app.segmentedControls.firstMatch
+        XCTAssertTrue(tabs.buttons["Chats"].exists && tabs.buttons["Rooms"].exists, "segmented tabs")
+        XCTAssertTrue(app.buttons["New message in the chat I'm in, Read it aloud"].exists || app.staticTexts["New message in the chat I'm in"].exists)
+        try app.performAccessibilityAudit(for: [.sufficientElementDescription]) { _ in false }
+        tabs.buttons["Rooms"].tap()
+        XCTAssertTrue(app.staticTexts["Room messages when the room isn't open"].waitForExistence(timeout: 5)
+                      || app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Room messages'")).firstMatch.exists, "rooms tab")
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        app.buttons["settings.category.profile"].tap()
+        XCTAssertTrue(app.buttons["Sign out"].waitForExistence(timeout: 5), "account tab")
         try app.performAccessibilityAudit(for: [.sufficientElementDescription]) { _ in false }
     }
 }

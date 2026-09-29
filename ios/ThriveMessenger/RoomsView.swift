@@ -152,37 +152,3 @@ struct MembersView: View {
         }
     }
 }
-
-struct SettingsView: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        @Bindable var model = model
-        Form {
-            Section("Account") {
-                Text("Signed in as \(model.username) on \(model.server.name)")
-                Button("Sign out", role: .destructive) { model.signOut() }
-            }
-            Section("Chats") {
-                Toggle("Send read receipts", isOn: $model.sendReadReceipts)
-                Toggle("Fetch link titles", isOn: $model.fetchLinkTitles)
-                Toggle("Open links inside Thrive", isOn: $model.linkOpenInApp)
-                Picker("Room messages when the room isn't open", selection: $model.roomAlerts) {
-                    Text("Only when someone mentions me").tag("mentions")
-                    Text("Announce every message").tag("all")
-                    Text("Nothing").tag("none")
-                }
-            }
-            Section("Servers") {
-                ForEach(model.servers) { s in
-                    Text(s.id == model.server.id ? "\(s.name), current" : s.name)
-                }
-                Text("More servers, including your own, are coming in a later version.").font(.footnote)
-            }
-            Section("About") {
-                Text("Thrive for iPhone \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "") (\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""))")
-            }
-        }
-        .navigationTitle("Settings")
-    }
-}

@@ -1,3 +1,4 @@
+import AudioToolbox
 import Foundation
 import Network
 import Observation
@@ -55,6 +56,10 @@ final class AppModel {
     var fetchLinkTitles: Bool { didSet { defaults.set(fetchLinkTitles, forKey: "fetch_link_titles") } }
     var linkOpenInApp: Bool { didSet { defaults.set(linkOpenInApp, forKey: "link_open_in_app") } }
     var roomAlerts: String { didSet { defaults.set(roomAlerts, forKey: "room_alerts") } }
+    /// A new message in the conversation on screen: "read" it aloud, play a "sound", or "none" (desktop 15.19 parity).
+    var openChatAlert: String { didSet { defaults.set(openChatAlert, forKey: "open_chat_new_message") } }
+    /// A direct message in another conversation: "read" it aloud, say only the "name", or "none" (unread count only).
+    var otherChatAlert: String { didSet { defaults.set(otherChatAlert, forKey: "other_chat_new_message") } }
 
     private let defaults = UserDefaults.standard
     private var connection: ThriveConnection?
@@ -78,6 +83,8 @@ final class AppModel {
         fetchLinkTitles = defaults.object(forKey: "fetch_link_titles") as? Bool ?? true
         linkOpenInApp = defaults.object(forKey: "link_open_in_app") as? Bool ?? true
         roomAlerts = defaults.string(forKey: "room_alerts") ?? "mentions"
+        openChatAlert = defaults.string(forKey: "open_chat_new_message") ?? "read"
+        otherChatAlert = defaults.string(forKey: "other_chat_new_message") ?? "read"
         username = defaults.string(forKey: "username") ?? ""
         if ProcessInfo.processInfo.arguments.contains("--reset-for-tests") {
             Keychain.delete(server: server.id, user: username)
@@ -447,6 +454,14 @@ final class AppModel {
 
     // MARK: server events
 
+    private func announceInOpenChat(_ text: String) {
+        switch openChatAlert {
+        case "sound": AudioServicesPlaySystemSound(1003)
+        case "none": break
+        default: Announce.say(text)
+        }
+    }
+
     private func handle(_ obj: [String: Any]) {
         lastActivity = Date()
         if loginPending, obj["status"] != nil { loginResult(obj); return }
@@ -552,11 +567,18 @@ final class AppModel {
         c.messages.append(m)
         requestTitles(for: m.text)
         if from.lowercased() != me {
+            let spoken = "\(from): \(m.voice != nil ? "voice message" : m.text)"
             if openConversation == c.id {
+                // Used to arrive silently in the chat on screen, so people missed it.
+                announceInOpenChat(spoken)
                 if UIApplication.shared.applicationState == .active { markRead(upTo: m, in: c) }
             } else if let i = contacts.firstIndex(where: { $0.user.lowercased() == other.lowercased() }) {
                 contacts[i].unread += 1
-                Announce.say("\(from): \(m.voice != nil ? "voice message" : m.text)")
+                switch otherChatAlert {
+                case "name": Announce.say("New message from \(from)")
+                case "none": break
+                default: Announce.say(spoken)
+                }
             }
         }
     }
@@ -659,6 +681,7 @@ final class AppModel {
             let roomName = c.room?.name ?? rooms.first { $0.id == roomID }?.name ?? "a room"
             if openConversation == c.id {
                 if mentioned { Announce.say("\(m.sender) mentioned you: \(m.text)", important: true) }
+                else { announceInOpenChat("\(m.sender): \(m.text)") }
                 if UIApplication.shared.applicationState == .active { markRead(upTo: m, in: c) }
             } else if mentioned {
                 Announce.say("\(m.sender) mentioned you in \(roomName): \(m.text)", important: true)
