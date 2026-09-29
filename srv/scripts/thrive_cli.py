@@ -804,6 +804,283 @@ def cmd_register_bot_session(args: argparse.Namespace) -> None:
         sock.close()
 
 
+# ---------------------------------------------------------------------------
+# agent-inbox: reliable DM hand-off for external agents (e.g. Adam on Muse).
+# Each incoming DM becomes a file in INBOX/new/. The agent handles it, then moves it to INBOX/done/
+# (or runs `agent-inbox-ack`); only then is the read receipt sent, so "read" means the agent saw it.
+# Replies go out through this same connection via INBOX/outbox/*.json, so a second login can't
+# steal the session. Unread DMs are caught up from server history on every (re)connect, the
+# connection is re-established forever with backoff, and a bot-session heartbeat keeps the
+# agent's presence visible to the server (and to System Monitor's watcher).
+
+class _LineReader:
+    """Buffered JSON-lines reader: a timeout never loses a half-received line (important behind slow proxies)."""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buf = bytearray()
+
+    def read(self, timeout: float) -> Dict[str, Any]:
+        """Next event, or {} if nothing complete arrived within `timeout`. Raises ConnectionError on close."""
+        deadline = time.time() + timeout
+        while b"\n" not in self.buf:
+            left = deadline - time.time()
+            if left <= 0:
+                return {}
+            self.sock.settimeout(left)
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                return {}
+            if not chunk:
+                raise ConnectionError("connection closed")
+            self.buf.extend(chunk)
+        line, _, rest = bytes(self.buf).partition(b"\n")
+        self.buf = bytearray(rest)
+        if not line.strip():
+            return {}
+        return json.loads(line.decode("utf-8", errors="replace"))
+
+
+def _inbox_dirs(root: Path) -> Dict[str, Path]:
+    dirs = {name: root / name for name in ("new", "done", "outbox", "sent", "state")}
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def _inbox_msg_path(dirs: Dict[str, Path], msg_id: str, sub: str = "new") -> Path:
+    return dirs[sub] / (safe_filename(str(msg_id)) + ".json")
+
+
+def _inbox_write_atomic(path: Path, payload: Dict[str, Any]) -> None:
+    tmp = path.with_name("." + path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _inbox_known(dirs: Dict[str, Path], msg_id: str) -> bool:
+    return any(_inbox_msg_path(dirs, msg_id, sub).exists() for sub in ("new", "done"))
+
+
+def _inbox_store(dirs: Dict[str, Path], item: Dict[str, Any], args: argparse.Namespace, source: str) -> bool:
+    msg_id = str(item.get("id") or "")
+    if not msg_id or _inbox_known(dirs, msg_id):
+        return False
+    record = {
+        "id": msg_id,
+        "from": item.get("from", ""),
+        "to": item.get("to", args.username),
+        "msg": item.get("msg", ""),
+        "time": item.get("time", ""),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "how_to_reply": f"write a JSON file into {dirs['outbox']} with to, msg and reply_to={msg_id}",
+        "how_to_mark_handled": f"move this file into {dirs['done']}",
+    }
+    path = _inbox_msg_path(dirs, msg_id)
+    _inbox_write_atomic(path, record)
+    emit({"status": "ok", "event": "inbox_new", "id": msg_id, "from": record["from"], "source": source}, args.json)
+    if args.on_message:
+        try:
+            import subprocess
+            env = dict(os.environ, THRIVE_MSG_FILE=str(path), THRIVE_MSG_FROM=str(record["from"]), THRIVE_MSG_ID=msg_id)
+            env.pop("THRIVE_PASSWORD", None)
+            subprocess.Popen(args.on_message, shell=True, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception as exc:
+            emit({"status": "warning", "event": "on_message_failed", "reason": str(exc)}, args.json)
+    return True
+
+
+def _inbox_catch_up(sock: socket.socket, reader: "_LineReader", dirs: Dict[str, Path], args: argparse.Namespace, backlog: List[Dict[str, Any]]) -> int:
+    """Ask the server for recent history with each contact and file any DM to us that is still unread."""
+    found = 0
+    for contact in [c.strip() for c in (args.catch_up_with or "").split(",") if c.strip()]:
+        rid = uuid.uuid4().hex[:12]
+        send_json(sock, {"action": "history_request", "with": contact, "limit": 50, "request_id": rid})
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            event = reader.read(2.0)
+            if not event:
+                continue
+            if event.get("action") == "history" and event.get("request_id") == rid:
+                for item in event.get("messages") or []:
+                    if (str(item.get("to", "")).lower() == args.username.lower() and not item.get("read_at")
+                            and _inbox_store(dirs, item, args, "catch_up")):
+                        found += 1
+                break
+            backlog.append(event)
+    return found
+
+
+def _inbox_flush(sock: socket.socket, dirs: Dict[str, Path], args: argparse.Namespace) -> None:
+    # Handled messages -> read receipts.
+    acked = []
+    for f in sorted(dirs["done"].glob("*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if rec.get("read_sent"):
+            continue
+        acked.append(str(rec.get("id") or f.stem))
+        rec["read_sent"] = datetime.now(timezone.utc).isoformat()
+        _inbox_write_atomic(f, rec)
+    if acked:
+        send_json(sock, {"action": "msg_read", "ids": acked})
+        emit({"status": "ok", "event": "inbox_read_sent", "ids": acked}, args.json)
+    # Outbox -> messages. A reply only counts as sent once the server confirms it (msg_sent); if the
+    # recipient is offline the server refuses it, so it stays in the outbox and is retried every minute.
+    now = time.time()
+    for f in sorted(dirs["outbox"].glob("*.json")):
+        key = f.name
+        state = _OUTBOX_STATE.get(key)
+        if state and state.get("waiting"):
+            if now - state["sent_at"] > 15:
+                state["waiting"] = False
+                state["retry_at"] = now + 60
+                emit({"status": "warning", "event": "inbox_send_unconfirmed", "file": key,
+                      "note": "recipient probably offline; will retry"}, args.json)
+            continue
+        if state and now < state.get("retry_at", 0):
+            continue
+        try:
+            out = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        to, text = str(out.get("to") or "").strip(), str(out.get("msg") or "")
+        reply_to = str(out.get("reply_to") or "")
+        if not to and reply_to:
+            src = _inbox_msg_path(dirs, reply_to)
+            if not src.exists():
+                src = _inbox_msg_path(dirs, reply_to, "done")
+            try:
+                to = json.loads(src.read_text(encoding="utf-8")).get("from", "")
+            except Exception:
+                to = ""
+        if not to or not text:
+            os.replace(f, dirs["sent"] / (f.stem + ".invalid.json"))
+            continue
+        ids = []
+        for part in split_message(text, 3500):
+            cid = uuid.uuid4().hex
+            ids.append(cid)
+            send_json(sock, {"action": "msg", "to": to, "from": args.username, "msg": part,
+                             "time": datetime.now().isoformat(), "client_id": cid})
+        _OUTBOX_STATE[key] = {"waiting": True, "sent_at": now, "ids": set(ids), "to": to, "reply_to": reply_to}
+
+
+_OUTBOX_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _inbox_on_msg_sent(dirs: Dict[str, Path], event: Dict[str, Any], args: argparse.Namespace) -> None:
+    cid = str(event.get("client_id") or "")
+    for key, state in list(_OUTBOX_STATE.items()):
+        if cid in state.get("ids", set()):
+            state["ids"].discard(cid)
+            if state["ids"]:
+                return
+            f = dirs["outbox"] / key
+            if f.exists():
+                os.replace(f, dirs["sent"] / key)
+            _OUTBOX_STATE.pop(key, None)
+            emit({"status": "ok", "event": "inbox_sent", "to": state["to"], "reply_to": state["reply_to"]}, args.json)
+            reply_to = state.get("reply_to")
+            if reply_to:
+                src = _inbox_msg_path(dirs, reply_to)
+                if src.exists():
+                    os.replace(src, _inbox_msg_path(dirs, reply_to, "done"))
+            return
+
+def _inbox_heartbeat_file(dirs: Dict[str, Path], connected: bool, note: str = "") -> None:
+    pending = len(list(dirs["new"].glob("*.json")))
+    _inbox_write_atomic(dirs["state"] / "heartbeat.json", {
+        "time": datetime.now(timezone.utc).isoformat(), "connected": connected, "pending": pending,
+        "pid": os.getpid(), "note": note})
+
+
+def cmd_agent_inbox(args: argparse.Namespace) -> None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    dirs = _inbox_dirs(args.inbox.expanduser())
+    backoff = 5.0
+    while True:
+        sock = None
+        try:
+            try:
+                sock = login(args)
+            except SystemExit:
+                raise ConnectionError("login failed")
+            backoff = 5.0
+            session_id = f"{args.username}:{args.host_label}:{os.getpid()}:{secrets.token_hex(6)}"
+            send_json(sock, {"action": "register_bot_session", "session_id": session_id, "auth_type": "agent",
+                             "runtime": "agent-inbox", "host_label": args.host_label, "platform": sys.platform,
+                             "capabilities": ["chat"], "transports": ["thrive"], "accepts_files": False,
+                             "supports_delegation": False, "background": True})
+            for st in _OUTBOX_STATE.values():
+                st["waiting"] = False
+                st["retry_at"] = 0
+            reader = _LineReader(sock)
+            backlog: List[Dict[str, Any]] = []
+            caught = _inbox_catch_up(sock, reader, dirs, args, backlog)
+            emit({"status": "ok", "event": "inbox_connected", "caught_up": caught,
+                  "pending": len(list(dirs["new"].glob("*.json")))}, args.json)
+            _inbox_heartbeat_file(dirs, True, "connected")
+            last_beat = 0.0
+            while True:
+                event = backlog.pop(0) if backlog else reader.read(2.0)
+                action = event.get("action", "")
+                if action == "msg" and not event.get("echo") and str(event.get("from", "")).lower() != args.username.lower():
+                    _inbox_store(dirs, event, args, "live")
+                elif action == "msg_sent":
+                    _inbox_on_msg_sent(dirs, event, args)
+                elif action and args.verbose:
+                    emit({"status": "ok", "event": action}, args.json)
+                _inbox_flush(sock, dirs, args)
+                if time.time() - last_beat >= args.heartbeat:
+                    send_json(sock, {"action": "bot_session_heartbeat", "session_id": session_id, "host_label": args.host_label})
+                    _inbox_heartbeat_file(dirs, True, "heartbeat")
+                    last_beat = time.time()
+        except KeyboardInterrupt:
+            _inbox_heartbeat_file(dirs, False, "stopped")
+            return
+        except Exception as exc:
+            _inbox_heartbeat_file(dirs, False, f"disconnected: {exc}")
+            emit({"status": "warning", "event": "inbox_disconnected", "reason": str(exc), "retry_in": backoff}, args.json)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        time.sleep(backoff)
+        backoff = min(60.0, backoff * 2)
+
+
+def cmd_agent_inbox_ack(args: argparse.Namespace) -> None:
+    dirs = _inbox_dirs(args.inbox.expanduser())
+    moved = []
+    for msg_id in args.ids:
+        src = _inbox_msg_path(dirs, msg_id)
+        if src.exists():
+            os.replace(src, _inbox_msg_path(dirs, msg_id, "done"))
+            moved.append(msg_id)
+    emit({"status": "ok", "handled": moved, "note": "read receipts go out from the running agent-inbox listener"}, args.json)
+
+
+def cmd_agent_inbox_reply(args: argparse.Namespace) -> None:
+    dirs = _inbox_dirs(args.inbox.expanduser())
+    out = {"reply_to": args.id, "msg": args.message if args.message != "-" else sys.stdin.read()}
+    if args.to:
+        out["to"] = args.to
+    path = dirs["outbox"] / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}.json"
+    _inbox_write_atomic(path, out)
+    emit({"status": "ok", "queued": str(path), "note": "the running agent-inbox listener sends it and marks the message handled"}, args.json)
+
+
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Print stable JSON output.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Path to srv.conf.")
@@ -943,6 +1220,28 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument("--auto-decline-calls", action="store_true", help="Decline incoming direct voice calls instead of leaving them ringing.")
     reg.add_argument("--call-decline-message", default="", help="Optional direct message sent to the caller after auto-declining.")
     reg.set_defaults(func=cmd_register_bot_session)
+
+    inbox = sub.add_parser("agent-inbox", help="Reliable DM hand-off for agents: inbox files, read receipts only after the agent handles a message, replies via outbox, catch-up, auto-reconnect, heartbeat.")
+    add_login_args(inbox)
+    inbox.add_argument("--inbox", type=Path, required=True, help="Persistent inbox folder (new/, done/, outbox/, sent/, state/). Never under /tmp.")
+    inbox.add_argument("--catch-up-with", default="tappedinfm,SystemMonitor,Clawdia", help="Comma-separated contacts whose unread DMs are fetched on every (re)connect.")
+    inbox.add_argument("--on-message", default="", help="Shell command run (detached) for each new DM; gets THRIVE_MSG_FILE, THRIVE_MSG_FROM, THRIVE_MSG_ID. Use it to wake the agent.")
+    inbox.add_argument("--heartbeat", type=float, default=30.0, help="Seconds between presence heartbeats.")
+    inbox.add_argument("--host-label", default=socket.gethostname(), help="Host label shown in the bot session.")
+    inbox.add_argument("--verbose", action="store_true", help="Print every server event, not just inbox events.")
+    inbox.set_defaults(func=cmd_agent_inbox)
+
+    ack = sub.add_parser("agent-inbox-ack", help="Mark inbox messages handled (moves new/ID.json to done/); the running listener then sends the read receipts.")
+    ack.add_argument("--inbox", type=Path, required=True)
+    ack.add_argument("ids", nargs="+")
+    ack.set_defaults(func=cmd_agent_inbox_ack)
+
+    rep = sub.add_parser("agent-inbox-reply", help="Queue a reply for the running agent-inbox listener to send (and mark the message handled).")
+    rep.add_argument("--inbox", type=Path, required=True)
+    rep.add_argument("--id", required=True, help="Inbox message id being answered.")
+    rep.add_argument("--to", default="", help="Recipient (default: the sender of --id).")
+    rep.add_argument("message", help="Reply text, or - for stdin.")
+    rep.set_defaults(func=cmd_agent_inbox_reply)
 
     return parser
 
