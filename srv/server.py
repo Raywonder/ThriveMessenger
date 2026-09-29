@@ -705,10 +705,19 @@ def _prepare_voice_message(msg):
     msg["msg"] = f"{label} ({_format_duration(duration)})"
     return True, "", mp3
 
-def _store_voice_file(msg_uid, mp3):
+def _voice_subfolder(name):
+    """One folder per sender (or Rooms/<room id>) instead of everything in one flat folder (Dom, 2026-09-29)."""
+    cleaned = re.sub(r'[^A-Za-z0-9._@-]', "_", str(name or "")).strip("._") or "unknown"
+    return cleaned[:80]
+
+def _store_voice_file(msg_uid, mp3, owner=None, room_id=None):
     try:
-        os.makedirs(VOICE_DIR, mode=0o700, exist_ok=True)
-        path = os.path.join(VOICE_DIR, f"{msg_uid}.mp3")
+        if room_id:
+            folder = os.path.join(VOICE_DIR, "Rooms", _voice_subfolder(room_id))
+        else:
+            folder = os.path.join(VOICE_DIR, _voice_subfolder(owner))
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        path = os.path.join(folder, f"{msg_uid}.mp3")
         with open(path, "wb") as fh:
             fh.write(mp3)
         return path
@@ -1393,7 +1402,7 @@ def _handle_room_action(sock, user, action, msg):
                 ok, reason, mp3 = _prepare_voice_message(msg)
                 if not ok:
                     raise rooms.RoomError(reason)
-                path = _store_voice_file("room-" + uuid.uuid4().hex, mp3)
+                path = _store_voice_file("room-" + uuid.uuid4().hex, mp3, room_id=room_id)
                 if not path:
                     raise rooms.RoomError("The server couldn't save that voice message.")
                 _room_post(room_id, user, msg["msg"], client_id=client_id, kind="voice", voice_path=path,
@@ -6741,7 +6750,7 @@ def handle_client(cs, addr):
                     if not delivered_to_user:
                         reason = f"{to} is offline."
                 if voice_mp3 is not None and not reason and not handled_by_bot:
-                    attachment_path = _store_voice_file(msg["id"], voice_mp3)
+                    attachment_path = _store_voice_file(msg["id"], voice_mp3, owner=frm)
                 if not reason or handled_by_bot or _is_registered_bot(to):
                     _record_direct_message_history(
                         frm,
