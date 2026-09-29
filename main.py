@@ -13,11 +13,16 @@ except Exception:
     wxmedia = None
 import unicodedata, wave, io
 try:
+    from app_health import AppHealth, classify as health_classify
+except Exception:  # never let reporting stop Thrive from starting
+    AppHealth = None
+    def health_classify(exc): return "app"
+try:
     import wx.html2 as wxhtml2
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.19"
+VERSION_TAG = "v2026-alpha15.20"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -26,7 +31,9 @@ BARE_DOMAIN_REGEX = re.compile(
 KEYRING_SERVICE = "ThriveMessenger"
 PASSKEY_KEYRING_SERVICE = "ThriveMessengerPasskey"
 DEFAULT_SOUNDPACK_BASE_URL = "https://im.tappedin.fm/thrive/sounds"
-DEFAULT_LOG_SUBMIT_URL = "https://im.tappedin.fm/thrive/logs"
+APP_HEALTH_KEY = "ah1-thrive-c0ce2f6aebba73a2"  # public per-app client id for the app-health collector (not a secret)
+HEALTH = None  # AppHealth instance once the app starts
+UPDATE_LAST_CHECK = {}  # {"ok": bool, "error_class": "network|server|app", "error": str}
 TYPING_IDLE_STOP_MS = 6000
 LOGIN_RESPONSE_TIMEOUT = 20
 IDLE_KEEPALIVE_SECONDS = 15 * 60
@@ -427,7 +434,6 @@ def load_user_config():
         'soundpack': 'default',
         'default_soundpack': 'default',
         'soundpack_base_url': DEFAULT_SOUNDPACK_BASE_URL,
-        'log_submit_url': DEFAULT_LOG_SUBMIT_URL,
         'sound_volume': 80,
         'call_soundpack': 'flexpbx',
         'auto_play_voice_messages': False,
@@ -471,6 +477,7 @@ def load_user_config():
         'incoming_popup_on_message': False,
         'incoming_alert_on_message': False,
         'incoming_message_behavior': 'silent_count',
+        'send_app_health': True,
         'open_chat_new_message': 'read',
         'notify_on_other_device_login': False,
         'message_timestamp_mode': 'start',
@@ -726,40 +733,11 @@ def _read_log_tail(path, max_bytes=256 * 1024):
         return ""
 
 def submit_logs_payload(config_dict, reason="manual"):
-    base_url = str(config_dict.get("log_submit_url", DEFAULT_LOG_SUBMIT_URL) or "").strip().rstrip("/")
-    if not base_url:
-        return False, "Log submit URL is not configured."
-    payload = {
-        "app": "Thrive Messenger",
-        "version": VERSION_TAG,
-        "reason": reason,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "username": str(config_dict.get("username", "") or ""),
-        "server": normalize_server_entry(config_dict.get("server_entries", [{}])[0] if config_dict.get("server_entries") else SERVER_CONFIG).get("name", "unknown"),
-        "platform": platform.platform(),
-        "log_tail": _read_log_tail(get_log_path()),
-    }
-    body = json.dumps(payload).encode("utf-8")
-    file_name = f"log-{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}.json"
-    url = f"{base_url}/{urllib.parse.quote(file_name)}"
-    req = urllib.request.Request(
-        url,
-        data=body,
-        method="PUT",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})",
-            "X-Thrive-Client": "desktop",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            code = int(getattr(resp, "status", 200))
-        if 200 <= code < 300:
-            return True, None
-        return False, f"Server returned status {code}"
-    except Exception as e:
-        return False, str(e)
+    """Send the log tail to the app-health collector. Returns (ok, reference or error text).
+    No user name or server name goes with it; the collector redacts emails, tokens and folders too."""
+    if HEALTH is None:
+        return False, "Diagnostics aren't available in this copy of Thrive."
+    return HEALTH.submit_diagnostics(_read_log_tail(get_log_path()), note=str(reason or ""))
 
 def prompt_submit_logs(parent, config_dict, reason, intro="A diagnostic report can be submitted to help troubleshoot this issue. Submit now?"):
     res = wx.MessageBox(intro, "Submit Diagnostics", wx.YES_NO | wx.ICON_QUESTION, parent)
@@ -767,8 +745,7 @@ def prompt_submit_logs(parent, config_dict, reason, intro="A diagnostic report c
         return False
     ok, err = submit_logs_payload(config_dict, reason=reason)
     if ok:
-        show_notification("Diagnostics", "Logs submitted successfully.", timeout=4)
-        wx.MessageBox("Diagnostic logs submitted successfully.", "Logs Submitted", wx.OK | wx.ICON_INFORMATION, parent)
+        wx.MessageBox(f"Diagnostic logs sent. If you contact us about this, your reference is {err}.", "Logs Submitted", wx.OK | wx.ICON_INFORMATION, parent)
         log_event("info", "logs_submitted_prompted", {"reason": reason})
         return True
     wx.MessageBox(f"Could not submit logs:\n{err}", "Log Submit Failed", wx.OK | wx.ICON_ERROR, parent)
@@ -1533,6 +1510,8 @@ def check_for_update(callback):
                 return
             settings = _load_update_settings()
             UPDATE_CONTEXT.clear()
+            UPDATE_LAST_CHECK.clear()
+            reached, failures = False, []
 
             feed_url = settings.get("feed_url")
             if feed_url:
@@ -1540,6 +1519,7 @@ def check_for_update(callback):
                     feed_req = urllib.request.Request(feed_url, headers={"User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})", "Accept": "application/json"})
                     with urllib.request.urlopen(feed_req, timeout=15) as resp:
                         feed_data = json.loads(resp.read().decode())
+                    reached = True
                     update = parse_update_feed(feed_data, VERSION_TAG, sys.platform)
                     if update:
                         update["feed_url"] = feed_url
@@ -1548,6 +1528,7 @@ def check_for_update(callback):
                         return
                 except Exception as feed_err:
                     print(f"Update feed check failed: {feed_err}")
+                    failures.append(feed_err)
 
             best = None
             for repo in settings.get("repos", []):
@@ -1556,8 +1537,10 @@ def check_for_update(callback):
                 try:
                     with urllib.request.urlopen(req, timeout=15) as resp:
                         data = json.loads(resp.read().decode())
+                    reached = True
                 except Exception as repo_err:
                     print(f"Update check failed for {repo}: {repo_err}")
+                    failures.append(repo_err)
                     continue
                 tag = data.get("tag_name", "")
                 remote = parse_github_tag(tag)
@@ -1569,41 +1552,67 @@ def check_for_update(callback):
                 UPDATE_CONTEXT.update({"source": "repo", "repo": best["repo"], "tag": best["tag"]})
                 wx.CallAfter(callback, best["tag"], ".".join(str(x) for x in best["remote"]), None)
                 return
+            if not reached and failures:
+                # Nothing answered: that's not "up to date". Most often the user is offline.
+                UPDATE_LAST_CHECK.update(ok=False, error_class=health_classify(failures[0]), error=str(failures[0])[:300])
+                wx.CallAfter(callback, None, None, "Thrive couldn't reach the update server.")
+                return
+            UPDATE_LAST_CHECK.update(ok=True)
             wx.CallAfter(callback, None, None, None)
         except Exception as e:
+            UPDATE_LAST_CHECK.update(ok=False, error_class=health_classify(e), error=str(e)[:300])
             wx.CallAfter(callback, None, None, str(e))
     threading.Thread(target=_check, daemon=True).start()
 
+class UpdateVerifyError(Exception):
+    """The downloaded file doesn't match the feed's checksum (our side, not the network)."""
+
 def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
+    """Download to dest via dest + '.part'. An interrupted download is kept and resumed next time (HTTP Range)."""
     def _download():
         import urllib.request
+        part = dest + ".part"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})"})
+            have = os.path.getsize(part) if os.path.exists(part) else 0
+            headers = {"User-Agent": f"ThriveMessenger/{VERSION_TAG} ({sys.platform})"}
+            if have:
+                headers["Range"] = f"bytes={have}-"
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=120) as resp:
-                total = int(resp.headers.get('Content-Length', 0))
-                downloaded = 0
-                digest = hashlib.sha256()
-                with open(dest, 'wb') as f:
+                resumed = bool(have) and int(getattr(resp, "status", 200) or 200) == 206
+                length = int(resp.headers.get('Content-Length', 0) or 0)
+                if not resumed:
+                    have = 0
+                total = have + length if length else 0
+                downloaded = have
+                with open(part, 'ab' if resumed else 'wb') as f:
                     while True:
                         chunk = resp.read(65536)
                         if not chunk: break
                         f.write(chunk)
-                        digest.update(chunk)
                         downloaded += len(chunk)
                         if total > 0:
                             pct = min(int(downloaded * 100 / total), 100)
                             wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
-                if total > 0 and downloaded != total:
-                    raise RuntimeError(f"Update download was incomplete: received {downloaded} of {total} bytes.")
-                if expected_sha256 and digest.hexdigest().lower() != str(expected_sha256).lower():
-                    raise RuntimeError("Update download failed SHA-256 verification.")
+            if total > 0 and downloaded != total:
+                raise ConnectionError(f"Update download was interrupted: received {downloaded} of {total} bytes.")
+            if expected_sha256:
+                digest = hashlib.sha256()
+                with open(part, 'rb') as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        digest.update(block)
+                if digest.hexdigest().lower() != str(expected_sha256).lower():
+                    os.remove(part)
+                    raise UpdateVerifyError("Update download failed SHA-256 verification.")
+            os.replace(part, dest)
             wx.CallAfter(callback, True, None)
         except Exception as e:
-            try:
-                if os.path.exists(dest): os.remove(dest)
-            except OSError:
-                pass
-            wx.CallAfter(callback, False, str(e))
+            if health_classify(e) != "network" or isinstance(e, UpdateVerifyError):
+                try:
+                    if os.path.exists(part): os.remove(part)
+                except OSError:
+                    pass
+            wx.CallAfter(callback, False, e)
     threading.Thread(target=_download, daemon=True).start()
 
 def apply_installer_update(installer_path):
@@ -1988,6 +1997,10 @@ class SettingsDialog(wx.Dialog):
             label="Notify me when this account signs in from another device",
         )
         self.notify_other_device_login_cb.SetValue(bool(self.config.get('notify_on_other_device_login', False)))
+        self.send_health_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Send update results and error reports (no personal content)")
+        self.send_health_cb.SetValue(bool(self.config.get('send_app_health', True)))
+        self.send_health_cb.SetToolTip("Tells our server when an update installs, fails or doesn't reopen, and when Thrive hits an error. "
+                                       "Never your messages, contacts, files, passwords or user name.")
         session_row = wx.BoxSizer(wx.HORIZONTAL)
         session_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Keep this device authenticated for:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.session_duration_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=["One hour", "One day", "One week", "One month", "One year", "Forever"])
@@ -2233,6 +2246,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.announce_typing_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.prefer_display_names_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.notify_other_device_login_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.send_health_cb, 0, wx.ALL, 5)
         accessibility_box.Add(session_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(incoming_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(open_chat_row, 0, wx.EXPAND | wx.ALL, 5)
@@ -2335,7 +2349,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb, self.start_at_login_cb, self.start_minimized_cb, self.announce_autostart_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb, self.start_at_login_cb, self.start_minimized_cb, self.announce_autostart_cb, self.send_health_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -2731,6 +2745,27 @@ class ClientApp(wx.App):
         except Exception:
             return False
 
+    def _start_app_health(self):
+        global HEALTH
+        if AppHealth is None or HEALTH is not None:
+            return
+        try:
+            HEALTH = AppHealth("thrive", APP_HEALTH_KEY, VERSION_TAG, data_dir=get_config_dir(), channel="alpha")
+            HEALTH.set_enabled(bool(self.user_config.get('send_app_health', True)))
+            HEALTH.on_startup()  # works out whether the last update installed and reopened
+        except Exception as e:
+            print(f"App health unavailable: {e}")
+            HEALTH = None
+            return
+        previous_hook = sys.excepthook
+        def _report_unhandled(exc_type, exc, tb):
+            try:
+                if HEALTH is not None and not issubclass(exc_type, KeyboardInterrupt):
+                    HEALTH.report_error("error", exc)
+            except Exception:
+                pass
+            previous_hook(exc_type, exc, tb)
+        sys.excepthook = _report_unhandled
     def OnInit(self):
         log_event("info", "app_start")
         self._startup_ui_started = False
@@ -2758,6 +2793,7 @@ class ClientApp(wx.App):
             print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
             log_event("warn", "ipc_bind_unavailable_continuing")
         self.user_config = load_user_config()
+        self._start_app_health()
         self.autostart = AUTOSTART_ARG in sys.argv[1:]
         if autostart_supported() and not self.user_config.get('start_at_login_initialized'):
             # New default: on. Applied once, so a later choice in Settings (or System Settings) is respected.
@@ -5697,8 +5733,7 @@ class MainFrame(wx.Frame):
         app = wx.GetApp()
         ok, err = submit_logs_payload(app.user_config, reason="manual_submit")
         if ok:
-            show_notification("Diagnostics", "Logs submitted successfully.", timeout=4)
-            wx.MessageBox("Diagnostic logs submitted successfully.", "Logs Submitted", wx.OK | wx.ICON_INFORMATION)
+            wx.MessageBox(f"Diagnostic logs sent. If you contact us about this, your reference is {err}.", "Logs Submitted", wx.OK | wx.ICON_INFORMATION, self)
             log_event("info", "logs_submitted_manual")
         else:
             wx.MessageBox(f"Could not submit logs:\n{err}", "Log Submit Failed", wx.OK | wx.ICON_ERROR)
@@ -5938,6 +5973,9 @@ class MainFrame(wx.Frame):
         app.user_config['announce_typing'] = dlg.announce_typing_cb.IsChecked()
         app.user_config['prefer_contact_display_names'] = dlg.prefer_display_names_cb.IsChecked()
         app.user_config['notify_on_other_device_login'] = dlg.notify_other_device_login_cb.IsChecked()
+        app.user_config['send_app_health'] = dlg.send_health_cb.IsChecked()
+        if HEALTH is not None:
+            HEALTH.set_enabled(app.user_config['send_app_health'])
         app.user_config['session_duration'] = ['hour', 'day', 'week', 'month', 'year', 'forever'][dlg.session_duration_choice.GetSelection()]
         incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
         incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
@@ -6345,9 +6383,24 @@ class MainFrame(wx.Frame):
         def _callback(tag, version_str, error):
             if not self: return
             self.btn_update.Enable()
+            if error:
+                cls = UPDATE_LAST_CHECK.get("error_class", "app")
+                if HEALTH is not None:
+                    HEALTH.update_failed("check", UPDATE_LAST_CHECK.get("error") or error, error_class=cls)
+                if cls == "network":
+                    # The user's side (offline, DNS, captive portal): no error dialog, just try again quietly.
+                    self._schedule_update_retry()
+                    if not silent:
+                        wx.MessageBox("Thrive couldn't reach the update server. Check that you're online. "
+                                      "Thrive will keep trying by itself.", "Update Check", wx.ICON_INFORMATION, self)
+                    return
+            else:
+                self._update_retry_step = 0
             if tag and silent and tag == getattr(self, "_declined_update_tag", None):
                 return  # already asked about this version; Help > Check for Updates still offers it
             if tag:
+                if HEALTH is not None:
+                    HEALTH.send("update_available", to_version=tag, stage="check")
                 result = wx.MessageBox(
                     f"A new version is available: {tag}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
                     "Update Available", wx.YES_NO | wx.ICON_INFORMATION, self)
@@ -6360,6 +6413,19 @@ class MainFrame(wx.Frame):
             elif not error and not silent:
                 wx.MessageBox(f"You're up to date. {VERSION_TAG} is the latest version.", "No Updates", wx.ICON_INFORMATION, self)
         check_for_update(_callback)
+    UPDATE_RETRY_MINUTES = (5, 30, 120)
+    def _schedule_update_retry(self):
+        """Quiet retries after a network failure: about 5 min, 30 min, 2 h, then the normal 6-hour schedule."""
+        step = getattr(self, "_update_retry_step", 0)
+        if step >= len(self.UPDATE_RETRY_MINUTES) or getattr(self, "_update_retry_pending", False):
+            return
+        self._update_retry_step = step + 1
+        self._update_retry_pending = True
+        def _retry():
+            self._update_retry_pending = False
+            if self and not getattr(self, "is_exiting", False):
+                self.on_check_updates(silent=True)
+        wx.CallLater(self.UPDATE_RETRY_MINUTES[step] * 60 * 1000, _retry)
     def _start_update_download(self, tag):
         import urllib.request
         use_installer = is_installer_install()
@@ -6390,6 +6456,7 @@ class MainFrame(wx.Frame):
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read().decode())
             except Exception as e:
+                if HEALTH is not None: HEALTH.update_failed("check", e, to_version=tag)
                 wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
             assets = data.get("assets", [])
             for name in target_candidates:
@@ -6406,6 +6473,7 @@ class MainFrame(wx.Frame):
                         asset_url = a.get("browser_download_url")
                         break
         if not asset_url:
+            if HEALTH is not None: HEALTH.update_failed("check", "No matching update file in the feed or release.", to_version=tag, error_class="server")
             wx.MessageBox(f"Could not find a matching update archive in release assets.", "Update Error", wx.ICON_ERROR); return
         ext = ".exe" if use_installer else ".zip"
         dest = os.path.join(tempfile.gettempdir(), f"thrive_update{ext}")
@@ -6415,11 +6483,15 @@ class MainFrame(wx.Frame):
             progress.Destroy()
             if success:
                 try:
+                    if HEALTH is not None: HEALTH.update_started(tag)  # the next start reports whether it worked
                     if use_installer and sys.platform == 'win32':
                         apply_installer_update(dest)
                     else:
                         apply_zip_update(dest)
                 except Exception as apply_err:
+                    if HEALTH is not None:
+                        HEALTH.state.pop("pending_update", None); HEALTH._save()
+                        HEALTH.update_failed("install", apply_err, to_version=tag)
                     wx.MessageBox(f"Failed to install update:\n{apply_err}", "Update Error", wx.ICON_ERROR)
                     return
                 app = wx.GetApp(); app.intentional_disconnect = True
@@ -6431,7 +6503,16 @@ class MainFrame(wx.Frame):
                 self.is_exiting = True; self.Destroy()
                 app.ExitMainLoop()
             else:
-                wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
+                stage = "verify" if isinstance(error, UpdateVerifyError) else "download"
+                cls = "server" if stage == "verify" else health_classify(error) if isinstance(error, BaseException) else "app"
+                if HEALTH is not None: HEALTH.update_failed(stage, error, to_version=tag, error_class=cls)
+                if cls == "network":
+                    # Keep what we have; the next try picks up where this one stopped.
+                    self._schedule_update_retry()
+                    wx.MessageBox("The update download was interrupted, probably by the connection. "
+                                  "Thrive will try again by itself and continue where it stopped.", "Update Paused", wx.ICON_INFORMATION, self)
+                else:
+                    wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
         expected_sha256 = None
         if UPDATE_CONTEXT.get("source") == "feed":
             if sys.platform == "darwin": expected_sha256 = UPDATE_CONTEXT.get("mac_zip_sha256")
@@ -7001,12 +7082,23 @@ class MainFrame(wx.Frame):
         dlg.set_typing_label(sender, False)
         self.clear_typing_state(sender)
         is_focused_chat = dlg.is_active_chat()
+        # In front but nobody has touched the computer for a minute: often someone listening, not away.
+        # Read it out in full, but leave it unread until the next key press in that chat.
+        idle_spoke = False
+        idle_in_front = (not is_focused_chat and dlg.window is not None and window_in_foreground(dlg.window)
+                         and dlg.window.current_chat() is dlg)
         if is_focused_chat:
             dlg.mark_newest_read_if_active()
         if not is_focused_chat:
             dlg.mark_tab_unread()
             self._mark_unread(sender)
-            if incoming_behavior == 'notify':
+            open_mode = str(app.user_config.get('open_chat_new_message', 'read') or 'read')
+            if idle_in_front and not voice_row and open_mode in ('read', 'sound'):
+                app.play_sound("receive.wav")
+                if open_mode == 'read':
+                    speak_text(f"{self.format_user_label(sender)}: {text}", interrupt=False)
+                    idle_spoke = True
+            elif incoming_behavior == 'notify':
                 show_notification("New message", f"New message from {sender}.", timeout=5)
                 # Toasts can be switched off or dropped (Focus Assist, unregistered app); the sound and a direct
                 # screen reader message always get through.
@@ -7034,7 +7126,7 @@ class MainFrame(wx.Frame):
             if mode == 'read' and not list_follows:
                 speak_text(f"{self.format_user_label(sender)}: {text}", interrupt=False)
                 spoke = True
-        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and not spoke and not (is_focused_chat and list_follows):
+        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and not spoke and not idle_spoke and not (is_focused_chat and list_follows):
             sender_label = self.format_user_label(sender)
             speak_text(f"{sender_label} says {text}")
     am_admin = False
@@ -11883,6 +11975,10 @@ class ChatWindow(wx.Frame):
         self._update_title()
         event.Skip()
     def on_key(self, event):
+        # Back at the keyboard: whatever arrived while idle in this chat has now been seen.
+        cur = self.current_chat()
+        if cur is not None and getattr(cur, "unread_count", 0) and hasattr(cur, "on_host_activated"):
+            wx.CallAfter(lambda c=cur: c and c.on_host_activated(move_focus=False))
         code = event.GetKeyCode()
         ctrl = event.ControlDown() and not event.AltDown()   # Command on macOS
         shift = event.ShiftDown()

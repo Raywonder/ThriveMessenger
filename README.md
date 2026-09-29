@@ -128,11 +128,17 @@ As long as you have a PC with Windows 7 or higher, an internet connection and a 
 
 ### TappedIn downloads
 
-The TappedIn build (Alpha 15.19) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+The TappedIn build (Alpha 15.20) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
 
 * Windows installer or portable ZIP.
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.20
+
+* With the chat in front but no key pressed for a minute, new messages are read in full, and stay unread until you press a key.
+* No error and no false "up to date" when the update server can't be reached: Thrive retries quietly (about 5 min, 30 min, 2 h), and interrupted downloads resume.
+* **Update and error reports** (no personal content, can be turned off in Settings): To help us fix problems quickly, Thrive tells our server when an update installs, fails or doesn't reopen, and when the app hits an error. A report contains a random install number (not linked to your account), the Thrive version, your operating system version and a short error description. It never includes your messages, contacts, files, passwords, keys or user name. You can turn this off in Settings, General, "Send update results and error reports". Diagnostic logs are only sent when you choose Help, Submit Diagnostic Logs, and Thrive then gives you a reference to quote.
 
 ### What's new in Alpha 15.19
 

@@ -6,6 +6,12 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.20
+- **Listening without typing:** if the chat is in front but you haven't touched the keyboard for a minute, Thrive now reads new messages in full instead of only saying "New message from …". They stay unread until you press a key in that chat.
+- **Calmer updates:** if Thrive can't reach the update server (you're offline, or the network is slow), it no longer shows an error or wrongly says you're up to date. It tries again by itself after about 5 minutes, 30 minutes and 2 hours. An interrupted update download continues where it stopped.
+- **Update and error reports:** Thrive now tells our server whether updates install and reopen, and about errors, so we can fix problems before you notice them. No personal content is sent, and you can turn it off. See "Update and error reports" below.
+- **Diagnostic logs** now go to our new reports server, without your user name, and Thrive tells you a reference number.
+
 ## What's New in Alpha 15.19
 - **You hear every new message.** In the chat you're in, a new message now plays a sound and is read aloud. Before, it was added silently and marked read, so messages that arrived while you were typing, or while you were away, were easy to miss.
 - **Away from the computer:** if nobody has touched the keyboard or mouse for a minute, new messages stay unread and you get the normal alert, even with the chat in front.
@@ -16,7 +22,8 @@
 
 ## Hearing New Messages
 - **In the chat you're in:** you hear the receive sound, and Thrive reads the message ("Name: message"). If you're on the newest message in the history, your screen reader reads it as the list moves to it. Change this in Settings, General, **New message in the chat I'm in**.
-- **Anywhere else** (another chat, another app, minimised, closed, or away for a minute): what happens is set by **Incoming message behavior**. With **Show notification with username** you get a notification, the receive sound and "New message from …". The chat's tab and the contact show it as unread until you open it.
+- **Chat in front but you haven't touched the keyboard for a minute** (for example, you're listening): Thrive reads the message in full, and it stays unread until you press a key in that chat.
+- **Anywhere else** (another chat, another app, minimised, or closed): what happens is set by **Incoming message behavior**. With **Show notification with username** you get a notification, the receive sound and "New message from …". The chat's tab and the contact show it as unread until you open it.
 - A message counts as read only once you've seen it in the chat in front, so the sender's "read" is accurate.
 
 ## What's New in Alpha 15.18
@@ -27,6 +34,10 @@
 - Thrive checks for updates by itself when it starts, and every six hours while it's open.
 - To check now, choose **Help, Check for Updates…** or press **Alt+P**. On a Mac it's also in the **Thrive Messenger** menu.
 - If a new version is available, Thrive asks whether to download and install it, then restarts on the new version. If you're up to date, it says so.
+- If the update server can't be reached, Thrive says so calmly (only when you asked) and tries again by itself later. An interrupted download continues where it stopped.
+
+## Update and error reports
+To help us fix problems quickly, Thrive tells our server when an update installs, fails or doesn't reopen, and when the app hits an error. A report contains a random install number (not linked to your account), the Thrive version, your operating system version and a short error description. It never includes your messages, contacts, files, passwords, keys or user name. You can turn this off in Settings, General, "Send update results and error reports". Diagnostic logs are only sent when you choose Help, Submit Diagnostic Logs, and Thrive then gives you a reference to quote.
 
 ## What's New in Alpha 15.17
 - **Links in chats:** a message says how many links it has. Left Arrow and Right Arrow move between them, and Enter opens one in a full view inside Thrive. Escape comes back. Link lists and link removal are in the message menu.
