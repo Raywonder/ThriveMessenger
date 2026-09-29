@@ -17,7 +17,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.18"
+VERSION_TAG = "v2026-alpha15.19"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -125,7 +125,8 @@ except Exception:
 def show_notification(title, message, timeout=5):
     try:
         if sys.platform == 'win32' and _WinNotification is not None:
-            toast = _WinNotification(app_id="Thrive Messenger", title=title, msg=message, duration="short")
+            # Must match the process ID and the Start menu shortcut, or Windows drops the toast without a word.
+            toast = _WinNotification(app_id="Thrive.Thrive_Messenger", title=title, msg=message, duration="short")
             toast.show()
         elif _plyer_notification is not None:
             _plyer_notification.notify(title, message, timeout=timeout)
@@ -470,6 +471,7 @@ def load_user_config():
         'incoming_popup_on_message': False,
         'incoming_alert_on_message': False,
         'incoming_message_behavior': 'silent_count',
+        'open_chat_new_message': 'read',
         'notify_on_other_device_login': False,
         'message_timestamp_mode': 'start',
         'saved_history_date_order': 'mdy',
@@ -570,6 +572,8 @@ def load_user_config():
         else:
             incoming_behavior = 'silent_count'
     settings['incoming_message_behavior'] = incoming_behavior
+    if str(settings.get('open_chat_new_message', 'read')) not in ('read', 'sound', 'none'):
+        settings['open_chat_new_message'] = 'read'
     settings['incoming_popup_on_message'] = (incoming_behavior == 'popup')
     settings['incoming_alert_on_message'] = incoming_behavior in ('notify', 'play_sound')
     timestamp_mode = str(settings.get('message_timestamp_mode', 'start') or 'start').strip().lower()
@@ -2003,6 +2007,15 @@ class SettingsDialog(wx.Dialog):
         incoming_idx_map = {'popup': 0, 'notify': 1, 'do_nothing': 2, 'play_sound': 3, 'silent_count': 4}
         self.incoming_behavior_choice.SetSelection(incoming_idx_map.get(incoming_val, 4))
         incoming_row.Add(self.incoming_behavior_choice, 1, wx.EXPAND)
+        open_chat_row = wx.BoxSizer(wx.HORIZONTAL)
+        open_chat_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="New message in the chat I'm in:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.open_chat_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
+            "Play a sound and read it aloud (default)",
+            "Play a sound only",
+            "Nothing",
+        ])
+        self.open_chat_choice.SetSelection({'read': 0, 'sound': 1, 'none': 2}.get(str(self.config.get('open_chat_new_message', 'read')), 0))
+        open_chat_row.Add(self.open_chat_choice, 1, wx.EXPAND)
         timestamp_row = wx.BoxSizer(wx.HORIZONTAL)
         timestamp_row.Add(wx.StaticText(accessibility_box.GetStaticBox(), label="Message timestamps:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
         self.timestamp_mode_choice = wx.Choice(accessibility_box.GetStaticBox(), choices=[
@@ -2222,6 +2235,7 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.notify_other_device_login_cb, 0, wx.ALL, 5)
         accessibility_box.Add(session_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(incoming_row, 0, wx.EXPAND | wx.ALL, 5)
+        accessibility_box.Add(open_chat_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(timestamp_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(date_group_row, 0, wx.EXPAND | wx.ALL, 5)
         accessibility_box.Add(enter_row, 0, wx.EXPAND | wx.ALL, 5)
@@ -2333,6 +2347,7 @@ class SettingsDialog(wx.Dialog):
             self.enter_action_choice.SetBackgroundColour(dark_color); self.enter_action_choice.SetForegroundColour(light_text_color)
             self.escape_action_choice.SetBackgroundColour(dark_color); self.escape_action_choice.SetForegroundColour(light_text_color)
             self.incoming_behavior_choice.SetBackgroundColour(dark_color); self.incoming_behavior_choice.SetForegroundColour(light_text_color)
+            self.open_chat_choice.SetBackgroundColour(dark_color); self.open_chat_choice.SetForegroundColour(light_text_color)
             self.timestamp_mode_choice.SetBackgroundColour(dark_color); self.timestamp_mode_choice.SetForegroundColour(light_text_color)
             self.saved_date_order_choice.SetBackgroundColour(dark_color); self.saved_date_order_choice.SetForegroundColour(light_text_color)
             self.bot_agent_backend_choice.SetBackgroundColour(dark_color); self.bot_agent_backend_choice.SetForegroundColour(light_text_color)
@@ -3365,6 +3380,16 @@ class ClientApp(wx.App):
             pass
         self.sync_session_preferences()
         self.frame.on_check_updates(silent=True)
+        # Keep looking while Thrive stays open (it can run for days), not only at sign-in.
+        if not getattr(self, "_update_timer", None):
+            self._update_timer = wx.Timer(self)
+            self.Bind(wx.EVT_TIMER, self._on_update_timer, self._update_timer)
+            self._update_timer.Start(UPDATE_CHECK_INTERVAL_MS)
+
+    def _on_update_timer(self, _event=None):
+        frame = getattr(self, "frame", None)
+        if frame and not getattr(frame, "is_exiting", False):
+            frame.on_check_updates(silent=True)
 
     def _start_keepalive_monitor(self):
         stop_event = getattr(self, "_keepalive_stop", None)
@@ -5917,6 +5942,7 @@ class MainFrame(wx.Frame):
         incoming_behavior_map = {0: 'popup', 1: 'notify', 2: 'do_nothing', 3: 'play_sound', 4: 'silent_count'}
         incoming_behavior = incoming_behavior_map.get(dlg.incoming_behavior_choice.GetSelection(), 'silent_count')
         app.user_config['incoming_message_behavior'] = incoming_behavior
+        app.user_config['open_chat_new_message'] = {0: 'read', 1: 'sound', 2: 'none'}.get(dlg.open_chat_choice.GetSelection(), 'read')
         app.user_config['incoming_popup_on_message'] = (incoming_behavior == 'popup')
         app.user_config['incoming_alert_on_message'] = incoming_behavior in ('notify', 'play_sound')
         ts_mode_map = {0: 'start', 1: 'end', 2: 'off'}
@@ -6319,12 +6345,16 @@ class MainFrame(wx.Frame):
         def _callback(tag, version_str, error):
             if not self: return
             self.btn_update.Enable()
+            if tag and silent and tag == getattr(self, "_declined_update_tag", None):
+                return  # already asked about this version; Help > Check for Updates still offers it
             if tag:
                 result = wx.MessageBox(
                     f"A new version is available: {tag}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
                     "Update Available", wx.YES_NO | wx.ICON_INFORMATION, self)
                 if result == wx.YES:
                     self._start_update_download(tag)
+                else:
+                    self._declined_update_tag = tag
             elif error and not silent:
                 wx.MessageBox(f"Could not check for updates:\n{error}", "Update Check Failed", wx.ICON_ERROR, self)
             elif not error and not silent:
@@ -6940,6 +6970,9 @@ class MainFrame(wx.Frame):
         elif dlg.window and dlg.window.tabbed and dlg.window.IsShown() and not dlg.is_chat_visible():
             # The chat window is open: a new conversation appears as an unread tab without switching to it.
             dlg.open_chat(activate=False, select=False)
+        # If the reader sits on the newest row of the history, the list moves onto the new message and NVDA/VoiceOver
+        # read it themselves; anywhere else (message box, tabs, an older row) Thrive has to say it.
+        list_follows = wx.Window.FindFocus() is dlg.hist and dlg.hist.GetSelection() in (wx.NOT_FOUND, dlg.hist.GetCount() - 1)
         voice = msg.get("voice") if isinstance(msg.get("voice"), dict) else None
         voice_row = None
         if voice and voice.get("b64"):
@@ -6975,6 +7008,10 @@ class MainFrame(wx.Frame):
             self._mark_unread(sender)
             if incoming_behavior == 'notify':
                 show_notification("New message", f"New message from {sender}.", timeout=5)
+                # Toasts can be switched off or dropped (Focus Assist, unregistered app); the sound and a direct
+                # screen reader message always get through.
+                app.play_sound("receive.wav")
+                speak_text(f"New message from {self.format_user_label(sender)}.", interrupt=False)
             elif incoming_behavior == 'play_sound':
                 app.play_sound("receive.wav")
         else:
@@ -6988,7 +7025,16 @@ class MainFrame(wx.Frame):
                 dlg.voice_player.play(voice_row["path"], dlg._voice_label(dlg._history_rows[-1]))
             played_bot_tts = True
         # Speak once here (append() is told not to), and not over a bot's own voice audio.
-        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts:
+        spoke = False
+        if is_focused_chat and not voice_row and not played_bot_tts:
+            # The chat in front used to take new messages in silently and mark them read, so people missed them.
+            mode = str(app.user_config.get('open_chat_new_message', 'read') or 'read')
+            if mode in ('read', 'sound'):
+                app.play_sound("receive.wav")
+            if mode == 'read' and not list_follows:
+                speak_text(f"{self.format_user_label(sender)}: {text}", interrupt=False)
+                spoke = True
+        if app.user_config.get('read_messages_aloud', False) and not played_bot_tts and not spoke and not (is_focused_chat and list_follows):
             sender_label = self.format_user_label(sender)
             speak_text(f"{sender_label} says {text}")
     am_admin = False
@@ -9296,6 +9342,48 @@ def tab_strip_has_focus(book):
             pass
     return False
 
+IDLE_AWAY_SECONDS = 60
+UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+def system_idle_seconds():
+    """Seconds since the last keyboard or mouse input anywhere on the computer (0 if unknown)."""
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+            info = LASTINPUTINFO(); info.cbSize = ctypes.sizeof(info)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return max(0.0, ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0)
+        elif sys.platform == 'darwin':
+            import ctypes, ctypes.util
+            cg = ctypes.cdll.LoadLibrary(ctypes.util.find_library("ApplicationServices"))
+            cg.CGEventSourceSecondsSinceLastEventType.restype = ctypes.c_double
+            cg.CGEventSourceSecondsSinceLastEventType.argtypes = [ctypes.c_int, ctypes.c_uint32]
+            return max(0.0, float(cg.CGEventSourceSecondsSinceLastEventType(0, 0xFFFFFFFF)))
+    except Exception:
+        pass
+    return 0.0
+
+def window_in_foreground(win):
+    """True only when the user is really looking at this window: shown, not minimised, and in front of every other app.
+    wx's IsActive() alone can stay true while another app has the foreground, which silently marked messages read."""
+    try:
+        if not win or not win.IsShown() or win.IsIconized():
+            return False
+    except Exception:
+        return False
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            return ctypes.windll.user32.GetForegroundWindow() == win.GetHandle()
+        except Exception:
+            pass
+    try:
+        return bool(win.IsActive() and wx.GetApp().IsActive())
+    except Exception:
+        return bool(win.IsActive())
+
 class ChatPanel(wx.Panel):
     """One conversation. Lives in a ChatWindow: as a tab (tabbed mode) or as the only content (classic mode)."""
     def __init__(self, frame, contact, sock, user, logging_enabled=False, is_contact=True, remote_server_entry=None, remote_target_user=None, can_call=False, show_call=False, wx_parent=None):
@@ -9829,7 +9917,8 @@ class ChatPanel(wx.Panel):
                 row["files"] = list(row.get("files", [])) + [voice["path"]]
         self._history_rows.append(row)
         self.hist.Append(self._row_display(row))
-        self.hist.SetSelection(self.hist.GetCount() - 1)
+        if self.hist.GetSelection() in (wx.NOT_FOUND, self.hist.GetCount() - 2) or wx.Window.FindFocus() is not self.hist:
+            self.hist.SetSelection(self.hist.GetCount() - 1)
         if find_links(text):
             self._prefetch_link_titles()
         app = wx.GetApp()
@@ -11322,6 +11411,7 @@ class RoomChatPanel(ChatPanel):
                     return
         row = self._room_row(item)
         app = wx.GetApp()
+        list_follows = wx.Window.FindFocus() is self.hist and self.hist.GetSelection() in (wx.NOT_FOUND, self.hist.GetCount() - 1)
         self._history_rows.append(row)
         self.hist.Append(self._row_display(row))
         self._known_ids.add(row["id"])
@@ -11335,8 +11425,12 @@ class RoomChatPanel(ChatPanel):
             if mentioned:
                 app.play_sound("receive.wav")
                 speak_text(f"{label} mentioned you in {self.room.get('name')}: {row['text']}", interrupt=False)
-            elif self.is_active_chat() and app.user_config.get('read_messages_aloud', False):
-                speak_text(f"{label} says {row['text']}")
+            elif self.is_active_chat():
+                mode = str(app.user_config.get('open_chat_new_message', 'read') or 'read')
+                if mode in ('read', 'sound'):
+                    app.play_sound("receive.wav")
+                if (mode == 'read' or app.user_config.get('read_messages_aloud', False)) and not list_follows:
+                    speak_text(f"{label}: {row['text']}", interrupt=False)
             elif not self.is_active_chat():
                 self.mark_tab_unread()
             if self.is_active_chat():
@@ -11721,7 +11815,8 @@ class ChatWindow(wx.Frame):
             self._announce_current()
         self._update_title()
     def is_active_chat(self, panel):
-        return bool(self.IsShown() and self.IsActive() and self.current_chat() is panel)
+        # Away from the computer counts as not looking: messages stay unread and get the normal alert.
+        return bool(window_in_foreground(self) and self.current_chat() is panel and system_idle_seconds() < IDLE_AWAY_SECONDS)
     def refresh_chat_label(self, panel):
         idx = self._index_of(panel)
         if self.tabbed and idx != wx.NOT_FOUND:

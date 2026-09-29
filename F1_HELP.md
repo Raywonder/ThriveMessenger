@@ -6,12 +6,25 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.19
+- **You hear every new message.** In the chat you're in, a new message now plays a sound and is read aloud. Before, it was added silently and marked read, so messages that arrived while you were typing, or while you were away, were easy to miss.
+- **Away from the computer:** if nobody has touched the keyboard or mouse for a minute, new messages stay unread and you get the normal alert, even with the chat in front.
+- **Alerts that always get through:** with "Show notification with username", Thrive now also plays a sound and has your screen reader say "New message from …", in case Windows hides the notification. Notifications themselves are fixed too: Windows was dropping them.
+- **Reading older messages:** a new message no longer pulls you off the message you're reading. Thrive reads it out instead.
+- **Updates:** Thrive also checks for updates every six hours while it's open, not only when you sign in.
+- **New setting:** Settings, General, "New message in the chat I'm in": play a sound and read it aloud (the default), play a sound only, or nothing.
+
+## Hearing New Messages
+- **In the chat you're in:** you hear the receive sound, and Thrive reads the message ("Name: message"). If you're on the newest message in the history, your screen reader reads it as the list moves to it. Change this in Settings, General, **New message in the chat I'm in**.
+- **Anywhere else** (another chat, another app, minimised, closed, or away for a minute): what happens is set by **Incoming message behavior**. With **Show notification with username** you get a notification, the receive sound and "New message from …". The chat's tab and the contact show it as unread until you open it.
+- A message counts as read only once you've seen it in the chat in front, so the sender's "read" is accurate.
+
 ## What's New in Alpha 15.18
 - **Check for Updates is back** in the Help menu, with **Alt+P** from anywhere in the main window. On a Mac it's also in the Thrive Messenger menu. Thrive says "Checking for updates", then tells you either that you're up to date or that a new version is ready to install.
 - The message box hint now says what Enter really does: nothing by default, unless you set Enter to send in Settings.
 
 ## Updates
-- Thrive checks for updates by itself when it starts.
+- Thrive checks for updates by itself when it starts, and every six hours while it's open.
 - To check now, choose **Help, Check for Updates…** or press **Alt+P**. On a Mac it's also in the **Thrive Messenger** menu.
 - If a new version is available, Thrive asks whether to download and install it, then restarts on the new version. If you're up to date, it says so.
 

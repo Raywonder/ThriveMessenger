@@ -128,11 +128,20 @@ As long as you have a PC with Windows 7 or higher, an internet connection and a 
 
 ### TappedIn downloads
 
-The TappedIn build (Alpha 15.18) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+The TappedIn build (Alpha 15.19) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
 
 * Windows installer or portable ZIP.
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.19
+
+* **You hear every new message.** In the chat you're in, a new message plays a sound and is read aloud, instead of being added silently and marked read.
+* **Away for a minute:** messages stay unread and you get the normal alert, even with the chat in front.
+* **Notifications** now show on Windows, and "Show notification with username" also plays a sound and says "New message from …" through your screen reader.
+* A new message doesn't pull you off an older message you're reading.
+* Thrive checks for updates every six hours while it's open.
+* New setting: **New message in the chat I'm in** (read aloud, sound only, or nothing).
 
 ### What's new in Alpha 15.18
 
