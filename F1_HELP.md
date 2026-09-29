@@ -69,6 +69,15 @@ Each conversation has three tabs:
 - Voice replies from Clawdia arrive as voice messages. Voice messages and voicemail you send her are transcribed so she can answer.
 - Voice calling is still switched off on this server while live call audio is being built.
 
+## The VoiceLink Contact (VoiceLink server chat)
+- **VoiceLink** in your contacts answers short commands about our VoiceLink servers. Message it **help** to start.
+- Everyone can ask for **status**, **servers**, **rooms**, **who** (or **who** and a room) and **room** and a name.
+- Servers are known by name: Main, Community, Dev and Devine Creations. Send **use community** to switch, or put the name first to ask once, for example **community rooms** or **dev status**.
+- Staff of a VoiceLink server can manage it from here after linking once: sign in to VoiceLink on that server, message Admin chat there with **link code**, then send the VoiceLink contact **link** with the server name and the code, for example **link Community ABCD-1234**. You then get exactly your role on that server.
+- Staff commands include **invite** a room (optionally **to** a person), **announce**, **agents**, **modules**, **users** (find, kick, ban, unban, role), **logs**, **deploy status**, **restart** and **broadcast**. Changes ask you to reply **confirm** within 2 minutes; anything else cancels.
+- Staff can also ask in their own words, such as "is anyone in the music rooms on community?". The answer only uses these same commands and your permissions.
+- **updates** (our server admins) lists the published VoiceLink app versions and any update problems. **unlink** removes your link.
+
 ## Keyboard Shortcuts
 - `F1`: Open Help
 - `Escape`: Close dialogs/chat

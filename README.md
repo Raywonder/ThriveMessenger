@@ -171,6 +171,10 @@ You can start an IM conversation with a contact simply by pressing Enter on them
 As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes. Received files are stored in Documents/ThriveMessenger/files.
 Note: server owners might place file size limits and certain file type restrictions on users; see below on how to do this yourself.
 
+### The VoiceLink contact
+
+The `voicelinkbot` contact ("VoiceLink") is a chat CLI for VoiceLink servers. It is an outside bot (`external_names` in `srv/srv.conf`), answered by the `voicelinkbot-relay` service on the server, not by Codex or OpenClaw. The relay passes each message to the VoiceLink server's Admin chat module (`/api/admin-chat/command`) as that Thrive user, so VoiceLink decides what the person may do from the VoiceLink account their Thrive name is linked to. Everyone gets public information; linked staff get their role's commands; changes need "confirm"; every command is logged by both the relay (`/var/log/voicelinkbot/audit.jsonl`) and the VoiceLink server. Message it `help`. VoiceLink help: `docs/admin-chat.html` in the VoiceLink repo.
+
 ### Server side commands
 
 If you see (Admin) beside a contact's online status, it means they are classed as a server admin and can perform server side commands from the client. This is what the aforementioned Use Server Side Commands button is for. Clicking the button will bring up a dialog much like the one that appears when you start a chat with a contact. You will auto focus on the command input field. To run a command, simply type it into the field and press Enter. To get more help in this text box, type `?` or `help` (with or without a leading slash).
