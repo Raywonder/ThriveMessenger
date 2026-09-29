@@ -22,7 +22,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.20"
+VERSION_TAG = "v2026-alpha15.21"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -1138,6 +1138,99 @@ def speak_text(text, interrupt=None):
 
 def _received_files_dir():
     return os.path.join(os.path.expanduser('~'), 'Documents', 'ThriveMessenger', 'files')
+
+_WIN_RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)}
+UNKNOWN_SENDER_FOLDER = "Earlier files (sender unknown)"
+
+def safe_folder_name(name, fallback="unknown"):
+    """A folder name that works on Windows, macOS and Linux (no <>:"/\\|?*, control characters or reserved names)."""
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", str(name or "")).strip().rstrip(". ")
+    if not cleaned:
+        cleaned = fallback
+    if cleaned.split(".")[0].lower() in _WIN_RESERVED:
+        cleaned = "_" + cleaned
+    return cleaned[:80]
+
+def contact_files_dir(username, create=True):
+    """Files exchanged with one person: <Files>/<username>. The user name, not the display name, so it never moves."""
+    path = os.path.join(_received_files_dir(), safe_folder_name(username))
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+def room_files_dir(room_name, create=True):
+    """Files shared in a room: <Files>/Rooms/<room name>."""
+    path = os.path.join(_received_files_dir(), "Rooms", safe_folder_name(room_name, "room"))
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+def _unique_path(folder, filename):
+    stem, ext = os.path.splitext(filename)
+    path, n = os.path.join(folder, filename), 1
+    while os.path.exists(path):
+        path, n = os.path.join(folder, f"{stem} ({n}){ext}"), n + 1
+    return path
+
+def migrate_files_layout(history):
+    """One-time move of loose files into per-person folders (15.21). Uses the transfer history to find who each
+    file came from; files with no record go to one 'sender unknown' folder so nothing is left loose. Old room
+    files move to Rooms. Updates the history paths in place. Returns (moved, unknown, changed_history)."""
+    root = _received_files_dir()
+    moved = unknown = 0
+    changed = False
+    by_path, by_name = {}, {}
+    for e in history or []:
+        path = str(e.get("path") or "")
+        if path:
+            by_path.setdefault(os.path.normcase(os.path.realpath(path)), []).append(e)
+        if e.get("filename") and e.get("user"):
+            by_name.setdefault(str(e["filename"]).lower(), []).append(e)
+    def _relocate(src, dest_dir):
+        nonlocal changed
+        dest = _unique_path(dest_dir, os.path.basename(src))
+        shutil.move(src, dest)
+        for e in by_path.get(os.path.normcase(os.path.realpath(src)), []):
+            e["path"] = dest; changed = True
+        return dest
+    if os.path.isdir(root):
+        for name in sorted(os.listdir(root)):
+            src = os.path.join(root, name)
+            if not os.path.isfile(src):
+                continue
+            try:
+                entries = by_path.get(os.path.normcase(os.path.realpath(src))) or by_name.get(name.lower()) or []
+                user = next((e.get("user") for e in entries if e.get("user")), None)
+                if user:
+                    dest = _relocate(src, contact_files_dir(user))
+                    for e in by_name.get(name.lower(), []):
+                        if not e.get("path") or not os.path.isfile(str(e.get("path"))):
+                            e["path"] = dest; changed = True
+                    moved += 1
+                else:
+                    unknown_dir = os.path.join(root, UNKNOWN_SENDER_FOLDER)
+                    os.makedirs(unknown_dir, exist_ok=True)
+                    _relocate(src, unknown_dir)
+                    unknown += 1
+            except Exception as e:
+                print(f"Could not move {name}: {e}")
+    old_rooms = os.path.join(os.path.dirname(root), "room-files")
+    if os.path.isdir(old_rooms):
+        target = os.path.join(root, "Rooms", "Earlier room files")
+        for name in sorted(os.listdir(old_rooms)):
+            src = os.path.join(old_rooms, name)
+            if os.path.isfile(src):
+                try:
+                    os.makedirs(target, exist_ok=True)
+                    _relocate(src, target); moved += 1
+                except Exception as e:
+                    print(f"Could not move room file {name}: {e}")
+        try:
+            if not os.listdir(old_rooms):
+                os.rmdir(old_rooms)
+        except OSError:
+            pass
+    return moved, unknown, changed
 
 def _move_to_trash(path):
     """Recoverable delete: Recycle Bin on Windows, Trash on macOS."""
@@ -2814,6 +2907,16 @@ class ClientApp(wx.App):
         self.transfer_history = []
         self.pending_rerequests = {}
         self.load_transfer_history()
+        if int(self.user_config.get('files_layout_version', 1) or 1) < 2:
+            try:
+                moved, unknown, changed = migrate_files_layout(self.transfer_history)
+                if changed:
+                    self.save_transfer_history()
+                log_event("info", "files_layout_migrated", {"moved": moved, "unknown": unknown})
+                self.user_config['files_layout_version'] = 2
+                save_user_config(self.user_config)
+            except Exception as e:
+                print(f"Files folder reorganisation failed: {e}")
         self.outbox, self.pending_acks = [], {}
         has_invite_launch = bool(self.launch_invite_context.get("invite_token"))
         if self.user_config.get('autologin') and self.user_config.get('username') and not has_invite_launch:
@@ -3836,9 +3939,7 @@ class ClientApp(wx.App):
 
     def on_file_data(self, msg):
         sender = msg["from"]; files = msg["files"]
-        docs_path = os.path.join(os.path.expanduser('~'), 'Documents')
-        save_dir = os.path.join(docs_path, 'ThriveMessenger', 'files')
-        os.makedirs(save_dir, exist_ok=True)
+        save_dir = contact_files_dir(sender)  # <Files>/<sender>, not the root of the files folder
         saved = []
         saved_paths = []
         for finfo in files:
@@ -8947,10 +9048,13 @@ class ContactTransfersPanel(wx.Panel):
         self.btn_open = wx.Button(self, label="&Open")
         self.btn_folder = wx.Button(self, label="Show in F&older")
         self.btn_again = wx.Button(self, label="&Get Again")
+        self.btn_person_folder = wx.Button(self, label="Open &Their Files Folder")
+        self.btn_person_folder.SetToolTip("Opens the folder where files with this person are kept.")
         self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
         self.btn_folder.Bind(wx.EVT_BUTTON, self.on_folder)
         self.btn_again.Bind(wx.EVT_BUTTON, self.on_get_again)
-        for b in (self.btn_open, self.btn_folder, self.btn_again):
+        self.btn_person_folder.Bind(wx.EVT_BUTTON, lambda e: open_path_or_url(contact_files_dir(self.chat.contact)))
+        for b in (self.btn_open, self.btn_folder, self.btn_again, self.btn_person_folder):
             btns.Add(b, 0, wx.RIGHT, 6)
         s.Add(btns, 0, wx.ALL, 6)
         self.SetSizer(s)
@@ -11536,8 +11640,7 @@ class RoomChatPanel(ChatPanel):
         if item.get("sender") == self.user:
             return
         try:
-            save_dir = os.path.join(os.path.expanduser("~"), "Documents", "ThriveMessenger", "room-files")
-            os.makedirs(save_dir, exist_ok=True)
+            save_dir = room_files_dir(self.room.get("name") or self.room_id)
             stem, ext = os.path.splitext(os.path.basename(item.get("filename") or "room-file"))
             path, n = os.path.join(save_dir, stem + ext), 1
             while os.path.exists(path):
@@ -11548,7 +11651,7 @@ class RoomChatPanel(ChatPanel):
                 if r.get("id") == item.get("message_id"):
                     r["files"] = [path]
             speak_text(f"{self.frame.format_user_label(item.get('sender'))} shared {os.path.basename(path)} in {self.room.get('name')}. "
-                       "It's saved in Documents, Thrive Messenger, room files.", interrupt=False)
+                       f"It's saved in Documents, Thrive Messenger, files, Rooms, {safe_folder_name(self.room.get('name') or 'room')}.", interrupt=False)
         except Exception as e:
             speak_text(f"A room file couldn't be saved: {e}", interrupt=False)
     def on_send(self, _):

@@ -128,11 +128,15 @@ As long as you have a PC with Windows 7 or higher, an internet connection and a 
 
 ### TappedIn downloads
 
-The TappedIn build (Alpha 15.20) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+The TappedIn build (Alpha 15.21) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
 
 * Windows installer or portable ZIP.
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.21
+
+* Received files go into a folder for each person (files/<user name>), and room files into files/Rooms/<room name>. Existing loose files are moved into the right folders the first time 15.21 starts, and Open and Show in Folder keep working.
 
 ### What's new in Alpha 15.20
 
@@ -214,7 +218,7 @@ You can start an IM conversation with a contact simply by pressing Enter on them
 
 ### File transfer
 
-As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes. Received files are stored in Documents/ThriveMessenger/files.
+As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes. Received files are stored in a folder per person, Documents/ThriveMessenger/files/<user name>, and room files in Documents/ThriveMessenger/files/Rooms/<room name>. The File Transfers tab in each conversation has Open Their Files Folder.
 Note: server owners might place file size limits and certain file type restrictions on users; see below on how to do this yourself.
 
 ### Server side commands

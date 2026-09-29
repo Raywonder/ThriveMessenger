@@ -6,6 +6,10 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.21
+- **A folder for each person:** received files now go into a folder named after the person who sent them, under Documents, ThriveMessenger, files. Room files go into files, Rooms, and the room's name. Files already in the files folder are moved into the right folder the first time 15.21 starts; any whose sender Thrive can't tell go into "Earlier files (sender unknown)". Open and Show in Folder keep working.
+- **Open Their Files Folder:** a new button in each conversation's File Transfers tab.
+
 ## What's New in Alpha 15.20
 - **iPhone Settings** are now a list of categories (General, Notifications, Privacy, Profile and Authentication), each with a short description. Each category opens its own screen with tabs. See "iPhone settings" below.
 - **iPhone:** a new message in the chat you have open is now read out by VoiceOver (it used to arrive silently). You can change that, and what you hear for other chats, under Settings, Notifications.
@@ -94,7 +98,7 @@ There are two tab strips: the conversation tabs at the top of the Chats window, 
 Each conversation has three tabs:
 - **Messages**: the live chat.
 - **Chat Archive** (formerly "Saved Messages"): every day of this conversation, from the server's history plus anything saved on this device, grouped by year, month and day. Choose newest or oldest first. Press Enter on a day to read it in a read-only text box. Escape goes back to the list of days. Control+S on a message also saves it on this device.
-- **File Transfers**: every file and voice message you sent to or received from this person, with name, size, date, direction and status.
+- **File Transfers**: every file and voice message you sent to or received from this person, with name, size, date, direction and status. Received files are kept in a folder for each person under Documents, ThriveMessenger, files, named with their user name (for example files\SystemMonitor). Files shared in a room go in files\Rooms\<room name>. In a conversation's File Transfers tab, Open Their Files Folder opens that person's folder, and Show in Folder shows the selected file.
   - **Open** or **Show in Folder** works when the file is still on this device.
   - If it isn't, **Get Again** asks the other person's app for it. If they still have it, it comes back to you automatically. If not, it is marked **No longer available**.
   - The Show list filters to Voice messages or Voicemail.
