@@ -22,7 +22,29 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.22"
+VERSION_TAG = "v2026-alpha15.23"
+# Short "What's New" blurbs shown once after an update (see MainFrame.maybe_show_whats_new / on_show_whats_new).
+# Keyed by the exact VERSION_TAG string used for that release; WHATS_NEW_ORDER controls display order.
+WHATS_NEW_ORDER = [
+    "v2026-alpha15.18", "v2026-alpha15.19", "v2026-alpha15.20",
+    "v2026-alpha15.21", "v2026-alpha15.22", "v2026-alpha15.23",
+]
+WHATS_NEW = {
+    "v2026-alpha15.18": "Check for Updates is back in the Help menu, with Alt+P from anywhere in the main window. "
+                        "Thrive says \"Checking for updates,\" then tells you either that you're up to date or that a new version is ready.",
+    "v2026-alpha15.19": "You hear every new message in the chat you're in: a sound, then the message read aloud. "
+                        "If you haven't touched the keyboard for a minute, new messages are read in full and stay unread until you press a key.",
+    "v2026-alpha15.20": "Calmer updates: if Thrive can't reach the update server it tries again quietly by itself, and an interrupted "
+                        "download picks up where it stopped. Thrive also tells us when updates install or fail, so we can fix problems "
+                        "before you notice them (no personal content; you can turn this off in Settings).",
+    "v2026-alpha15.21": "Received files are now organized into a folder for each person, and a folder for each room, under Documents, "
+                        "ThriveMessenger, files.",
+    "v2026-alpha15.22": "The links list now closes after opening, copying or removing a link, putting you back on the message it came "
+                        "from, the same as Escape or Ctrl+W already did.",
+    "v2026-alpha15.23": "Thrive now remembers an unfinished message as a draft as you type, so you never lose your text, including "
+                        "when an update installs. Updates never interrupt you mid-typing, and after an update Thrive restores your "
+                        "drafts and reopens the chat you were in.",
+}
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -495,6 +517,11 @@ def load_user_config():
         'device_id': str(uuid.uuid4()),
         'device_name': platform.node() or 'This device',
         'session_duration': 'month',
+        'remember_drafts': True,
+        'show_whats_new_after_update': True,
+        'last_seen_whats_new_version': '',
+        'last_open_chat': None,
+        'pending_update': None,
     }
 
     # 1. Load non-sensitive preferences from JSON
@@ -540,6 +567,19 @@ def load_user_config():
     except Exception:
         settings['read_after_seconds'] = 2
     settings['keep_contact_list_open'] = bool(settings.get('keep_contact_list_open', True))
+    settings['remember_drafts'] = bool(settings.get('remember_drafts', True))
+    if not settings['remember_drafts']:
+        # "Remember" semantics: turning it off forgets anything already remembered.
+        try:
+            clear_all_drafts()
+        except Exception:
+            pass
+    settings['show_whats_new_after_update'] = bool(settings.get('show_whats_new_after_update', True))
+    settings['last_seen_whats_new_version'] = str(settings.get('last_seen_whats_new_version') or '')
+    if not isinstance(settings.get('last_open_chat'), dict):
+        settings['last_open_chat'] = None
+    if not isinstance(settings.get('pending_update'), dict):
+        settings['pending_update'] = None
     if settings.get('link_open_mode') not in ('full', 'browser', 'ask'):
         settings['link_open_mode'] = 'full'
     settings['fetch_link_titles'] = bool(settings.get('fetch_link_titles', True))
@@ -673,6 +713,90 @@ def save_user_config(settings):
         _KEYRING_WRITE_CACHE.pop((KEYRING_SERVICE, _keyring_account_for(username, settings)), None)
     # 2. Non-sensitive preferences to JSON.
     _write_settings_file(settings)
+
+def get_drafts_path():
+    return os.path.join(get_config_dir(), 'drafts.json')
+
+_DRAFTS_CACHE = None
+
+def _load_drafts():
+    """In-memory cache of drafts.json, loaded once per process. Values are unsent-message text keyed by a
+    stable conversation id: a contact's username for DMs, or "room:<room_id>" for rooms (RoomChatPanel.contact)."""
+    global _DRAFTS_CACHE
+    if _DRAFTS_CACHE is not None:
+        return _DRAFTS_CACHE
+    data = {}
+    path = get_drafts_path()
+    if os.path.exists(path):
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = {str(k): str(v) for k, v in loaded.items() if str(v or '').strip()}
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Could not load drafts.json, starting empty: {e}")
+    _DRAFTS_CACHE = data
+    return _DRAFTS_CACHE
+
+def _save_drafts_to_disk():
+    """Atomic write (temp file + os.replace), the same pattern download_update uses (.part -> dest), so a
+    crash mid-write can never corrupt or half-write drafts.json."""
+    path = get_drafts_path()
+    tmp = path + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(_load_drafts(), f, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"Error saving drafts.json: {e}")
+
+def get_draft(conv_id):
+    if not conv_id:
+        return ''
+    return _load_drafts().get(str(conv_id), '')
+
+def set_draft(conv_id, text):
+    """Save (or, if empty, clear) the unsent-message draft for one conversation. No-ops when nothing changed,
+    so the debounced typing handler doesn't hit disk on every idle timer fire."""
+    if not conv_id:
+        return
+    drafts = _load_drafts()
+    text = text or ''
+    key = str(conv_id)
+    if text.strip():
+        if drafts.get(key) == text:
+            return
+        drafts[key] = text
+    else:
+        if key not in drafts:
+            return
+        drafts.pop(key, None)
+    _save_drafts_to_disk()
+
+def clear_draft(conv_id):
+    if not conv_id:
+        return
+    drafts = _load_drafts()
+    if drafts.pop(str(conv_id), None) is not None:
+        _save_drafts_to_disk()
+
+def clear_all_drafts():
+    """Called when the user turns off 'Remember unsent messages as drafts': matches 'remember' semantics by
+    forgetting anything already remembered."""
+    global _DRAFTS_CACHE
+    _DRAFTS_CACHE = {}
+    _save_drafts_to_disk()
+
+def draft_preview(conv_id, max_words=6):
+    """First few words of a saved draft, for the contact/room list ('Draft: <first few words>'). Empty if none."""
+    text = get_draft(conv_id)
+    if not text:
+        return ''
+    words = text.strip().split()
+    preview = ' '.join(words[:max_words])
+    if len(words) > max_words:
+        preview += '\u2026'
+    return preview
 
 def _device_login_fields(settings):
     return {
@@ -1661,7 +1785,9 @@ class UpdateVerifyError(Exception):
     """The downloaded file doesn't match the feed's checksum (our side, not the network)."""
 
 def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
-    """Download to dest via dest + '.part'. An interrupted download is kept and resumed next time (HTTP Range)."""
+    """Download to dest via dest + '.part'. An interrupted download is kept and resumed next time (HTTP Range).
+    progress_dlg may be None: the caller skips the dialog entirely for a silent background download (see
+    MainFrame._start_update_download), in which case progress just isn't reported anywhere."""
     def _download():
         import urllib.request
         part = dest + ".part"
@@ -1684,7 +1810,7 @@ def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
                         if not chunk: break
                         f.write(chunk)
                         downloaded += len(chunk)
-                        if total > 0:
+                        if total > 0 and progress_dlg is not None:
                             pct = min(int(downloaded * 100 / total), 100)
                             wx.CallAfter(progress_dlg.Update, pct, f"Downloaded {downloaded // 1024} KB of {total // 1024} KB")
             if total > 0 and downloaded != total:
@@ -1991,6 +2117,44 @@ def apply_toggle_semantics(window):
             walk(child)
     walk(window)
 
+class WhatsNewDialog(wx.Dialog):
+    """Accessible What's New: a read-only multi-line text view (so NVDA/VoiceOver can read it freely with
+    arrow keys), a Close button, and Escape to dismiss. MainFrame.maybe_show_whats_new returns focus to
+    wherever the user was afterward."""
+    def __init__(self, parent, entries):
+        super().__init__(parent, title="What's New in Thrive Messenger",
+                          size=(560, 420), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.SetName("What's New")
+        panel = wx.Panel(self)
+        s = wx.BoxSizer(wx.VERTICAL)
+        blocks = []
+        for tag, note in entries:
+            short = tag.replace("v2026-alpha", "Alpha ") if str(tag).startswith("v2026-alpha") else str(tag)
+            blocks.append(f"{short}:\n{note}")
+        body = "\n\n".join(blocks) if blocks else "No changes to report."
+        intro = wx.StaticText(panel, label="Here's what's changed since you last checked:")
+        s.Add(intro, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        self.text_ctrl = wx.TextCtrl(panel, value=body, style=wx.TE_MULTILINE | wx.TE_READONLY)
+        self.text_ctrl.SetName("What's New details")
+        s.Add(self.text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+        close_btn = wx.Button(panel, wx.ID_OK, label="&Close")
+        close_btn.SetDefault()
+        s.Add(close_btn, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        panel.SetSizer(s)
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(outer)
+        self.SetEscapeId(wx.ID_OK)
+        close_btn.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_OK))
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+        wx.CallAfter(self.text_ctrl.SetFocus)
+    def _on_key(self, event):
+        if event.GetKeyCode() == wx.WXK_ESCAPE:
+            self.EndModal(wx.ID_OK)
+            return
+        event.Skip()
+
+
 class SettingsDialog(wx.Dialog):
     def __init__(self, parent, current_config, can_admin=False):
         super().__init__(parent, title="Settings", size=(560, 650)); self.config = current_config
@@ -2204,6 +2368,12 @@ class SettingsDialog(wx.Dialog):
         self.keep_contact_list_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Keep the contact list open when a chat opens")
         self.keep_contact_list_cb.SetValue(bool(self.config.get('keep_contact_list_open', True)))
         self.keep_contact_list_cb.SetToolTip("Chat windows get their own taskbar and Alt+Tab entry, so the contact list stays available. Ctrl+0 in a chat returns to it.")
+        self.remember_drafts_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Remember unsent messages as drafts")
+        self.remember_drafts_cb.SetValue(bool(self.config.get('remember_drafts', True)))
+        self.remember_drafts_cb.SetToolTip("Whatever you're typing but haven't sent is saved as you go and restored next time you open that chat, even after an update restarts Thrive. Turning this off also forgets any drafts already saved.")
+        self.show_whats_new_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Show What's New after an update")
+        self.show_whats_new_cb.SetValue(bool(self.config.get('show_whats_new_after_update', True)))
+        self.show_whats_new_cb.SetToolTip("After Thrive updates and restarts, briefly show what changed. You can always see it again from Help, What's New.")
         self.delete_for_everyone_cb = wx.CheckBox(accessibility_box.GetStaticBox(), label="Delete messages for everyone")
         self.delete_for_everyone_cb.SetValue(bool(self.config.get('delete_messages_for_everyone', True)))
         self.delete_for_everyone_cb.SetToolTip("When you delete a message you sent (or any message, if you are an admin), it is removed for both people in the conversation.")
@@ -2350,6 +2520,8 @@ class SettingsDialog(wx.Dialog):
         accessibility_box.Add(self.double_escape_chat_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.chat_tabs_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.keep_contact_list_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.remember_drafts_cb, 0, wx.ALL, 5)
+        accessibility_box.Add(self.show_whats_new_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.start_fresh_cb, 0, wx.ALL, 5)
         accessibility_box.Add(self.read_receipts_cb, 0, wx.ALL, 5)
         read_row = wx.BoxSizer(wx.HORIZONTAL)
@@ -2442,7 +2614,7 @@ class SettingsDialog(wx.Dialog):
             self.call_out_label.SetForegroundColour(light_text_color)
             self.admin_hint.SetForegroundColour(light_text_color)
             self.bot_mesh_hint.SetForegroundColour(light_text_color)
-            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb, self.start_at_login_cb, self.start_minimized_cb, self.announce_autostart_cb, self.send_health_cb]:
+            for cb in [self.auto_open_files_cb, self.read_aloud_cb, self.interrupt_speech_cb, self.global_chat_logging_cb, self.show_main_actions_cb, self.typing_indicator_cb, self.announce_typing_cb, self.prefer_display_names_cb, self.double_escape_chat_cb, self.chat_tabs_cb, self.keep_contact_list_cb, self.remember_drafts_cb, self.show_whats_new_cb, self.start_fresh_cb, self.read_receipts_cb, self.delete_for_everyone_cb, self.delete_attached_files_cb, self.fetch_link_titles_cb, self.start_at_login_cb, self.start_minimized_cb, self.announce_autostart_cb, self.send_health_cb]:
                 cb.SetForegroundColour(light_text_color)
             self.restart_after_save_cb.SetForegroundColour(light_text_color)
             self.allow_cross_server_dm_cb.SetForegroundColour(light_text_color)
@@ -2838,6 +3010,37 @@ class ClientApp(wx.App):
         except Exception:
             return False
 
+    # Update UI must never steal focus from a compose box. A keystroke in ANY open chat's input_ctrl (see
+    # ChatPanel._handle_draft_typing) updates _last_typing_ts; these helpers let the update code check before
+    # showing anything intrusive.
+    UPDATE_TYPING_ACTIVE_WINDOW_SECONDS = 8
+    def has_open_unsent_text(self):
+        """True if any currently open chat's compose box has unsent text right now."""
+        frame = getattr(self, "frame", None)
+        if not frame:
+            return False
+        for panel in frame.all_chats():
+            try:
+                if panel.input_ctrl.GetValue().strip():
+                    return True
+            except Exception:
+                pass
+        return False
+    def is_user_busy_typing(self):
+        """True if the user is actively typing (a keystroke in the last few seconds) or currently has unsent
+        text in an open compose box. Governs whether update UI may appear at all right now."""
+        if (time.time() - getattr(self, "_last_typing_ts", 0.0)) < self.UPDATE_TYPING_ACTIVE_WINDOW_SECONDS:
+            return True
+        return self.has_open_unsent_text()
+    def has_any_unsent_draft(self):
+        """Broader check used right before an update restart: any open compose box with text, OR any draft
+        saved anywhere (even for a chat that isn't currently open). Governs the final 'Install now or later?'."""
+        if self.has_open_unsent_text():
+            return True
+        try:
+            return bool(_load_drafts())
+        except Exception:
+            return False
     def _start_app_health(self):
         global HEALTH
         if AppHealth is None or HEALTH is not None:
@@ -2886,6 +3089,7 @@ class ClientApp(wx.App):
             print("IPC port unavailable and no active instance responded; continuing without IPC listener.")
             log_event("warn", "ipc_bind_unavailable_continuing")
         self.user_config = load_user_config()
+        self._last_typing_ts = 0.0
         self._start_app_health()
         self.autostart = AUTOSTART_ARG in sys.argv[1:]
         if autostart_supported() and not self.user_config.get('start_at_login_initialized'):
@@ -3524,11 +3728,47 @@ class ClientApp(wx.App):
             self._update_timer = wx.Timer(self)
             self.Bind(wx.EVT_TIMER, self._on_update_timer, self._update_timer)
             self._update_timer.Start(UPDATE_CHECK_INTERVAL_MS)
+        # Reopen whatever chat was open before (e.g. before an update restarted Thrive), then, once that has
+        # had time to restore its own draft and take focus, show What's New if anything changed since last seen.
+        wx.CallLater(2500, self._reopen_last_chat_after_launch)
+        wx.CallLater(3200, self._show_whats_new_after_launch)
 
     def _on_update_timer(self, _event=None):
         frame = getattr(self, "frame", None)
         if frame and not getattr(frame, "is_exiting", False):
             frame.on_check_updates(silent=True)
+
+    def _reopen_last_chat_after_launch(self):
+        """Reopen whichever chat was open/focused before Thrive last closed (see
+        MainFrame._save_last_open_chat_for_restart), so relaunching after an update doesn't drop the user back
+        at the contact list with no idea where they were."""
+        frame = getattr(self, "frame", None)
+        if not frame or getattr(frame, "is_exiting", False):
+            return
+        last = self.user_config.get('last_open_chat')
+        if not isinstance(last, dict) or not last:
+            return
+        try:
+            if last.get('kind') == 'room' and isinstance(last.get('room'), dict) and last['room'].get('room_id'):
+                frame.open_room_chat(dict(last['room']), activate=True)
+            elif last.get('kind') == 'dm' and last.get('contact'):
+                contact = str(last['contact'])
+                is_contact = contact in frame.contact_states
+                dlg = frame.get_chat(contact) or ChatDialog(
+                    frame, contact, frame.sock, frame.user,
+                    is_chat_logging_enabled(self.user_config, contact),
+                    is_contact=is_contact,
+                    can_call=frame.can_use_voice_call(),
+                    show_call=frame.is_voice_call_visible(),
+                )
+                dlg.open_chat(activate=True)
+        except Exception as e:
+            print(f"Could not reopen last chat after launch: {e}")
+
+    def _show_whats_new_after_launch(self):
+        frame = getattr(self, "frame", None)
+        if frame and not getattr(frame, "is_exiting", False):
+            frame.maybe_show_whats_new()
 
     def _start_keepalive_monitor(self):
         stop_event = getattr(self, "_keepalive_stop", None)
@@ -5712,6 +5952,7 @@ class MainFrame(wx.Frame):
         self.mi_submit_logs = help_menu.Append(wx.ID_ANY, "Submit Diagnostic Logs")
         help_menu.AppendSeparator()
         self.mi_check_updates = help_menu.Append(int(self.check_updates_id), "Check for Updates…\tAlt+P")
+        self.mi_whats_new = help_menu.Append(wx.ID_ANY, "What's New…")
 
         menubar.Append(file_menu, "&File")
         menubar.Append(contacts_menu, "&Contacts")
@@ -5765,6 +6006,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_open_demo_videos, self.mi_demo_videos)
         self.Bind(wx.EVT_MENU, self.on_submit_logs, self.mi_submit_logs)
         self.Bind(wx.EVT_MENU, self.on_check_updates_menu, self.mi_check_updates)
+        self.Bind(wx.EVT_MENU, self.on_show_whats_new, self.mi_whats_new)
         if self.mi_app_check_updates is not None:
             self.Bind(wx.EVT_MENU, self.on_check_updates_menu, self.mi_app_check_updates)
 
@@ -6095,6 +6337,12 @@ class MainFrame(wx.Frame):
         app.user_config['delete_messages_for_everyone'] = dlg.delete_for_everyone_cb.IsChecked()
         app.user_config['chat_tabs'] = dlg.chat_tabs_cb.IsChecked()
         app.user_config['keep_contact_list_open'] = dlg.keep_contact_list_cb.IsChecked()
+        prev_remember_drafts = bool(app.user_config.get('remember_drafts', True))
+        new_remember_drafts = dlg.remember_drafts_cb.IsChecked()
+        app.user_config['remember_drafts'] = new_remember_drafts
+        if prev_remember_drafts and not new_remember_drafts:
+            clear_all_drafts()  # "remember" semantics: turning it off forgets what's already remembered
+        app.user_config['show_whats_new_after_update'] = dlg.show_whats_new_cb.IsChecked()
         app.user_config['start_chats_fresh'] = dlg.start_fresh_cb.IsChecked()
         app.user_config['send_read_receipts'] = dlg.read_receipts_cb.IsChecked()
         app.user_config['read_after_seconds'] = int(dlg.read_after_spin.GetValue())
@@ -6473,11 +6721,72 @@ class MainFrame(wx.Frame):
         menu.Bind(wx.EVT_MENU, _on_clear_global, mi_clear_global)
         self.PopupMenu(menu)
         menu.Destroy()
+    def save_all_drafts(self):
+        """Force every open chat to write its current compose-box text (or clear it) to drafts.json right now,
+        bypassing each panel's debounce timer. Called unconditionally before an update installs and restarts,
+        so nothing is ever lost to timing."""
+        for panel in self.all_chats():
+            try:
+                panel.flush_draft_now()
+            except Exception:
+                pass
+    def _save_last_open_chat_for_restart(self):
+        """Remember which chat was active so it can be reopened automatically after an update-triggered
+        relaunch (see ClientApp._reopen_last_chat_after_launch)."""
+        app = wx.GetApp()
+        active = None
+        for panel in self.all_chats():
+            try:
+                if panel.is_active_chat():
+                    active = panel
+                    break
+            except Exception:
+                pass
+        if active is None:
+            app.user_config.pop('last_open_chat', None)
+            return
+        if getattr(active, "room_id", None):
+            app.user_config['last_open_chat'] = {"kind": "room", "room_id": active.room_id, "room": dict(active.room)}
+        else:
+            app.user_config['last_open_chat'] = {"kind": "dm", "contact": active.contact}
+    def on_show_whats_new(self, event=None):
+        """Help > What's New: always available, shows the full list regardless of the setting or what's
+        already been seen."""
+        self.maybe_show_whats_new(force=True)
+    def maybe_show_whats_new(self, force=False):
+        """Shown once after an update installs the versions the user hasn't seen yet (or any time via
+        Help > What's New, with force=True). Accessible: Escape or the Close button dismisses it, and focus
+        returns to wherever the user was (their chat and compose box, after drafts/last-chat are restored)."""
+        app = wx.GetApp()
+        if not force and not app.user_config.get('show_whats_new_after_update', True):
+            return
+        last_seen = str(app.user_config.get('last_seen_whats_new_version') or '')
+        last_seen_parsed = parse_github_tag(last_seen) or (-1, -1, -1, -1)
+        entries = [(tag, WHATS_NEW[tag]) for tag in WHATS_NEW_ORDER
+                   if tag in WHATS_NEW and (parse_github_tag(tag) or (-1, -1, -1, -1)) > last_seen_parsed]
+        if not entries:
+            if not force:
+                return
+            entries = [(tag, WHATS_NEW[tag]) for tag in WHATS_NEW_ORDER if tag in WHATS_NEW]
+        came_from = wx.Window.FindFocus()
+        with WhatsNewDialog(self, entries) as dlg:
+            dlg.ShowModal()
+        if not force:
+            app.user_config['last_seen_whats_new_version'] = VERSION_TAG
+            save_user_config(app.user_config)
+        wx.CallAfter(self._return_focus, came_from)
     def on_check_updates_menu(self, event=None):
         self.on_check_updates(event, silent=False)
     def on_check_updates(self, event=None, silent=False):
         if not self.btn_update.IsEnabled():
             if not silent: speak_text("Already checking for updates.")
+            return
+        app = wx.GetApp()
+        pending = app.user_config.get('pending_update')
+        if isinstance(pending, dict) and pending.get('dest') and os.path.exists(pending['dest']):
+            # Already downloaded and waiting on an earlier "Later": no need to hit the network again.
+            if not silent: speak_text("An update is already downloaded and ready to install.")
+            self._proceed_with_install(pending.get('tag', ''), pending['dest'], bool(pending.get('use_installer')))
             return
         self.btn_update.Disable()
         if not silent: speak_text("Checking for updates.")
@@ -6492,28 +6801,49 @@ class MainFrame(wx.Frame):
                     # The user's side (offline, DNS, captive portal): no error dialog, just try again quietly.
                     self._schedule_update_retry()
                     if not silent:
-                        wx.MessageBox("Thrive couldn't reach the update server. Check that you're online. "
-                                      "Thrive will keep trying by itself.", "Update Check", wx.ICON_INFORMATION, self)
+                        self._show_update_notice("Thrive couldn't reach the update server. Check that you're online. "
+                                      "Thrive will keep trying by itself.", "Update Check", wx.ICON_INFORMATION)
                     return
             else:
                 self._update_retry_step = 0
             if tag and silent and tag == getattr(self, "_declined_update_tag", None):
                 return  # already asked about this version; Help > Check for Updates still offers it
             if tag:
-                if HEALTH is not None:
-                    HEALTH.send("update_available", to_version=tag, stage="check")
-                result = wx.MessageBox(
-                    f"A new version is available: {tag}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
-                    "Update Available", wx.YES_NO | wx.ICON_INFORMATION, self)
-                if result == wx.YES:
-                    self._start_update_download(tag)
-                else:
-                    self._declined_update_tag = tag
+                self._offer_update_when_idle(tag)
             elif error and not silent:
-                wx.MessageBox(f"Could not check for updates:\n{error}", "Update Check Failed", wx.ICON_ERROR, self)
+                self._show_update_notice(f"Could not check for updates:\n{error}", "Update Check Failed", wx.ICON_ERROR)
             elif not error and not silent:
-                wx.MessageBox(f"You're up to date. {VERSION_TAG} is the latest version.", "No Updates", wx.ICON_INFORMATION, self)
+                self._show_update_notice(f"You're up to date. {VERSION_TAG} is the latest version.", "No Updates", wx.ICON_INFORMATION)
         check_for_update(_callback)
+    # --- update UI must never steal focus from a compose box --------------------------------------------------
+    UPDATE_IDLE_POLL_MS = 20000
+    def _show_update_notice(self, message, title, icon=wx.ICON_INFORMATION):
+        """An update-related informational/error dialog, deferred (polled, same idea as _schedule_update_retry)
+        rather than shown while the user is mid-typing or has unsent text anywhere open."""
+        if not self or getattr(self, "is_exiting", False):
+            return
+        if wx.GetApp().is_user_busy_typing():
+            wx.CallLater(self.UPDATE_IDLE_POLL_MS, self._show_update_notice, message, title, icon)
+            return
+        wx.MessageBox(message, title, icon, self)
+    def _offer_update_when_idle(self, tag):
+        """The 'Update Available' Yes/No prompt: only shown once the user isn't actively typing or sitting on
+        unsent text, otherwise it keeps quietly checking back."""
+        if not self or getattr(self, "is_exiting", False):
+            return
+        app = wx.GetApp()
+        if app.is_user_busy_typing():
+            wx.CallLater(self.UPDATE_IDLE_POLL_MS, self._offer_update_when_idle, tag)
+            return
+        if HEALTH is not None:
+            HEALTH.send("update_available", to_version=tag, stage="check")
+        result = wx.MessageBox(
+            f"A new version is available: {tag}\nYou are currently running {VERSION_TAG}.\n\nWould you like to download and install it?",
+            "Update Available", wx.YES_NO | wx.ICON_INFORMATION, self)
+        if result == wx.YES:
+            self._start_update_download(tag)
+        else:
+            self._declined_update_tag = tag
     UPDATE_RETRY_MINUTES = (5, 30, 120)
     def _schedule_update_retry(self):
         """Quiet retries after a network failure: about 5 min, 30 min, 2 h, then the normal 6-hour schedule."""
@@ -6558,7 +6888,7 @@ class MainFrame(wx.Frame):
                     data = json.loads(resp.read().decode())
             except Exception as e:
                 if HEALTH is not None: HEALTH.update_failed("check", e, to_version=tag)
-                wx.MessageBox(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
+                self._show_update_notice(f"Failed to fetch release info:\n{e}", "Update Error", wx.ICON_ERROR); return
             assets = data.get("assets", [])
             for name in target_candidates:
                 for a in assets:
@@ -6575,34 +6905,22 @@ class MainFrame(wx.Frame):
                         break
         if not asset_url:
             if HEALTH is not None: HEALTH.update_failed("check", "No matching update file in the feed or release.", to_version=tag, error_class="server")
-            wx.MessageBox(f"Could not find a matching update archive in release assets.", "Update Error", wx.ICON_ERROR); return
+            self._show_update_notice("Could not find a matching update archive in release assets.", "Update Error", wx.ICON_ERROR); return
         ext = ".exe" if use_installer else ".zip"
         dest = os.path.join(tempfile.gettempdir(), f"thrive_update{ext}")
-        progress = wx.ProgressDialog("Downloading Update", "Starting download...", maximum=100, parent=self,
-            style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT | wx.PD_SMOOTH)
+        app = wx.GetApp()
+        # Never app-modal, and skipped entirely while the user is mid-typing: update UI must never be able to
+        # steal focus from a compose box, full stop.
+        progress = None
+        if not app.is_user_busy_typing():
+            progress = wx.ProgressDialog("Downloading Update", "Starting download...", maximum=100, parent=self,
+                style=wx.PD_AUTO_HIDE | wx.PD_CAN_ABORT | wx.PD_SMOOTH)
         def _done(success, error):
-            progress.Destroy()
+            if progress:
+                progress.Destroy()
             if success:
-                try:
-                    if HEALTH is not None: HEALTH.update_started(tag)  # the next start reports whether it worked
-                    if use_installer and sys.platform == 'win32':
-                        apply_installer_update(dest)
-                    else:
-                        apply_zip_update(dest)
-                except Exception as apply_err:
-                    if HEALTH is not None:
-                        HEALTH.state.pop("pending_update", None); HEALTH._save()
-                        HEALTH.update_failed("install", apply_err, to_version=tag)
-                    wx.MessageBox(f"Failed to install update:\n{apply_err}", "Update Error", wx.ICON_ERROR)
-                    return
-                app = wx.GetApp(); app.intentional_disconnect = True
-                try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
-                except: pass
-                try: self.sock.close()
-                except: pass
-                if self.task_bar_icon: self.task_bar_icon.Destroy()
-                self.is_exiting = True; self.Destroy()
-                app.ExitMainLoop()
+                if HEALTH is not None: HEALTH.update_started(tag)  # the next start reports whether it worked
+                self._proceed_with_install(tag, dest, use_installer)
             else:
                 stage = "verify" if isinstance(error, UpdateVerifyError) else "download"
                 cls = "server" if stage == "verify" else health_classify(error) if isinstance(error, BaseException) else "app"
@@ -6610,16 +6928,67 @@ class MainFrame(wx.Frame):
                 if cls == "network":
                     # Keep what we have; the next try picks up where this one stopped.
                     self._schedule_update_retry()
-                    wx.MessageBox("The update download was interrupted, probably by the connection. "
-                                  "Thrive will try again by itself and continue where it stopped.", "Update Paused", wx.ICON_INFORMATION, self)
+                    self._show_update_notice("The update download was interrupted, probably by the connection. "
+                                  "Thrive will try again by itself and continue where it stopped.", "Update Paused", wx.ICON_INFORMATION)
                 else:
-                    wx.MessageBox(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
+                    self._show_update_notice(f"Download failed:\n{error}", "Update Error", wx.ICON_ERROR)
         expected_sha256 = None
         if UPDATE_CONTEXT.get("source") == "feed":
             if sys.platform == "darwin": expected_sha256 = UPDATE_CONTEXT.get("mac_zip_sha256")
             elif use_installer: expected_sha256 = UPDATE_CONTEXT.get("installer_sha256")
             else: expected_sha256 = UPDATE_CONTEXT.get("win_zip_sha256")
         download_update(asset_url, dest, progress, _done, expected_sha256=expected_sha256)
+    def _proceed_with_install(self, tag, dest, use_installer):
+        """An update is downloaded and ready. Flush every open draft unconditionally, regardless of the
+        debounce timer, then either install now or -- if there's unsent text anywhere -- ask first, deferring
+        the ask itself while the user is actively typing (never interrupt mid-sentence)."""
+        app = wx.GetApp()
+        self.save_all_drafts()
+        def _ask_and_go():
+            if not self or getattr(self, "is_exiting", False):
+                return
+            if app.is_user_busy_typing():
+                wx.CallLater(self.UPDATE_IDLE_POLL_MS, _ask_and_go)
+                return
+            if app.has_any_unsent_draft():
+                dlg = wx.MessageDialog(self,
+                    "An update is ready to install. You have an unsent draft message.\n\n"
+                    "Install now, or wait until later? Either way, nothing will be lost.",
+                    "Update Ready", wx.YES_NO | wx.ICON_QUESTION)
+                dlg.SetYesNoLabels("Install &Now", "&Later")
+                choice = dlg.ShowModal()
+                dlg.Destroy()
+                if choice != wx.ID_YES:
+                    app.user_config['pending_update'] = {"tag": tag, "dest": dest, "use_installer": bool(use_installer)}
+                    save_user_config(app.user_config)
+                    if HEALTH is not None: HEALTH.send("update_deferred", to_version=tag, stage="install")
+                    speak_text("Okay. Thrive will ask again later; the download is kept so it won't happen twice.", interrupt=False)
+                    return
+            app.user_config.pop('pending_update', None)
+            self._save_last_open_chat_for_restart()
+            save_user_config(app.user_config)
+            self._install_and_restart(tag, dest, use_installer)
+        _ask_and_go()
+    def _install_and_restart(self, tag, dest, use_installer):
+        try:
+            if use_installer and sys.platform == 'win32':
+                apply_installer_update(dest)
+            else:
+                apply_zip_update(dest)
+        except Exception as apply_err:
+            if HEALTH is not None:
+                HEALTH.state.pop("pending_update", None); HEALTH._save()
+                HEALTH.update_failed("install", apply_err, to_version=tag)
+            self._show_update_notice(f"Failed to install update:\n{apply_err}", "Update Error", wx.ICON_ERROR)
+            return
+        app = wx.GetApp(); app.intentional_disconnect = True
+        try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
+        except: pass
+        try: self.sock.close()
+        except: pass
+        if self.task_bar_icon: self.task_bar_icon.Destroy()
+        self.is_exiting = True; self.Destroy()
+        app.ExitMainLoop()
     def _prompt_invite_user(self, username, methods=None):
         with InviteUserDialog(self, username, methods=methods) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
@@ -6841,7 +7210,9 @@ class MainFrame(wx.Frame):
             unread = int(self._unread_counts.get(c["user"], 0) or 0)
             user_label = self.format_user_label(c["user"], include_username=True)
             unread_text = f"  |  {user_label} has {unread} new message{'s' if unread != 1 else ''}" if unread > 0 else ""
-            display = f"{user_label}  |  {c['status']}{unread_text}"
+            draft = draft_preview(c["user"])
+            draft_text = f"  |  Draft: {draft}" if draft else ""
+            display = f"{user_label}  |  {c['status']}{unread_text}{draft_text}"
             self.lv.Append(display)
             idx = self.lv.GetCount() - 1
             self._contact_display_map.append(c["user"])
@@ -7007,6 +7378,9 @@ class MainFrame(wx.Frame):
     def on_exit(self, _):
         print("Exiting application...");
         app = wx.GetApp(); app.intentional_disconnect = True
+        self.save_all_drafts()
+        self._save_last_open_chat_for_restart()
+        save_user_config(app.user_config)
         app.reconnect_stop_event.set(); app.reconnect_in_progress = False
         try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
         except: pass
@@ -7018,6 +7392,7 @@ class MainFrame(wx.Frame):
         app.ExitMainLoop()
     def on_logout(self, _):
         self.is_exiting = True; app = wx.GetApp(); app.intentional_disconnect = True
+        self.save_all_drafts()  # drafts are per-conversation and safe to keep across a logout/login
         app.reconnect_stop_event.set(); app.reconnect_in_progress = False
         try: self.sock.sendall(json.dumps({"action":"logout"}).encode()+b"\n")
         except: pass
@@ -8153,11 +8528,18 @@ class GroupRoomsPanel(wx.Panel):
                  f"{r.get('member_count', 0)} member{'s' if r.get('member_count', 0) != 1 else ''}"]
         if r.get("unread"):
             parts.append(f"{r['unread']} unread")
+        draft = draft_preview("room:" + str(r.get("room_id") or ""))
+        if draft:
+            parts.append(f"Draft: {draft}")
         if r.get("visibility") == "private":
             parts.append("private")
         if r.get("topic"):
             parts.append(f"topic: {r['topic']}")
         return ", ".join(parts)
+    def refresh_labels_only(self):
+        """Re-render room list labels from the already-fetched self.rooms (e.g. after a draft changes),
+        without hitting the server the way refresh_rooms() does."""
+        self._show_rooms(self.rooms)
     def _show_rooms(self, rooms, query=""):
         keep = (self._selected_room() or {}).get("room_id")
         self.rooms = list(rooms or [])
@@ -9604,6 +9986,8 @@ class ChatPanel(wx.Panel):
         self._sent_typing = False
         self._typing_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_typing_timeout, self._typing_timer)
+        self._draft_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_draft_timer, self._draft_timer)
 
         dark_mode_on = is_windows_dark_mode()
         if dark_mode_on:
@@ -9695,6 +10079,7 @@ class ChatPanel(wx.Panel):
         self._hist_state = {"loaded": False, "has_more": False, "pending": False}
         if not self.is_remote_directory_chat and not bool(wx.GetApp().user_config.get('start_chats_fresh', False)):
             wx.CallAfter(self.request_history)
+        self._restore_draft()
         self._focus_input()
     def apply_call_permissions(self, can_call, show_call):
         self._can_call = bool(can_call)
@@ -9713,8 +10098,14 @@ class ChatPanel(wx.Panel):
         except Exception:
             return bool(self.logging_enabled)
     def _focus_input(self):
-        wx.CallAfter(self.input_ctrl.SetFocus)
-        wx.CallLater(120, self.input_ctrl.SetFocus)
+        wx.CallAfter(self._focus_input_now)
+        wx.CallLater(120, self._focus_input_now)
+    def _focus_input_now(self):
+        try:
+            self.input_ctrl.SetFocus()
+            self.input_ctrl.SetInsertionPointEnd()
+        except Exception:
+            pass
     @property
     def sock(self):
         # Always the app's current connection, so a reconnect can never leave a chat on a dead socket.
@@ -9742,6 +10133,7 @@ class ChatPanel(wx.Panel):
         return bool(self.window and self.window.is_active_chat(self))
     def close_chat(self):
         self._send_stop_typing()
+        self.flush_draft_now()
         if self.window:
             self.window.remove_chat(self)
     def mark_tab_unread(self):
@@ -9905,6 +10297,7 @@ class ChatPanel(wx.Panel):
             return
         self._handle_enter_action()
     def on_input_text(self, event):
+        self._handle_draft_typing()
         if self.is_remote_directory_chat:
             event.Skip()
             return
@@ -9936,6 +10329,67 @@ class ChatPanel(wx.Panel):
     def on_typing_timeout(self, event):
         if self._sent_typing:
             self._send_stop_typing()
+    # --- drafts: per-conversation, keyed by self.contact (a username for DMs, "room:<id>" for rooms) -----------
+    DRAFT_DEBOUNCE_MS = 1000
+    def _handle_draft_typing(self):
+        """Call on every EVT_TEXT in the compose box. Tracks global typing activity (the update pipeline uses
+        this to avoid ever interrupting a compose box), and debounces the actual draft save to disk so we
+        aren't writing a file on every keystroke."""
+        app = wx.GetApp()
+        if self.input_ctrl.GetValue().strip():
+            app._last_typing_ts = time.time()
+        if not app.user_config.get('remember_drafts', True):
+            return
+        timer = getattr(self, "_draft_timer", None)
+        if timer is not None:
+            timer.Start(self.DRAFT_DEBOUNCE_MS, oneShot=True)
+    def _on_draft_timer(self, event):
+        self.flush_draft_now()
+        self._refresh_draft_indicator()
+    def flush_draft_now(self):
+        """Write (or clear) the draft immediately, bypassing the debounce timer. Safe to call any time,
+        including during shutdown: used on send, on chat close, and unconditionally right before an update
+        installs and restarts so nothing depends on timing."""
+        try:
+            if not wx.GetApp().user_config.get('remember_drafts', True):
+                return
+            text = self.input_ctrl.GetValue()
+            if text.strip():
+                set_draft(self.contact, text)
+            else:
+                clear_draft(self.contact)
+        except Exception:
+            pass
+    def clear_draft_now(self):
+        timer = getattr(self, "_draft_timer", None)
+        if timer is not None:
+            timer.Stop()
+        try:
+            clear_draft(self.contact)
+        except Exception:
+            pass
+        self._refresh_draft_indicator()
+    def _restore_draft(self):
+        if not wx.GetApp().user_config.get('remember_drafts', True):
+            return
+        saved = get_draft(self.contact)
+        if saved:
+            self.input_ctrl.ChangeValue(saved)  # ChangeValue: no EVT_TEXT, so restoring never sends "typing"
+    def _refresh_draft_indicator(self):
+        """Refresh the contact/room list row so 'Draft: ...' appears or disappears promptly, without hitting
+        the server (see GroupRoomsPanel.refresh_labels_only)."""
+        try:
+            frame = self.frame
+            if not frame:
+                return
+            if getattr(self, "room_id", None) is not None:
+                gp = getattr(frame, "groups_panel", None)
+                if gp:
+                    wx.CallAfter(gp.refresh_labels_only)
+            else:
+                wx.CallAfter(frame._apply_search_filter)
+        except Exception:
+            pass
     def on_key(self, event):
         if event.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("chat", self)
@@ -10046,10 +10500,12 @@ class ChatPanel(wx.Panel):
                 self.mark_row_queued(client_id, True)
                 speak_text("Offline. The message will be sent when Thrive reconnects.", interrupt=False)
             wx.GetApp().play_sound("send.wav")
+            self.clear_draft_now()
             self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
             return
         self.append(txt, self.user, ts, client_id=None)
         wx.GetApp().play_sound("send.wav")
+        self.clear_draft_now()
         self.input_ctrl.Clear(); self.input_ctrl.SetFocus()
     def on_send_file(self, _):
         if self.is_remote_directory_chat:
@@ -11666,6 +12122,7 @@ class RoomChatPanel(ChatPanel):
             return
         self.append(txt, self.user, time.time(), client_id=client_id)
         wx.GetApp().play_sound("send.wav")
+        self.clear_draft_now()
         self.input_ctrl.Clear()
         self.input_ctrl.SetFocus()
     def on_send_file(self, _):
@@ -11716,6 +12173,7 @@ class RoomChatPanel(ChatPanel):
         self._play_voice_row(row)
     # --- typing -------------------------------------------------------------------------------------------------
     def on_input_text(self, event):
+        self._handle_draft_typing()
         if wx.GetApp().user_config.get('typing_indicators', True):
             txt = self.input_ctrl.GetValue().strip()
             if txt and not self._sent_typing:

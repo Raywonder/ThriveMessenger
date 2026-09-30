@@ -128,11 +128,16 @@ As long as you have a PC with Windows 7 or higher, an internet connection and a 
 
 ### TappedIn downloads
 
-The TappedIn build (Alpha 15.21) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+The TappedIn build (Alpha 15.23) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
 
 * Windows installer or portable ZIP.
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.23
+* **Drafts:** whatever you're typing but haven't sent is saved automatically as you go (about a second after you stop typing) and restored the next time you open that chat, even after Thrive updates and restarts. The contact list and room list show "Draft: ..." with the first few words. Turn this off in Settings, General, "Remember unsent messages as drafts" (on by default); turning it off also forgets any drafts already saved.
+* **Updates never interrupt you mid-typing.** If you're actively typing, or have any unsent text anywhere, Thrive no longer pops the "Update Available" dialog or an app-modal progress bar over your compose box; it waits until you're idle, or downloads silently in the background. Right before installing and restarting, every open draft is saved to disk first, no matter what. If you still have an unsent draft at that point, Thrive asks "Install now or later?" instead of restarting on you; "Later" keeps the download so it won't happen twice, and Thrive reopens the chat you were in after it restarts.
+* **What's New:** after an update installs, Thrive shows a short summary of what changed since you last saw it (Escape closes it, and focus returns to your chat). See it again any time from Help, What's New. Turn it off in Settings, General, "Show What's New after an update".
 
 ### What's new in Alpha 15.22
 * **Links list fix:** Open, Open in browser, Copy link, Copy title and Remove link in the list of links now close the list and put focus back on the message it came from, the same as Escape/Ctrl+W. Before, the list stayed open after using any of those.

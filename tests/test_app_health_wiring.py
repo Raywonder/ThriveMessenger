@@ -31,9 +31,16 @@ class AppHealthWiringTests(unittest.TestCase):
         self.assertIn("sys.excepthook", body)
 
     def test_update_started_is_recorded_before_installing(self):
+        # 15.23: the actual install call moved out of _start_update_download into _install_and_restart, so an
+        # update-ready-but-unsent-draft can ask "install now or later?" (_proceed_with_install) in between.
+        # The ordering guarantee (update_started recorded before anything installs) still holds across that
+        # call chain.
         body = self._func("_start_update_download")
-        self.assertLess(body.index("HEALTH.update_started(tag)"), body.index("apply_installer_update(dest)"))
-        self.assertIn('HEALTH.update_failed("install"', body)
+        self.assertLess(body.index("HEALTH.update_started(tag)"), body.index("self._proceed_with_install(tag, dest, use_installer)"))
+        install_body = self._func("_install_and_restart")
+        self.assertIn("apply_installer_update(dest)", install_body)
+        self.assertIn('HEALTH.update_failed("install"', install_body)
+        body = self._func("_start_update_download")
         self.assertIn("update_failed(stage, error", body)
 
     def test_unreachable_update_server_is_not_up_to_date(self):
