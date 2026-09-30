@@ -134,6 +134,9 @@ The TappedIn build (Alpha 15.21) is on the [Thrive Messenger Setup page](https:/
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
 
+### What's new in Alpha 15.22
+* **Links list fix:** Open, Open in browser, Copy link, Copy title and Remove link in the list of links now close the list and put focus back on the message it came from, the same as Escape/Ctrl+W. Before, the list stayed open after using any of those.
+
 ### What's new in Alpha 15.21
 
 * Received files go into a folder for each person (files/<user name>), and room files into files/Rooms/<room name>. Existing loose files are moved into the right folders the first time 15.21 starts, and Open and Show in Folder keep working.

@@ -22,7 +22,7 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.21"
+VERSION_TAG = "v2026-alpha15.22"
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(
     r'\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d{1,5})?(?:/[^\s<>()]*)?)\b',
@@ -9342,7 +9342,9 @@ class LinkViewerFrame(wx.Frame):
 class LinksListDialog(wx.Dialog):
     """Links as an accessible list; each item reads "title, URL, sender, time".
     Enter opens, Ctrl+C copies the link, Ctrl+Shift+C copies the title, the Applications key shows more actions.
-    pick_to_remove=True makes Enter remove the chosen link instead (Remove links > A link in this conversation)."""
+    pick_to_remove=True makes Enter remove the chosen link instead (Remove links > A link in this conversation).
+    Every action - the buttons below the list, their keyboard equivalents and the context menu - closes this
+    dialog and puts focus back on the message the list came from, the same as Escape or Ctrl+W (Command+W)."""
     def __init__(self, chat, heading, items, pick_to_remove=False):
         super().__init__(chat.GetTopLevelParent(), title=heading, size=(820, 520), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.chat = chat
@@ -9354,8 +9356,9 @@ class LinksListDialog(wx.Dialog):
         self.items = items
         panel = wx.Panel(self)
         s = wx.BoxSizer(wx.VERTICAL)
-        hint = "Enter removes the chosen link." if self.pick_to_remove else \
-            "Enter opens. Control C copies the link, Control Shift C copies the title. Applications key for more."
+        hint = "Enter removes the chosen link and closes this list." if self.pick_to_remove else \
+            "Enter opens, Control C copies the link, Control Shift C copies the title. Applications key for more. " \
+            "Each one closes this list and goes back to the message."
         self.lbl = wx.StaticText(panel, label=f"&Links, {len(items)} ({hint})")
         self.list = wx.ListBox(panel, choices=[self._label(i) for i in items] or ["No links found"], style=wx.LB_SINGLE, name=heading)
         if items:
@@ -9413,14 +9416,13 @@ class LinksListDialog(wx.Dialog):
     def _selected(self):
         n = self.list.GetSelection()
         return self.items[n] if self.items and 0 <= n < len(self.items) else None
-    def _refocus(self):
-        if self:
-            self.Raise()
-            self.list.SetFocus()
     def _open(self, mode=None):
         item = self._selected()
-        if item:
-            open_link(item["url"], parent=self, title=item.get("title") or link_title_for(item["url"]), return_to=self._refocus, mode=mode)
+        if not item:
+            return
+        chat = self.chat
+        if open_link(item["url"], parent=self, title=item.get("title") or link_title_for(item["url"]), return_to=chat.focus_messages, mode=mode):
+            self.Close()
     def _copy(self, title=False):
         item = self._selected()
         if not item:
@@ -9430,21 +9432,18 @@ class LinksListDialog(wx.Dialog):
             ok = copy_text_to_clipboard(t or item["url"])
             speak_text(("Title copied" if t else "No title found, copied the link instead") if ok else "Could not copy", interrupt=True)
         else:
-            speak_text("Link copied" if copy_text_to_clipboard(item["url"]) else "Could not copy", interrupt=True)
+            ok = copy_text_to_clipboard(item["url"])
+            speak_text("Link copied" if ok else "Could not copy", interrupt=True)
+        if ok:
+            self.Close()
     def _remove(self):
         item = self._selected()
         if not item:
             return
-        n = self.list.GetSelection()
         if self.chat.remove_link_items([item], "Remove this link", parent=self):
-            self.items.pop(n)
-            self.list.Delete(n)
-            if self.items:
-                self.list.SetSelection(min(n, len(self.items) - 1))
-            else:
-                self.list.Append("No links found")
-            self.lbl.SetLabel(f"&Links, {len(self.items)}")
-        self.list.SetFocus()
+            self.Close()
+        else:
+            self.list.SetFocus()
     def on_list_key(self, event):
         key = event.GetKeyCode()
         if key in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER) and not event.HasAnyModifiers():

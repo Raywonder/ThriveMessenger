@@ -6,6 +6,9 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.22
+- **Links list fix:** opening a link, opening it in your browser, copying the link, copying its title or removing it from the list of links now closes the list and puts you back on the message it came from, the same as Escape or Ctrl+W already did. Before, the list stayed open after any of those actions.
+
 ## What's New in Alpha 15.21
 - **A folder for each person:** received files now go into a folder named after the person who sent them, under Documents, ThriveMessenger, files. Room files go into files, Rooms, and the room's name. Files already in the files folder are moved into the right folder the first time 15.21 starts; any whose sender Thrive can't tell go into "Earlier files (sender unknown)". Open and Show in Folder keep working.
 - **Open Their Files Folder:** a new button in each conversation's File Transfers tab.
@@ -125,7 +128,7 @@ Each conversation has three tabs:
 - **Mouse:** double-click a message to open its link. View Full Message shows each link as a real clickable link.
 - **Links menu:** the message context menu (Applications key or Shift+F10) has a Links group below the usual options:
   - Open link, Open link in full view, Open link in default browser, Copy link and Copy link title. These act on the link you moved to or the only link; with several links you pick one from a submenu.
-  - **Show list of links:** in this message, in this conversation (its whole history), in this chat window (all open tabs) or in all conversations. Each item reads "title, address, sender, time". Enter opens, Control+C copies the link, Control+Shift+C copies the title, Delete removes it, and the Applications key shows more actions. Escape closes the list.
+  - **Show list of links:** in this message, in this conversation (its whole history), in this chat window (all open tabs) or in all conversations. Each item reads "title, address, sender, time". Enter opens, Control+C copies the link, Control+Shift+C copies the title, Delete removes it, and the Applications key shows more actions. Every one of those closes the list and puts you back on the message it came from, the same as Escape or Control+W.
   - **Remove links:** this link, all links in this message, a link in this conversation (you pick from a list), all links in this conversation, or all links in all conversations. Thrive asks first. Links in your own messages are removed for everyone, following the same rule as deleting: only the sender or an admin. Links other people sent are hidden on this device only, and Thrive tells you which.
 - **Link titles:** the Thrive server looks up each page's title in the background, so links are read by name, and the site sees the server rather than you. It never visits private or local network addresses. When there's no title, the address is used.
 - Settings, General tab, Chat Behavior: **Open links in** (Full view inside Thrive, Default browser, or Ask each time), **Fetch link titles** (on by default) and **Sort link lists** (Newest first or By sender).
@@ -221,7 +224,7 @@ Each conversation has three tabs:
   - On a message with links: `Left`/`Right` move between its links, `Enter` or `Space` open the link
   - In the message list: `Alt+Down` / `Alt+Up` next or previous message with a link, `Alt+Left` back to where you were before a jump, `Ctrl+Home` / `Ctrl+End` first or last message
   - In full view of a link: `Escape` or `Ctrl+W` close, `Alt+Left` / `Alt+Right` back and forward, `F5` reload
-  - In a list of links: `Enter` open, `Ctrl+C` copy the link, `Ctrl+Shift+C` copy the title, `Delete` remove, `Escape` close
+  - In a list of links: `Enter` open, `Ctrl+C` copy the link, `Ctrl+Shift+C` copy the title, `Delete` remove, `Escape`/`Ctrl+W` close - each one closes the list and returns to the message it came from
   - On a voice message: `Enter` play or stop, `Space` pause or resume, `Left`/`Right` skip 5 seconds
 
 
