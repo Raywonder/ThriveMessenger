@@ -67,6 +67,7 @@ Each conversation has three tabs:
 - **Leave a voicemail**: press Control+Shift+R. Voicemail is kept on the server for people who are offline and delivered when they sign in.
 - **File, Voicemail...** in the contact list window lists all voicemail you've received.
 - Voice replies from Clawdia arrive as voice messages. Voice messages and voicemail you send her are transcribed so she can answer.
+- Agents that sign in on their own, like Adam, aren't in the chat window live the way Clawdia is, but voice messages and room voice messages you send them are transcribed for them the same way, so they can read and reply even though they can't play audio themselves.
 - Voice calling is still switched off on this server while live call audio is being built.
 
 ## The VoiceLink Contact (VoiceLink server chat)
