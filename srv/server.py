@@ -702,7 +702,7 @@ def _canonical_username(name):
 
 VOICE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_messages")
 MAX_VOICE_BYTES = 6 * 1024 * 1024          # decoded upload limit (about 3 minutes of 16 kHz WAV)
-WHISPER_CLI = "/home/tappedin/.openclaw/workspace/scripts/faster_whisper_openclaw.py"
+WHISPER_CLI = "/usr/local/bin/transcribe-audio"
 
 def _format_duration(seconds):
     seconds = int(round(float(seconds or 0)))
@@ -728,14 +728,48 @@ def _transcode_voice_to_mp3(raw, suffix=".bin"):
             return fh.read(), duration
 
 def _transcribe_audio_file(path):
-    """Local speech-to-text (the same faster-whisper adapter OpenClaw uses). '' when unavailable."""
+    """Local speech-to-text (Mac mini whisper.cpp over SSH, local faster-whisper fallback). '' when unavailable.
+    One retry after a short pause absorbs a transient SSH hiccup to the Mac."""
     if not os.path.isfile(WHISPER_CLI):
         return ""
+    for attempt in (1, 2):
+        try:
+            out = subprocess.run([WHISPER_CLI, path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=400)
+            text = out.stdout.decode("utf-8", "replace").strip()
+            if text:
+                return text
+            print(f"Transcription empty for {path} (exit {out.returncode}, attempt {attempt}): "
+                  f"{out.stderr.decode('utf-8', 'replace')[-800:]}")
+        except Exception as e:
+            print(f"Transcription failed for {path} (attempt {attempt}): {type(e).__name__}: {e}")
+        if attempt == 1:
+            time.sleep(3)
+    return ""
+
+def _agent_voice_fallback_text(frm, duration, is_voicemail, transcript):
+    """Short text fallback for clients that don't render a separate transcript field (Dom, 2026-09-30: external
+    bots/agents like Adam get nothing usable from a bare voice attachment, so they need this in the message text too)."""
+    label = "Voicemail" if is_voicemail else "voice message"
+    state = "transcribed" if transcript else "couldn't be transcribed"
+    return f"[{label} from {frm}, {_format_duration(duration)}, {state}]"
+
+def _cache_voice_transcript(msg_uid, transcript):
     try:
-        out = subprocess.run([WHISPER_CLI, path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=180)
-        return out.stdout.decode("utf-8", "replace").strip()
-    except Exception:
-        return ""
+        con = sqlite3.connect(DB)
+        con.execute("UPDATE direct_message_history SET transcript=? WHERE msg_uid=?", (transcript or "", msg_uid))
+        con.commit(); con.close()
+    except Exception as e:
+        print(f"Could not cache voice transcript: {type(e).__name__}")
+
+def _deliver_agent_voice_transcript(to_user, msg_uid, path, frm, duration, is_voicemail):
+    """Transcribe a voice DM to an external bot/agent account off the socket thread (never blocks the sender's
+    connection), cache it once per msg_uid, and push it to that recipient if still connected. A late reconnect
+    picks up the cached transcript from _deliver_pending_bot_messages instead."""
+    transcript = _transcribe_audio_file(path) if path else ""
+    _cache_voice_transcript(msg_uid, transcript)
+    fallback = _agent_voice_fallback_text(frm, duration, is_voicemail, transcript)
+    _send_to_user(to_user, {"action": "voice_transcript", "to": to_user, "id": msg_uid,
+                            "transcript": transcript, "fallback": fallback})
 
 def _prepare_voice_message(msg):
     """Validate and normalise msg["voice"] in place. Returns (ok, reason, mp3_bytes)."""
@@ -811,16 +845,19 @@ def _deliver_pending_bot_messages(sock, username):
     con = sqlite3.connect(DB)
     try:
         rows = con.execute(
-            "SELECT p.msg_uid, h.frm, h.to_user, h.body, h.created_at, h.deleted_at FROM pending_bot_messages p "
+            "SELECT p.msg_uid, h.frm, h.to_user, h.body, h.created_at, h.deleted_at, h.transcript FROM pending_bot_messages p "
             "JOIN direct_message_history h ON h.msg_uid = p.msg_uid WHERE lower(p.to_user)=lower(?) ORDER BY h.id", (username,)).fetchall()
     finally:
         con.close()
     delivered = 0
-    for uid, frm, to_user, body, created_at, deleted_at in rows:
+    for uid, frm, to_user, body, created_at, deleted_at, transcript in rows:
         try:
             if not deleted_at:
-                _send_json_line(sock, {"action": "msg", "from": frm, "to": to_user, "msg": body, "id": uid,
-                                       "time": created_at + "Z", "server_time": created_at + "Z", "delayed": True})
+                payload = {"action": "msg", "from": frm, "to": to_user, "msg": body, "id": uid,
+                          "time": created_at + "Z", "server_time": created_at + "Z", "delayed": True}
+                if transcript:
+                    payload["transcript"] = transcript
+                _send_json_line(sock, payload)
                 delivered += 1
             con = sqlite3.connect(DB)
             con.execute("DELETE FROM pending_bot_messages WHERE msg_uid=?", (uid,))
@@ -856,10 +893,13 @@ HISTORY_MAX_LIMIT = 1000
 def _history_item(row):
     rowid, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path = row[:8]
     delivered, read_at = (row[8], row[9]) if len(row) > 9 else (0, None)
+    transcript = row[10] if len(row) > 10 else None
     item = {"seq": rowid, "id": msg_uid or f"h{rowid}", "from": frm, "to": to_user, "msg": body or "",
             "time": (created_at or "") + ("Z" if created_at and not str(created_at).endswith("Z") else ""),
             "edited": bool(edited_at), "delivered": bool(delivered),
             "read_at": (read_at + "Z") if read_at else None}
+    if transcript:
+        item["transcript"] = transcript
     label = re.match(r"^(Voice message|Voicemail) \((\d+):(\d\d)\)$", body or "")
     if label:
         item["voice"] = {"duration": int(label.group(2)) * 60 + int(label.group(3)),
@@ -880,7 +920,7 @@ def _history_query(user, other, before_seq=None, limit=HISTORY_DEFAULT_LIMIT, da
     con = sqlite3.connect(DB, timeout=10)
     try:
         rows = con.execute(
-            f"SELECT id, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path, delivered, read_at FROM direct_message_history "
+            f"SELECT id, frm, to_user, body, created_at, edited_at, msg_uid, attachment_path, delivered, read_at, transcript FROM direct_message_history "
             f"WHERE {where} ORDER BY id DESC LIMIT ?", params + [limit + 1]).fetchall()
     finally:
         con.close()
@@ -1288,9 +1328,25 @@ def _room_post(room_id, sender, body, client_id="", kind="text", voice_path=None
     item = rooms.add_message(DB, room_id, sender, body, kind=kind, filename=filename, client_id=client_id,
                              voice_path=voice_path, voice_duration=voice_duration)
     _room_broadcast(room_id, {"action": "group_room_message", "message": item})
+    if kind == "voice" and voice_path:
+        agent_members = [m for m in _room_members(room_id)
+                         if m.lower() != str(sender).lower() and _is_registered_bot(m) and not _is_virtual_bot(m)]
+        if agent_members:
+            # Members that sign in by themselves (e.g. Adam) get a transcript, not just raw audio.
+            threading.Thread(target=_deliver_room_voice_transcript, name=f"room-voice-transcript-{room_id}",
+                             daemon=True, args=(room_id, item, voice_path, sender, agent_members)).start()
     if kind in ("text", "voice"):
         _room_maybe_bot_replies(room_id, sender, item)
     return item
+
+def _deliver_room_voice_transcript(room_id, item, voice_path, sender, agent_members):
+    """Transcribe a room voice message off the socket thread for its external/agent members, cache it on the
+    message so later history fetches include it too, and push it now to whoever's connected."""
+    transcript = _transcribe_audio_file(voice_path)
+    rooms.set_transcript(DB, item["message_id"], transcript)
+    fallback = f"[voice message from {sender} in this room, " + ("transcribed" if transcript else "couldn't be transcribed") + "]"
+    _send_to_all_sessions(agent_members, {"action": "group_room_voice_transcript", "room_id": room_id,
+                                          "message_id": item["message_id"], "transcript": transcript, "fallback": fallback})
 
 def _room_mark_read(room_id, user, message_id):
     read_at = rooms.mark_read(DB, room_id, user, message_id)
@@ -4322,7 +4378,7 @@ def init_db():
         created_at TEXT NOT NULL
     )''')
     dmh_cols = [row[1] for row in cur.execute("PRAGMA table_info(direct_message_history)")]
-    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by", "attachment_path", "delivered_at", "read_at"):
+    for col in ("msg_uid", "edited_at", "edited_by", "deleted_at", "deleted_by", "attachment_path", "delivered_at", "read_at", "transcript"):
         if col not in dmh_cols:
             cur.execute(f"ALTER TABLE direct_message_history ADD COLUMN {col} TEXT")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
@@ -6859,6 +6915,11 @@ def handle_client(cs, addr):
                         reason = f"{to} is offline."
                 if voice_mp3 is not None and not reason and not handled_by_bot:
                     attachment_path = _store_voice_file(msg["id"], voice_mp3, owner=frm)
+                    if attachment_path and _is_registered_bot(to) and not _is_virtual_bot(to):
+                        # External bot/agent account (e.g. Adam): give it a transcript, not just raw audio.
+                        threading.Thread(target=_deliver_agent_voice_transcript, name=f"agent-voice-transcript-{to}",
+                                         daemon=True, args=(to, msg["id"], attachment_path, frm,
+                                                            msg.get("voice", {}).get("duration"), is_voicemail)).start()
                 if not reason or handled_by_bot or _is_registered_bot(to):
                     _record_direct_message_history(
                         frm,

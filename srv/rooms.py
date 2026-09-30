@@ -88,6 +88,7 @@ def init_schema(db):
                 voice_duration REAL,
                 mentions_json TEXT NOT NULL DEFAULT '[]',
                 client_id TEXT NOT NULL DEFAULT '',
+                transcript TEXT,
                 FOREIGN KEY(room_id) REFERENCES group_rooms(room_id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_group_messages_room_time ON group_room_messages(room_id, sent_at);
@@ -101,6 +102,19 @@ def init_schema(db):
                 FOREIGN KEY(room_id) REFERENCES group_rooms(room_id) ON DELETE CASCADE
             );
         """)
+        msg_cols = [row[1] for row in con.execute("PRAGMA table_info(group_room_messages)")]
+        if "transcript" not in msg_cols:
+            con.execute("ALTER TABLE group_room_messages ADD COLUMN transcript TEXT")
+        con.commit()
+    finally:
+        con.close()
+
+
+def set_transcript(db, message_id, transcript):
+    """Cache a voice message's transcript once (server.py calls this from a background thread)."""
+    con = _con(db)
+    try:
+        con.execute("UPDATE group_room_messages SET transcript=? WHERE message_id=?", (transcript or "", message_id))
         con.commit()
     finally:
         con.close()
@@ -529,6 +543,9 @@ def _message_dict(row):
         d["voice"] = {"duration": duration or 0, "stored": bool(path)}
     if d["deleted"]:
         d["body"] = ""
+        d["transcript"] = None
+    elif not d.get("transcript"):
+        d.pop("transcript", None)
     return d
 
 
@@ -602,7 +619,7 @@ def delete_message(db, room_id, actor, message_id):
         raise RoomError("Only the sender or a room moderator can delete that message.")
     con = _con(db)
     try:
-        con.execute("UPDATE group_room_messages SET deleted=1, body='', voice_path=NULL, edited_at=?, edited_by=? WHERE message_id=?",
+        con.execute("UPDATE group_room_messages SET deleted=1, body='', voice_path=NULL, transcript=NULL, edited_at=?, edited_by=? WHERE message_id=?",
                     (time.time(), actor, message_id))
         con.commit()
     finally:

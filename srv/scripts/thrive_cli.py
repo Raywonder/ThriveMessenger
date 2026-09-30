@@ -867,11 +867,14 @@ def _inbox_store(dirs: Dict[str, Path], item: Dict[str, Any], args: argparse.Nam
     msg_id = str(item.get("id") or "")
     if not msg_id or _inbox_known(dirs, msg_id):
         return False
+    voice = item.get("voice") if isinstance(item.get("voice"), dict) else None
+    transcript = str(item.get("transcript") or "")
     record = {
         "id": msg_id,
         "from": item.get("from", ""),
         "to": item.get("to", args.username),
-        "msg": item.get("msg", ""),
+        # A voice message's transcript (once ready) replaces the placeholder text so it reads like any other DM.
+        "msg": transcript or item.get("msg", ""),
         "time": item.get("time", ""),
         "received_at": datetime.now(timezone.utc).isoformat(),
         "source": source,
@@ -879,8 +882,24 @@ def _inbox_store(dirs: Dict[str, Path], item: Dict[str, Any], args: argparse.Nam
         "how_to_mark_handled": f"move this file into {dirs['done']}",
     }
     path = _inbox_msg_path(dirs, msg_id)
+    if voice is not None:
+        record["voice"] = True
+        record["transcribed"] = bool(transcript)
+        if not transcript:
+            record["note"] = f"Voice message; the transcript follows shortly, or run: thrive_cli voice-get {msg_id}"
+        b64 = voice.get("b64")
+        if b64:
+            try:
+                audio_path = path.with_suffix(".mp3")
+                audio_path.write_bytes(base64.b64decode(b64))
+                record["audio_file"] = audio_path.name
+            except Exception as exc:
+                emit({"status": "warning", "event": "inbox_voice_save_failed", "id": msg_id, "reason": str(exc)}, args.json)
+        else:
+            record["audio_file"] = None  # not delivered inline (e.g. caught up while offline); fetch with voice-get
     _inbox_write_atomic(path, record)
-    emit({"status": "ok", "event": "inbox_new", "id": msg_id, "from": record["from"], "source": source}, args.json)
+    emit({"status": "ok", "event": "inbox_new", "id": msg_id, "from": record["from"], "source": source,
+          "voice": voice is not None}, args.json)
     if args.on_message:
         try:
             import subprocess
@@ -993,6 +1012,26 @@ def _inbox_on_msg_sent(dirs: Dict[str, Path], event: Dict[str, Any], args: argpa
                     os.replace(src, _inbox_msg_path(dirs, reply_to, "done"))
             return
 
+def _inbox_apply_voice_transcript(dirs: Dict[str, Path], msg_id: str, transcript: str, fallback: str, args: argparse.Namespace) -> bool:
+    """A voice DM's transcript usually arrives a few seconds after the message itself (server.py transcribes it
+    off its own socket thread); patch the inbox file in place wherever it still sits (new/ or done/)."""
+    for sub in ("new", "done"):
+        path = _inbox_msg_path(dirs, msg_id, sub)
+        if not path.exists():
+            continue
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rec["msg"] = transcript or fallback
+        rec["transcribed"] = bool(transcript)
+        rec.pop("note", None)
+        _inbox_write_atomic(path, rec)
+        emit({"status": "ok", "event": "inbox_voice_transcript", "id": msg_id, "transcribed": bool(transcript)}, args.json)
+        return True
+    return False
+
+
 def _inbox_heartbeat_file(dirs: Dict[str, Path], connected: bool, note: str = "") -> None:
     pending = len(list(dirs["new"].glob("*.json")))
     _inbox_write_atomic(dirs["state"] / "heartbeat.json", {
@@ -1037,6 +1076,9 @@ def cmd_agent_inbox(args: argparse.Namespace) -> None:
                     _inbox_store(dirs, event, args, "live")
                 elif action == "msg_sent":
                     _inbox_on_msg_sent(dirs, event, args)
+                elif action == "voice_transcript" and event.get("id"):
+                    _inbox_apply_voice_transcript(dirs, str(event["id"]), event.get("transcript") or "",
+                                                  event.get("fallback") or "", args)
                 elif action and args.verbose:
                     emit({"status": "ok", "event": action}, args.json)
                 _inbox_flush(sock, dirs, args)
@@ -1058,6 +1100,39 @@ def cmd_agent_inbox(args: argparse.Namespace) -> None:
                     pass
         time.sleep(backoff)
         backoff = min(60.0, backoff * 2)
+
+
+def cmd_voice_get(args: argparse.Namespace) -> None:
+    """Fetch a voice message's audio by id (works for DMs whether or not the inline copy arrived, e.g. after
+    catch-up delivered only the transcript). Saved next to its inbox record when --inbox is given."""
+    sock = login(args)
+    try:
+        rid = uuid.uuid4().hex[:12]
+        send_json(sock, {"action": "voice_fetch", "id": args.id, "request_id": rid})
+        try:
+            event = recv_until_action(sock, ("voice_data",), timeout=args.wait)
+        except socket.timeout:
+            event = {}
+    finally:
+        sock.close()
+    if not event or not event.get("ok") or not event.get("b64"):
+        fail("Voice audio isn't available (message not found, deleted, or you weren't a participant).", args.json)
+    raw = base64.b64decode(event["b64"])
+    if args.out:
+        out_path = Path(args.out).expanduser()
+    elif args.inbox:
+        dirs = _inbox_dirs(args.inbox.expanduser())
+        base_dir = dirs["new"]
+        for sub in ("new", "done"):
+            if _inbox_msg_path(dirs, args.id, sub).exists():
+                base_dir = dirs[sub]
+                break
+        out_path = base_dir / f"{safe_filename(args.id)}.mp3"
+    else:
+        out_path = Path.cwd() / f"{safe_filename(args.id)}.mp3"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(raw)
+    emit({"status": "ok", "id": args.id, "saved": str(out_path), "bytes": len(raw)}, args.json)
 
 
 def cmd_agent_inbox_ack(args: argparse.Namespace) -> None:
@@ -1220,6 +1295,14 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument("--auto-decline-calls", action="store_true", help="Decline incoming direct voice calls instead of leaving them ringing.")
     reg.add_argument("--call-decline-message", default="", help="Optional direct message sent to the caller after auto-declining.")
     reg.set_defaults(func=cmd_register_bot_session)
+
+    voice_get = sub.add_parser("voice-get", help="Fetch a voice message's audio by id (a DM you sent or received).")
+    add_login_args(voice_get)
+    voice_get.add_argument("id", help="Message id (the inbox record's \"id\" field).")
+    voice_get.add_argument("--out", help="Save path. Default: next to the inbox record (--inbox), or ID.mp3 in the current directory.")
+    voice_get.add_argument("--inbox", type=Path, help="Inbox folder to save next to (matches agent-inbox's --inbox).")
+    voice_get.add_argument("--wait", type=float, default=10.0, help="Seconds to wait for the server response.")
+    voice_get.set_defaults(func=cmd_voice_get)
 
     inbox = sub.add_parser("agent-inbox", help="Reliable DM hand-off for agents: inbox files, read receipts only after the agent handles a message, replies via outbox, catch-up, auto-reconnect, heartbeat.")
     add_login_args(inbox)
