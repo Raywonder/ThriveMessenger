@@ -127,6 +127,13 @@ Logging into your Thrive Messenger account is as simple as logging into your com
 3.  Optionally, check the boxes to remember your credentials and log in automatically.
 4.  Click Login or Press Alt + L to log into Thrive Messenger. A sound will play to tell you that you're logged in.
 
+### iOS
+
+The iPhone app is built for VoiceOver. Two settings worth knowing about:
+
+*   **Forgot password**: on the sign-in screen, tap Forgot password? to request a reset code by email, then enter that code with a new password.
+*   **Enter key sends message**: with a hardware keyboard connected, Enter sends the message you're composing. Turn this off in Settings > General > Keyboard. Shift+Enter or Option+Enter always starts a new line, and Command+Enter always sends, regardless of the setting.
+
 ### Web3 Domain Support
 
 Server owners can use Web3 DNS domains for server hostnames. In Server Manager or `client.conf`, set the server host to your domain as normal.
