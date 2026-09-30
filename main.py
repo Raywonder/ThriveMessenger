@@ -1837,13 +1837,38 @@ def download_update(url, dest, progress_dlg, callback, expected_sha256=None):
 def apply_installer_update(installer_path):
     program_dir = get_program_dir()
     exe_path = os.path.join(program_dir, 'thrive_messenger.exe')
+    pid = os.getpid()
     batch_path = os.path.join(tempfile.gettempdir(), 'thrive_update.cmd')
     with open(batch_path, 'w') as f:
-        f.write(f'@echo off\r\n')
-        # The installer (15.15+) upgrades in place in C:\Program Files, removes any other copy, and relaunches Thrive itself.
-        f.write(f'start /wait "" "{installer_path}" /VERYSILENT /CLOSEAPPLICATIONS /NORESTART\r\n')
+        f.write('@echo off\r\n')
+        f.write('setlocal\r\n')
+        f.write(f'set "UPDATE_LOG={os.path.join(tempfile.gettempdir(), "thrive_update.log")}"\r\n')
+        # Wait for this process to fully exit before touching anything: starting the
+        # installer while we still hold the wx DLLs open is what caused the relaunch
+        # to crash with "DLL load failed ... being used by another process".
+        f.write(':waitexit\r\n')
+        f.write(f'tasklist /fi "PID eq {pid}" 2>NUL | find /i "{pid}" >NUL\r\n')
+        f.write('if not errorlevel 1 (\r\n')
+        f.write('    timeout /t 1 /nobreak >NUL\r\n')
+        f.write('    goto waitexit\r\n')
+        f.write(')\r\n')
+        # The installer (15.15+) upgrades in place in C:\Program Files, removes any other copy, and normally
+        # relaunches Thrive itself. Confirm that actually happened; if not (e.g. a lingering file lock from
+        # antivirus scanning the new exe), retry with backoff and start it ourselves exactly once.
+        f.write(f'start /wait "" "{installer_path}" /VERYSILENT /CLOSEAPPLICATIONS /NORESTART >> "%UPDATE_LOG%" 2>&1\r\n')
         f.write(f'del "{installer_path}"\r\n')
-        f.write(f'del "%~f0"\r\n')
+        f.write('set "RETRY=0"\r\n')
+        f.write(':waitrelaunch\r\n')
+        f.write('tasklist /fi "IMAGENAME eq thrive_messenger.exe" 2>NUL | find /i "thrive_messenger.exe" >NUL\r\n')
+        f.write('if not errorlevel 1 goto done\r\n')
+        f.write('set /a RETRY+=1\r\n')
+        f.write('if %RETRY% GEQ 6 goto relaunch_self\r\n')
+        f.write('timeout /t 2 /nobreak >NUL\r\n')
+        f.write('goto waitrelaunch\r\n')
+        f.write(':relaunch_self\r\n')
+        f.write(f'start "" "{exe_path}"\r\n')
+        f.write(':done\r\n')
+        f.write('del "%~f0"\r\n')
     subprocess.Popen(['cmd', '/c', batch_path], creationflags=0x08000000)
 
 def build_windows_zip_update_batch(zip_path, program_dir, exe_path, pid, temp_extract):
@@ -2053,48 +2078,75 @@ class ThriveTaskBarIcon(wx.adv.TaskBarIcon):
 class AuthenticatedDevicesDialog(wx.Dialog):
     """Server-backed inventory of authenticated devices and locations."""
     def __init__(self, parent):
-        super().__init__(parent, title="Authenticated Devices", size=(700, 460))
+        super().__init__(parent, title="Authenticated Devices", size=(760, 460))
         self.devices = []
         panel = wx.Panel(self); sizer = wx.BoxSizer(wx.VERTICAL)
-        self.summary = wx.StaticText(panel, label="Loading authenticated devices…")
+        self.summary = wx.StaticText(panel, label="Loading authenticated devices\u2026")
         self.device_list = wx.ListBox(panel, name="Authenticated device list")
         row = wx.BoxSizer(wx.HORIZONTAL)
         refresh_btn = wx.Button(panel, label="&Refresh")
         self.revoke_btn = wx.Button(panel, label="&Sign Out Selected Device")
+        self.revoke_others_btn = wx.Button(panel, label="Sign Out All &Other Devices")
         close_btn = wx.Button(panel, wx.ID_CLOSE, "&Close")
-        row.Add(refresh_btn, 0, wx.RIGHT, 8); row.Add(self.revoke_btn, 0, wx.RIGHT, 8); row.Add(close_btn)
+        row.Add(refresh_btn, 0, wx.RIGHT, 8); row.Add(self.revoke_btn, 0, wx.RIGHT, 8)
+        row.Add(self.revoke_others_btn, 0, wx.RIGHT, 8); row.Add(close_btn)
         sizer.Add(self.summary, 0, wx.EXPAND | wx.ALL, 10)
         sizer.Add(self.device_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         sizer.Add(row, 0, wx.ALIGN_RIGHT | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         panel.SetSizer(sizer)
         refresh_btn.Bind(wx.EVT_BUTTON, self.refresh)
         self.revoke_btn.Bind(wx.EVT_BUTTON, self.revoke_selected)
+        self.revoke_others_btn.Bind(wx.EVT_BUTTON, self.revoke_others)
         close_btn.Bind(wx.EVT_BUTTON, lambda _: self.EndModal(wx.ID_CLOSE))
         self.device_list.Bind(wx.EVT_LISTBOX, lambda _: self.revoke_btn.Enable(self.device_list.GetSelection() != wx.NOT_FOUND))
-        self.revoke_btn.Disable(); wx.CallAfter(self.refresh, None)
+        self.revoke_btn.Disable(); self.revoke_others_btn.Disable(); wx.CallAfter(self.refresh, None)
 
     @property
     def frame(self): return self.GetParent()
 
     def refresh(self, _):
-        self.frame.sock.sendall((json.dumps({"action": "list_authenticated_devices"}) + "\n").encode())
+        try:
+            self.frame.sock.sendall((json.dumps({"action": "list_authenticated_devices"}) + "\n").encode())
+        except OSError as e:
+            wx.MessageBox(f"Could not load authenticated devices: {e}", "Authenticated Devices", wx.OK | wx.ICON_ERROR, self)
 
     def update_devices(self, message):
         self.devices = list(message.get("devices", []))
         self.summary.SetLabel(f"You are currently authenticated on {len(self.devices)} device(s) or locations.")
         labels = []
         for item in self.devices:
-            current = " — current device" if item.get("current") else ""
+            current = " — this device" if item.get("current") else ""
             expiry = item.get("expires_at") or "never"
-            labels.append(f"{item.get('device_name', 'Unknown device')} | {item.get('platform', 'unknown')} | authenticated {item.get('authenticated_at', '')} | expires {expiry}{current}")
-        self.device_list.Set(labels); self.revoke_btn.Disable()
+            version = item.get("client_version") or "unknown version"
+            last_seen = item.get("last_seen_at") or "unknown"
+            labels.append(
+                f"{item.get('device_name', 'Unknown device')} | {item.get('platform', 'unknown')} {version} | "
+                f"authenticated {item.get('authenticated_at', '')} | last seen {last_seen} | expires {expiry}{current}"
+            )
+        self.device_list.Set(labels)
+        self.revoke_btn.Disable()
+        self.revoke_others_btn.Enable(len(self.devices) > 1)
 
     def revoke_selected(self, _):
         index = self.device_list.GetSelection()
         if index == wx.NOT_FOUND or index >= len(self.devices): return
         item = self.devices[index]; label = item.get('device_name', 'selected device')
         if wx.MessageBox(f"Sign out {label}?", "Confirm Device Sign Out", wx.YES_NO | wx.ICON_QUESTION, self) != wx.YES: return
-        self.frame.sock.sendall((json.dumps({"action": "deauthenticate_device", "session_id": item.get("session_id", "")}) + "\n").encode())
+        try:
+            self.frame.sock.sendall((json.dumps({"action": "deauthenticate_device", "session_id": item.get("session_id", "")}) + "\n").encode())
+        except OSError as e:
+            wx.MessageBox(f"Could not sign out that device: {e}", "Device Sign Out Failed", wx.OK | wx.ICON_ERROR, self)
+
+    def revoke_others(self, _):
+        if wx.MessageBox(
+            "Sign out every other device and location? This device stays signed in.",
+            "Confirm Sign Out All Other Devices", wx.YES_NO | wx.ICON_QUESTION, self,
+        ) != wx.YES:
+            return
+        try:
+            self.frame.sock.sendall((json.dumps({"action": "deauthenticate_other_devices"}) + "\n").encode())
+        except OSError as e:
+            wx.MessageBox(f"Could not sign out other devices: {e}", "Device Sign Out Failed", wx.OK | wx.ICON_ERROR, self)
 
 def apply_toggle_semantics(window):
     """Every on/off control is a wx.CheckBox (NVDA: "check box, checked"). On macOS, mark them as switches so
@@ -3929,6 +3981,7 @@ class ClientApp(wx.App):
                     elif act == "delete_account_result": wx.CallAfter(self.frame.on_delete_account_result, msg)
                     elif act == "authenticated_devices": wx.CallAfter(self.frame.on_authenticated_devices, msg)
                     elif act == "deauthenticate_device_result": wx.CallAfter(self.frame.on_deauthenticate_device_result, msg)
+                    elif act == "deauthenticate_other_devices_result": wx.CallAfter(self.frame.on_deauthenticate_other_devices_result, msg)
                     elif act == "bot_token_revoked": wx.CallAfter(self.frame.on_bot_token_revoked, msg.get("bot", "bot"))
                     elif act == "bot_rules": wx.CallAfter(self.frame.on_bot_rules, msg)
                     elif act == "bot_rules_update": wx.CallAfter(self.frame.on_bot_rules_update, msg)
@@ -5690,6 +5743,8 @@ class MainFrame(wx.Frame):
         self._build_menu_bar()
         self._apply_voiceover_hints(search_label)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
+        self.Bind(wx.EVT_ACTIVATE, self.on_activate_report_device)
+        self._last_device_activity_ping = 0.0
         self.apply_action_button_layout()
         self.update_button_states()
         self.apply_feature_visibility()
@@ -5983,7 +6038,7 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_register_passkey, self.mi_register_passkey)
-        self.Bind(wx.EVT_MENU, self.on_manage_devices, self.mi_manage_devices)
+        self.Bind(wx.EVT_MENU, lambda _: self.show_authenticated_devices(), self.mi_manage_devices)
         self.Bind(wx.EVT_MENU, self.on_logout, self.mi_logout)
         self.Bind(wx.EVT_MENU, self.on_exit, self.mi_exit)
         self.Bind(wx.EVT_MENU, self.on_block_toggle, self.mi_block_toggle)
@@ -6172,12 +6227,6 @@ class MainFrame(wx.Frame):
                 return response, ""
             return None, last_error or "The passkey request could not be sent."
 
-    def _list_passkeys(self):
-        resp, _ = self._send_passkey_request({"action": "list_passkeys"}, "passkey_list")
-        if resp and resp.get("action") == "passkey_list":
-            return resp.get("passkeys", [])
-        return []
-
     def on_register_passkey(self, _):
         app = wx.GetApp()
         default_label = f"Thrive Messenger - {self.user}"
@@ -6215,62 +6264,6 @@ class MainFrame(wx.Frame):
         save_user_config(app.user_config)
         show_notification("Passkey Ready", f"Passkey registered for {label}.", timeout=6)
         wx.MessageBox("Passkey registered. You can now use Login with Passkey.", "Passkey Ready", wx.OK | wx.ICON_INFORMATION, self)
-
-    def on_manage_devices(self, _):
-        app = wx.GetApp()
-        entries = self._list_passkeys()
-        if not entries:
-            wx.MessageBox("No registered devices were found for this account.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
-            return
-        count = len([e for e in entries if not e.get("revoked")])
-        labels = [f"{e.get('label', 'Device')} | created {e.get('created_at', '')}" for e in entries if not e.get("revoked")]
-        if not labels:
-            wx.MessageBox("All devices are already revoked.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
-            return
-        choice = wx.GetSingleChoiceIndex(
-            f"You are signed in on {count} device(s). Choose one to sign out, or cancel to keep all.",
-            "Manage Signed-In Devices",
-            labels,
-            self,
-        )
-        if choice == -1:
-            res_all = wx.MessageBox(
-                "Do you want to sign out all devices for this account?",
-                "Sign Out All Devices",
-                wx.YES_NO | wx.ICON_QUESTION,
-                self,
-            )
-            if res_all != wx.YES:
-                return
-            for entry in entries:
-                if entry.get("revoked"):
-                    continue
-                self._send_passkey_request(
-                    {"action": "revoke_passkey", "passkey_id": entry.get("id", "")},
-                    "passkey_revoke_result",
-                )
-            _delete_passkey_from_keyring(self.user, settings=app.user_config, server_entry=app.active_server_entry)
-            show_notification("Devices Updated", "Signed out all devices.", timeout=5)
-            wx.MessageBox("All devices were signed out.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
-            return
-        target = [e for e in entries if not e.get("revoked")][choice]
-        resp, error = self._send_passkey_request(
-            {"action": "revoke_passkey", "passkey_id": target.get("id", "")},
-            "passkey_revoke_result",
-        )
-        if error:
-            wx.MessageBox(f"Could not revoke selected device. {error}", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
-            return
-        if not resp:
-            wx.MessageBox("Could not revoke selected device. The server response was empty.", "Manage Devices", wx.OK | wx.ICON_ERROR, self)
-            return
-        if not resp.get("ok"):
-            wx.MessageBox(resp.get("reason", "Unknown revoke error"), "Manage Devices", wx.OK | wx.ICON_ERROR, self)
-            return
-        if str(target.get("id", "")) == str(app.user_config.get("passkey_ids", {}).get(self._passkey_map_key(), "")):
-            _delete_passkey_from_keyring(self.user, settings=app.user_config, server_entry=app.active_server_entry)
-        show_notification("Device Signed Out", f"{target.get('label', 'Device')} was signed out.", timeout=5)
-        wx.MessageBox("Selected device was signed out.", "Manage Devices", wx.OK | wx.ICON_INFORMATION, self)
 
     def on_settings(self, event):
         app = wx.GetApp()
@@ -6418,6 +6411,16 @@ class MainFrame(wx.Frame):
         if not msg.get("ok"):
             wx.MessageBox(msg.get("reason", "Could not sign out that device."), "Device Sign Out Failed", wx.OK | wx.ICON_ERROR, self)
             return
+        dialog = getattr(self, "_authenticated_devices_dialog", None)
+        if dialog:
+            dialog.refresh(None)
+
+    def on_deauthenticate_other_devices_result(self, msg):
+        if not msg.get("ok"):
+            wx.MessageBox(msg.get("reason", "Could not sign out other devices."), "Device Sign Out Failed", wx.OK | wx.ICON_ERROR, self)
+            return
+        count = msg.get("count", 0)
+        show_notification("Devices Updated", f"Signed out {count} other device(s).", timeout=5)
         dialog = getattr(self, "_authenticated_devices_dialog", None)
         if dialog:
             dialog.refresh(None)
@@ -7401,7 +7404,26 @@ class MainFrame(wx.Frame):
         if self._directory_dlg: self._directory_dlg.Destroy(); self._directory_dlg = None
         app.play_sound("logout.wav"); self.Destroy()
         app.show_login_dialog()
+    def report_device_activity(self):
+        """Tell the server this device is actively in use, so it (not other signed-in devices)
+        gets new-message notifications/sounds. Throttled: the server only needs a fresh timestamp
+        every so often, not on every keystroke."""
+        now = time.time()
+        if now - getattr(self, '_last_device_activity_ping', 0) < 20:
+            return
+        self._last_device_activity_ping = now
+        try:
+            self.sock.sendall((json.dumps({"action": "device_activity"}) + "\n").encode())
+        except OSError:
+            pass
+
+    def on_activate_report_device(self, evt):
+        if evt.GetActive():
+            self.report_device_activity()
+        evt.Skip()
+
     def on_key(self, evt):
+        self.report_device_activity()
         if evt.GetKeyCode() == wx.WXK_F1:
             open_help_docs_for_context("main", self)
         elif evt.CmdDown() and evt.GetKeyCode() == ord(','):
@@ -7415,7 +7437,7 @@ class MainFrame(wx.Frame):
             if action == 'quit':
                 self.on_exit(None)
             elif action == 'minimize':
-                self.minimize_to_tray()
+                self.hide_to_tray()
             return
         elif evt.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             focused = wx.Window.FindFocus()
@@ -7495,6 +7517,10 @@ class MainFrame(wx.Frame):
         self.on_send(None)
     def receive_message(self, msg):
         app = wx.GetApp()
+        # The server marks at most one signed-in device "active" (whoever last touched the app) and
+        # tags every other copy of the message notify=False, so background devices stay quiet and just
+        # sync instead of piling on sounds/toasts/speech for a message already seen elsewhere.
+        notify = bool(msg.get("notify", True))
         sender = str(msg.get("from") or "").strip()
         if not sender:
             return
@@ -7569,7 +7595,9 @@ class MainFrame(wx.Frame):
             dlg.mark_tab_unread()
             self._mark_unread(sender)
             open_mode = str(app.user_config.get('open_chat_new_message', 'read') or 'read')
-            if idle_in_front and not voice_row and open_mode in ('read', 'sound'):
+            if not notify:
+                pass  # another signed-in device is active right now; stay quiet and just sync
+            elif idle_in_front and not voice_row and open_mode in ('read', 'sound'):
                 app.play_sound("receive.wav")
                 if open_mode == 'read':
                     speak_text(f"{self.format_user_label(sender)}: {text}", interrupt=False)
