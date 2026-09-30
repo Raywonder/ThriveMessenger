@@ -30,6 +30,67 @@ socket_session_ids = {}
 client_statuses = {}
 session_preferences = {}
 lock = threading.Lock()
+
+def _parse_duration_seconds(text, default_seconds):
+    text = str(text or "").strip().lower()
+    if not text:
+        return default_seconds
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if text[-1] in units and text[:-1].isdigit():
+        return int(text[:-1]) * units[text[-1]]
+    if text.isdigit():
+        return int(text)
+    return default_seconds
+
+# Active-device tracking: session_id -> last activity unix time (in memory; ephemeral by design).
+# Only the device the user is actively using gets a new-message notification/sound; the rest stay
+# quiet and just sync. If nobody has been active in the window, everyone is notified.
+_session_activity = {}
+_session_activity_lock = threading.Lock()
+ACTIVE_DEVICE_WINDOW_SECONDS = 120
+
+def note_session_activity(session_id):
+    if not session_id:
+        return
+    with _session_activity_lock:
+        _session_activity[session_id] = time.time()
+
+def _active_session_for_user(user_sockets):
+    """user_sockets: iterable of sockets for one user. Returns the session_id that should be
+    notified, or None if every device should be notified (nobody's been active recently, or only
+    one device is signed in)."""
+    with lock:
+        session_ids = [socket_session_ids.get(s) for s in user_sockets]
+    session_ids = [sid for sid in session_ids if sid]
+    if len(session_ids) <= 1:
+        return None
+    now = time.time()
+    with _session_activity_lock:
+        recent = [(sid, _session_activity.get(sid, 0)) for sid in session_ids]
+    best_sid, best_ts = max(recent, key=lambda pair: pair[1]) if recent else (None, 0)
+    if best_ts and now - best_ts <= ACTIVE_DEVICE_WINDOW_SECONDS:
+        return best_sid
+    return None
+
+# Rate-limit for request_reset: (identifier or ip) -> last request unix time.
+_reset_request_times = {}
+_reset_request_lock = threading.Lock()
+RESET_REQUEST_COOLDOWN_SECONDS = 60
+
+def _reset_request_allowed(key):
+    now = time.time()
+    with _reset_request_lock:
+        last = _reset_request_times.get(key, 0)
+        if now - last < RESET_REQUEST_COOLDOWN_SECONDS:
+            return False
+        _reset_request_times[key] = now
+        # Occasional cleanup so this dict doesn't grow forever.
+        if len(_reset_request_times) > 5000:
+            cutoff = now - RESET_REQUEST_COOLDOWN_SECONDS
+            for k, v in list(_reset_request_times.items()):
+                if v < cutoff:
+                    _reset_request_times.pop(k, None)
+        return True
 smtp_config = {}
 flexpbx_config = {}
 file_config = {}
@@ -4005,7 +4066,8 @@ def load_config():
         'server': config.get('smtp', 'server', fallback=''),
         'port': config.getint('smtp', 'port', fallback=587),
         'email': config.get('smtp', 'email', fallback=''),
-        'password': config.get('smtp', 'password', fallback='')
+        'password': config.get('smtp', 'password', fallback=''),
+        'code_expires_seconds': _parse_duration_seconds(config.get('smtp', 'code_expires', fallback='15m'), 900),
     }
     global flexpbx_config
     flexpbx_config = {
@@ -4201,6 +4263,7 @@ def init_db():
     if 'verification_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN verification_code TEXT")
     if 'is_verified' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN is_verified INTEGER DEFAULT 1") # Default 1 for old users
     if 'reset_code' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code TEXT")
+    if 'reset_code_at' not in existing_cols: cur.execute("ALTER TABLE users ADD COLUMN reset_code_at TEXT")
 
     cur.execute('''CREATE TABLE IF NOT EXISTS contacts (owner TEXT, contact TEXT, blocked INTEGER DEFAULT 0, PRIMARY KEY(owner, contact))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_tokens (owner TEXT, bot TEXT, token TEXT, created_at TEXT, PRIMARY KEY(owner, bot))''')
@@ -4765,7 +4828,23 @@ def register_authenticated_device(db, username, req):
         _session_expiry(req.get("session_duration"), now)))
     db.commit(); return session_id
 
+def purge_stale_unknown_devices(username=None, stale_days=3):
+    """Auto-expire old 'Unknown device' sessions from before the client sent a real device_name/platform,
+    so Manage Devices doesn't stay cluttered with dozens of unidentifiable entries forever."""
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=stale_days)).isoformat() + "Z"
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    con = sqlite3.connect(DB)
+    sql = ("""UPDATE authenticated_devices SET revoked_at=? WHERE revoked_at IS NULL AND last_seen_at<?
+        AND (device_name='Unknown device' OR platform IS NULL OR platform='' OR platform='unknown')""")
+    params = [now, cutoff]
+    if username:
+        sql += " AND username=?"
+        params.append(username)
+    con.execute(sql, params)
+    con.commit(); con.close()
+
 def list_authenticated_devices(username, current_session_id=None):
+    purge_stale_unknown_devices(username)
     now = datetime.datetime.utcnow().isoformat()+"Z"; con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
     rows = con.execute("""SELECT session_id,device_id,device_name,platform,client_version,authenticated_at,last_seen_at,expires_at
         FROM authenticated_devices WHERE username=? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>?)
@@ -4786,6 +4865,13 @@ def revoke_authenticated_device(username, session_id):
             try: target.close()
             except Exception: pass
     return changed
+
+def revoke_other_authenticated_devices(username, keep_session_id):
+    con = sqlite3.connect(DB)
+    rows = con.execute("SELECT session_id FROM authenticated_devices WHERE username=? AND revoked_at IS NULL AND session_id!=?",
+                        (username, keep_session_id or "")).fetchall()
+    con.close()
+    return sum(1 for (sid,) in rows if revoke_authenticated_device(username, sid))
 
 def handle_client(cs, addr):
     sock = cs
@@ -5059,7 +5145,11 @@ def handle_client(cs, addr):
 
         # --- Request Password Reset ---
         if action == "request_reset":
-            ident = req.get("identifier")
+            ident = str(req.get("identifier", "") or "").strip()
+            ip = addr[0] if addr else ""
+            if not _reset_request_allowed(f"ident:{ident.casefold()}") or not _reset_request_allowed(f"ip:{ip}"):
+                sock.sendall(json.dumps({"status": "error", "reason": "Too many reset requests. Please wait a minute and try again."}).encode() + b"\n")
+                return
             con = sqlite3.connect(DB)
             # Find user by email or username
             row = con.execute("SELECT username, email FROM users WHERE username=? OR email=?", (ident, ident)).fetchone()
@@ -5067,7 +5157,8 @@ def handle_client(cs, addr):
                 t_user, t_email = row
                 if t_email:
                     code = EmailManager.generate_code()
-                    con.execute("UPDATE users SET reset_code=? WHERE username=?", (code, t_user))
+                    con.execute("UPDATE users SET reset_code=?, reset_code_at=? WHERE username=?",
+                                (code, datetime.datetime.utcnow().isoformat() + "Z", t_user))
                     con.commit()
                     EmailManager.send_email(t_email, "Thrive Messenger - Password Reset", f"Your password reset code is: {code}")
                     # Return OK even if email fails to prevent enumeration, mostly.
@@ -5086,14 +5177,28 @@ def handle_client(cs, addr):
             t_code = req.get("code")
             new_p = req.get("new_pass")
             con = sqlite3.connect(DB)
-            row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
-            if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (_hash_password(new_p), t_user))
+            row = con.execute("SELECT reset_code, reset_code_at, email FROM users WHERE username=?", (t_user,)).fetchone()
+            code_ok = bool(row and row[0] == t_code and t_code)
+            expired = False
+            if code_ok and row[1]:
+                try:
+                    issued_at = datetime.datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+                    age = (datetime.datetime.now(datetime.timezone.utc) - issued_at).total_seconds()
+                    expired = age > smtp_config.get('code_expires_seconds', 900)
+                except ValueError:
+                    expired = False
+            if code_ok and not expired:
+                con.execute("UPDATE users SET password=?, reset_code=NULL, reset_code_at=NULL WHERE username=?", (_hash_password(new_p), t_user))
                 con.commit(); con.close()
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
+                t_email = row[2] if row else None
+                if t_email:
+                    EmailManager.send_email(t_email, "Thrive Messenger - Password Changed",
+                                             f"The password for {t_user} on this Thrive server was just changed via password reset. "
+                                             f"If this wasn't you, contact your server admin right away.")
             else:
                 con.close()
-                sock.sendall(json.dumps({"status": "error", "reason": "Invalid code"}).encode() + b"\n")
+                sock.sendall(json.dumps({"status": "error", "reason": "Reset code has expired. Request a new one." if expired else "Invalid code"}).encode() + b"\n")
             return
 
         if action not in ("login", "login_passkey"):
@@ -6702,6 +6807,7 @@ def handle_client(cs, addr):
                         "to_is_bot": _is_registered_bot(to),
                         "sent_at": datetime.datetime.utcnow().isoformat(),
                     })
+                note_session_activity(socket_session_ids.get(sock))
                 con = sqlite3.connect(DB)
                 recipient_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (to, frm)).fetchone()
                 sender_has_blocked = con.execute("SELECT blocked FROM contacts WHERE owner=? AND contact=?", (frm, to)).fetchone()
@@ -6740,10 +6846,12 @@ def handle_client(cs, addr):
                     else:
                         reason = f"{to} is offline."
                 else:
-                    line = (json.dumps(msg)+"\n").encode()
+                    active_sid = _active_session_for_user(all_socks_to)
                     for target_sock in all_socks_to:
+                        target_sid = socket_session_ids.get(target_sock)
+                        notify = active_sid is None or target_sid == active_sid
                         try:
-                            target_sock.sendall(line)
+                            target_sock.sendall((json.dumps(dict(msg, notify=notify))+"\n").encode())
                             delivered_to_user = True
                         except Exception:
                             pass
@@ -7087,6 +7195,11 @@ def handle_client(cs, addr):
                         ok = _verify_password_for_login(stored, cur_pass)
                     if ok:
                         con.execute("UPDATE users SET password=? WHERE username=?", (_hash_password(new_pass), user))
+                        row_email = con.execute("SELECT email FROM users WHERE username=?", (user,)).fetchone()
+                        if row_email and row_email[0]:
+                            EmailManager.send_email(row_email[0], "Thrive Messenger - Password Changed",
+                                                     f"The password for {user} on this Thrive server was just changed. "
+                                                     f"If this wasn't you, contact your server admin right away.")
                         con.commit(); con.close()
                         sock.sendall((json.dumps({"action": "change_password_result", "ok": True}) + "\n").encode())
                     else:
@@ -7113,6 +7226,15 @@ def handle_client(cs, addr):
                 try: sock.sendall((json.dumps({"action":"deauthenticate_device_result","ok":ok,"reason":"" if ok else "Device session was not found or is already signed out.","session_id":target})+"\n").encode())
                 except OSError: pass
                 if ok and target==current: break
+
+            elif action == "device_activity":
+                note_session_activity(socket_session_ids.get(sock))
+
+            elif action == "deauthenticate_other_devices":
+                current=socket_session_ids.get(sock)
+                count=revoke_other_authenticated_devices(user, current)
+                try: sock.sendall((json.dumps({"action":"deauthenticate_other_devices_result","ok":True,"count":count})+"\n").encode())
+                except OSError: pass
 
             elif action == "logout": break
     except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
