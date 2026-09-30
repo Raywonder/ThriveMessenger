@@ -128,11 +128,18 @@ As long as you have a PC with Windows 7 or higher, an internet connection and a 
 
 ### TappedIn downloads
 
-The TappedIn build (Alpha 15.23) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
+The TappedIn build (Alpha 15.24) is on the [Thrive Messenger Setup page](https://tappedin.fm/thrive-messenger-setup/):
 
 * Windows installer or portable ZIP.
 * Mac ZIP. It runs natively on Apple silicon and on Intel Macs.
 * iPhone: a native app, in testing through TestFlight (iOS 17 or later).
+
+### What's new in Alpha 15.24
+* **Fixed a crash after updating:** Thrive sometimes failed to reopen itself right after installing an update (a DLL file conflict between the old and new copy). The updater now waits for the old copy to fully close before installing, and confirms Thrive actually reopened.
+* **Fixed a crash using Escape to minimise** to the tray/menu bar.
+* **Manage Signed-In Devices** (User menu) now shows your real signed-in devices and locations, with a new **Sign Out All Other Devices** button.
+* **Password reset codes now expire** (15 minutes), and you'll get an email whenever your password changes.
+* **Quieter multi-device notifications:** only the device you're actively using plays a sound or shows a notification for a new message; other signed-in devices stay quiet and just sync.
 
 ### What's new in Alpha 15.23
 * **Drafts:** whatever you're typing but haven't sent is saved automatically as you go (about a second after you stop typing) and restored the next time you open that chat, even after Thrive updates and restarts. The contact list and room list show "Draft: ..." with the first few words. Turn this off in Settings, General, "Remember unsent messages as drafts" (on by default); turning it off also forgets any drafts already saved.

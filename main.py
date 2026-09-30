@@ -22,12 +22,12 @@ try:
 except Exception:
     wxhtml2 = None
 
-VERSION_TAG = "v2026-alpha15.23"
+VERSION_TAG = "v2026-alpha15.24"
 # Short "What's New" blurbs shown once after an update (see MainFrame.maybe_show_whats_new / on_show_whats_new).
 # Keyed by the exact VERSION_TAG string used for that release; WHATS_NEW_ORDER controls display order.
 WHATS_NEW_ORDER = [
     "v2026-alpha15.18", "v2026-alpha15.19", "v2026-alpha15.20",
-    "v2026-alpha15.21", "v2026-alpha15.22", "v2026-alpha15.23",
+    "v2026-alpha15.21", "v2026-alpha15.22", "v2026-alpha15.23", "v2026-alpha15.24",
 ]
 WHATS_NEW = {
     "v2026-alpha15.18": "Check for Updates is back in the Help menu, with Alt+P from anywhere in the main window. "
@@ -44,6 +44,11 @@ WHATS_NEW = {
     "v2026-alpha15.23": "Thrive now remembers an unfinished message as a draft as you type, so you never lose your text, including "
                         "when an update installs. Updates never interrupt you mid-typing, and after an update Thrive restores your "
                         "drafts and reopens the chat you were in.",
+    "v2026-alpha15.24": "Fixed a crash where Thrive sometimes failed to reopen itself after installing an update, and a crash when "
+                        "using Escape to minimise to the tray. \u201cManage Signed-In Devices\u201d now shows your real signed-in "
+                        "devices and locations, with a Sign Out All Other Devices button. Password reset codes now expire, and you'll "
+                        "get an email whenever your password changes. Only the device you're using now plays a sound for new messages; "
+                        "the rest stay quiet and just sync.",
 }
 URL_REGEX = re.compile(r'((?:https?|ipfs|ipns|web3)://[^\s<>()]+)', re.IGNORECASE)
 BARE_DOMAIN_REGEX = re.compile(

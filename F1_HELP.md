@@ -6,6 +6,13 @@
 3. In Login, pick a server from the **Server** dropdown.
 4. Sign in with your username/password.
 
+## What's New in Alpha 15.24
+- **Fixed a crash after updating:** Thrive sometimes failed to reopen itself right after installing an update (a DLL file conflict between the old and new copy). The updater now waits for the old copy to fully close before installing, and checks that Thrive actually reopened.
+- **Fixed a crash using Escape to minimise** to the tray/menu bar.
+- **Manage Signed-In Devices** (User menu) now shows your real signed-in devices and locations -- device name, platform, app version, when it was last seen, and expiry -- instead of an empty or broken list. A new **Sign Out All Other Devices** button signs out everywhere except the device you're on.
+- **Password reset codes now expire** (15 minutes) and you'll get an email whenever your password changes, whether through a reset or Change Password in Settings, so you'll know if it wasn't you.
+- **Quieter multi-device notifications:** only the device you're actively using plays a sound or shows a notification for a new message; your other signed-in devices stay quiet and just sync, instead of all sounding off at once.
+
 ## What's New in Alpha 15.23
 - **Drafts:** whatever you're typing but haven't sent is saved automatically about a second after you stop typing, and restored the next time you open that chat -- even after Thrive updates and restarts. The contact list and room list show "Draft: ..." with the first few words, so you can tell at a glance. Turn this off in Settings, General tab, Chat Behavior: **Remember unsent messages as drafts** (on by default); turning it off also forgets any drafts already saved.
 - **Updates never interrupt you mid-typing.** If you're actively typing, or have any unsent text anywhere, Thrive no longer pops the "Update Available" dialog or an app-modal progress bar over your message box; it waits quietly until you're idle, or downloads in the background without showing anything. Right before installing and restarting, every open draft is saved to disk first, no matter what. If you still have an unsent draft at that point, Thrive asks "Install now or later?" instead of restarting on you -- choosing Later keeps the download so it won't happen twice, and Thrive reopens the chat you were in once it restarts.
@@ -50,7 +57,7 @@
 - If a new version is available, Thrive asks whether to download and install it, then restarts on the new version. If you're up to date, it says so.
 - If the update server can't be reached, Thrive says so calmly (only when you asked) and tries again by itself later. An interrupted download continues where it stopped.
 - **Updates never interrupt your typing.** If you're actively typing, or have unsent text anywhere, Thrive won't show the "Update Available" dialog or any progress bar over your message box -- it waits until you're idle, or downloads silently in the background. Every open draft is saved to disk before Thrive ever installs and restarts, no matter what. If you still have an unsent draft at that moment, Thrive asks **Install now or later?** instead of restarting on you; choosing **Later** keeps the download so it won't happen twice. After the restart, Thrive reopens the chat you were in and restores your drafts.
-- **What's New** after an update: see "What's New in Alpha 15.23" above, and **Help, What's New** any time.
+- **What's New** after an update: see "What's New in Alpha 15.24" above, and **Help, What's New** any time.
 
 ## Update and error reports
 To help us fix problems quickly, Thrive tells our server when an update installs, fails or doesn't reopen, and when the app hits an error. A report contains a random install number (not linked to your account), the Thrive version, your operating system version and a short error description. It never includes your messages, contacts, files, passwords, keys or user name. You can turn this off in Settings, General, "Send update results and error reports". Diagnostic logs are only sent when you choose Help, Submit Diagnostic Logs, and Thrive then gives you a reference to quote.
