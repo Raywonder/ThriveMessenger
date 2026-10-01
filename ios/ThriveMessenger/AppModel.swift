@@ -490,6 +490,9 @@ final class AppModel {
             if let i = c.messages.firstIndex(where: { $0.clientID == cid }) {
                 c.messages[i].id = id; c.messages[i].serverKnown = true; c.messages[i].queued = false
                 c.messages[i].delivered = obj["delivered"] as? Bool ?? false
+                // DM voice messages are sent with an empty serverID (not known until this ack); without this,
+                // tapping your own just-sent voice message says "not available yet" forever.
+                if c.messages[i].voice != nil { c.messages[i].voice?.serverID = id }
             }
         case "msg_failed":
             Announce.say(obj["reason"] as? String ?? "A message couldn't be sent.", important: true)
