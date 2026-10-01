@@ -3052,20 +3052,10 @@ def _default_bot_contacts():
     return [name for name in names if _is_registered_bot(name)]
 
 def _ensure_default_bot_contacts(username):
-    username = str(username or '').strip()
-    if not username:
-        return
-    bots = _default_bot_contacts()
-    if not bots:
-        return
-    con = sqlite3.connect(DB)
-    try:
-        for bot in bots:
-            if bot != username:
-                con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (username, bot))
-        con.commit()
-    finally:
-        con.close()
+    """Legacy no-op: contacts, including bots, are always added by the user."""
+    # Keep this callable while older sign-in paths still invoke it.  In
+    # particular, never restore the old implicit bot-contact population here.
+    return None
 
 def _known_clawdia_reply(sender_user, bot_name, text):
     agent_names = {"clawdia", "sapphire", "saphire", "sophia", "sofia"}
@@ -4100,6 +4090,71 @@ def _max_accounts_per_email():
     except Exception:
         return 0
 
+def _ensure_onboarding_state_schema(con):
+    """Make the one-time onboarding marker safe on databases from older releases."""
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS onboarding_state "
+        "(username TEXT PRIMARY KEY, contact_suggestion_seen INTEGER NOT NULL DEFAULT 0)"
+    )
+
+def _contact_search_suggestion_pending(username):
+    """Return whether a user with no contacts has not yet handled the suggestion.
+
+    The small, side-effect-free query is intentionally separate from socket I/O so
+    it can be exercised against a temporary database in server tests.
+    """
+    username = str(username or "").strip()
+    if not username or not _suggest_contact_search_for_new_users():
+        return False
+    try:
+        con = sqlite3.connect(DB)
+        try:
+            _ensure_onboarding_state_schema(con)
+            has_contact = con.execute(
+                "SELECT 1 FROM contacts WHERE owner=? LIMIT 1", (username,)
+            ).fetchone()
+            seen = con.execute(
+                "SELECT 1 FROM onboarding_state "
+                "WHERE username=? AND contact_suggestion_seen=1", (username,)
+            ).fetchone()
+            return not has_contact and not seen
+        finally:
+            con.close()
+    except sqlite3.Error:
+        # A damaged or read-only old database must never block a successful login.
+        return False
+
+def _mark_contact_search_suggestion_seen(username):
+    """Record either Search or Skip; safe to retry if an older schema is in use."""
+    try:
+        con = sqlite3.connect(DB)
+        try:
+            _ensure_onboarding_state_schema(con)
+            con.execute(
+                "INSERT OR REPLACE INTO onboarding_state(username, contact_suggestion_seen) "
+                "VALUES(?, 1)",
+                (str(username or "").strip(),),
+            )
+            con.commit()
+            return True
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return False
+
+def _suggest_contact_search_for_new_users():
+    """Whether an empty new contact list should offer the directory search."""
+    return str(_get_server_setting("suggest_contact_search_for_new_users", "1")).strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+def _maybe_send_contact_suggestion(sock, username):
+    if _contact_search_suggestion_pending(username):
+        _send_json_line(sock, {
+            "action": "contact_search_suggestion",
+            "message": "Your contacts list is empty. Would you like to search for people to add?",
+        })
+
 class EmailManager:
     @staticmethod
     def send_email(to_email, subject, body):
@@ -4492,6 +4547,10 @@ def init_db():
         last_seen TEXT NOT NULL
     )''')
     cur.execute('''CREATE TABLE IF NOT EXISTS server_settings (key TEXT PRIMARY KEY, value TEXT)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS onboarding_state (
+        username TEXT PRIMARY KEY,
+        contact_suggestion_seen INTEGER NOT NULL DEFAULT 0
+    )''')
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_rule_overrides (owner TEXT, bot TEXT, rules TEXT, updated_at TEXT, PRIMARY KEY(owner, bot))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS group_policies (scope TEXT, group_name TEXT, policy_json TEXT, updated_by TEXT, updated_at TEXT, PRIMARY KEY(scope, group_name))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS feature_policies (feature_key TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1, ui_visible INTEGER DEFAULT 1, scope TEXT DEFAULT 'all', description TEXT, updated_by TEXT, updated_at TEXT)''')
@@ -4506,6 +4565,7 @@ def init_db():
     if 'reason' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN reason TEXT")
     conn.commit()
     cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('max_accounts_per_email', '0')")
+    cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('suggest_contact_search_for_new_users', '1')")
     conn.commit()
     _seed_feature_defaults()
     rooms.init_schema(DB)
@@ -4861,9 +4921,6 @@ def _handle_mastodon_login(req):
                 "INSERT INTO users(username, password, email, is_verified) VALUES(?,?,?,1)",
                 (username, _hash_password(random_password), "",),
             )
-            for bot in _default_bot_contacts():
-                if bot != username:
-                    con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (username, bot))
             con.execute(
                 """
                 INSERT INTO mastodon_account_links(thrive_username, instance_host, account_id, acct, display_name, linked_at, last_login_at)
@@ -5241,9 +5298,6 @@ def handle_client(cs, addr):
                 con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (_hash_password(new_pass), email, code, verified, new_user))
             else:
                 con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, _hash_password(new_pass), email, code, verified))
-                for bot in _default_bot_contacts():
-                    if bot != new_user:
-                        con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (new_user, bot))
             if invite_token:
                 con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
             con.commit()
@@ -5441,6 +5495,7 @@ def handle_client(cs, addr):
             socket_session_ids[sock] = session_id
             client_statuses[user] = "online"
             session_preferences[sock] = {}
+        _maybe_send_contact_suggestion(sock, user)
         # Voicemail left while this user was offline arrives shortly after sign-in.
         threading.Timer(2.0, _deliver_pending_voicemail, args=(sock, user)).start()
         threading.Timer(2.5, _deliver_pending_bot_messages, args=(sock, user)).start()
@@ -5671,6 +5726,14 @@ def handle_client(cs, addr):
                 groups = [r[0] for r in con.execute("SELECT group_name FROM user_access_groups WHERE username=? ORDER BY group_name", (target_user,)).fetchall()]
                 con.close()
                 sock.sendall((json.dumps({"action": "feature_group_list", "ok": True, "username": target_user, "groups": groups}) + "\n").encode())
+
+            elif action == "contact_search_suggestion_seen":
+                # Search and Skip both acknowledge the one-time optional prompt.
+                saved = _mark_contact_search_suggestion_seen(user)
+                _send_json_line(sock, {
+                    "action": "contact_search_suggestion_saved",
+                    "ok": saved,
+                })
 
             elif action == "add_contact":
                 contact_to_add = msg["to"]
