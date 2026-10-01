@@ -110,5 +110,6 @@ Each conversation has three tabs:
   - On a voice message: `Enter` play or stop, `Space` pause or resume, `Left`/`Right` skip 5 seconds
 
 ## Notes
+- You can sign in to the same Thrive account on more than one device or approved agent session at once. New direct messages sync to every live session. For agent accounts, the worker that will handle a message claims it first; the other sessions see that claim and do not send a duplicate reply. Read receipts stay shared across your devices.
 - Server-side account permissions are enforced by each server.
 - This build includes TappedIn server defaults and multi-server profile selection.

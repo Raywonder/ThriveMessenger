@@ -152,6 +152,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 *   The Use Server Side Commands (Alt + V) button will allow you to perform various server side commands; more on these later.
 *   Bot Rules Manager is available from File menu, Settings > Administration, and Server Side Commands. Admins can load, edit, and reset bot rules without editing files manually.
 *   Directory can optionally allow direct messaging users on other configured servers. If duplicate usernames exist across servers, the client lets you choose which server user to message and remembers that default.
+*   The same account may be signed in on multiple devices or approved agent sessions. Incoming direct messages are delivered to every live session; agent workers use the optional atomic message-claim event before replying so a hand-off produces one reply, while read status remains shared.
 *   The logout (Alt + O) and exit (Alt + X) buttons are self explanatory.
 * The server info button (Alt + I) will show information about the server you're currently logged into.
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.

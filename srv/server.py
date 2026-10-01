@@ -982,6 +982,27 @@ def _mark_messages_read(reader, ids):
         _send_to_all_sessions({reader}, {"action": "msg_read_sync", "ids": [u for u, _ in rows], "read_at": now + "Z"})
     return len(rows)
 
+def _claim_direct_message(reader, msg_uid, session_id=""):
+    """Atomically reserve one incoming DM for a live worker."""
+    msg_uid = str(msg_uid or "").strip()[:128]
+    if not msg_uid:
+        return False, "A message ID is required.", None
+    owner = str(session_id or "").strip()[:200] or "device"
+    now = _iso_utc_now()
+    con = sqlite3.connect(DB, timeout=10)
+    try:
+        row = con.execute("SELECT msg_uid FROM direct_message_history WHERE msg_uid=? AND lower(to_user)=lower(?) AND deleted_at IS NULL LIMIT 1", (msg_uid, reader)).fetchone()
+        if not row:
+            return False, "That incoming message was not found.", None
+        existing = con.execute("SELECT claimed_by, claimed_at FROM direct_message_claims WHERE msg_uid=?", (msg_uid,)).fetchone()
+        if existing:
+            return False, "That message has already been claimed.", {"claimed_by": existing[0], "claimed_at": existing[1]}
+        con.execute("INSERT INTO direct_message_claims(msg_uid, recipient, claimed_by, claimed_at) VALUES(?,?,?,?)", (msg_uid, reader, owner, now))
+        con.commit()
+        return True, "", {"claimed_by": owner, "claimed_at": now}
+    finally:
+        con.close()
+
 def _read_status(sender, other, since=None, limit=50):
     """What `sender` sent to `other`, newest first, with delivered/read status (for agents deciding whether to resend)."""
     where = "lower(frm)=lower(?) AND lower(to_user)=lower(?) AND deleted_at IS NULL"
@@ -4382,6 +4403,9 @@ def init_db():
         if col not in dmh_cols:
             cur.execute(f"ALTER TABLE direct_message_history ADD COLUMN {col} TEXT")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dmh_msg_uid ON direct_message_history(msg_uid)")
+    cur.execute('''CREATE TABLE IF NOT EXISTS direct_message_claims (
+        msg_uid TEXT PRIMARY KEY, recipient TEXT NOT NULL, claimed_by TEXT NOT NULL, claimed_at TEXT NOT NULL
+    )''')
     cur.execute("CREATE TABLE IF NOT EXISTS pending_voicemail (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS pending_bot_messages (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS link_titles (url TEXT PRIMARY KEY, title TEXT, fetched_at REAL)")
@@ -6871,8 +6895,8 @@ def handle_client(cs, addr):
                 
                 with lock:
                     sock_to = clients.get(to)
-                    # People (not bots) get the message on every signed-in device.
-                    all_socks_to = list(user_sessions.get(to, set())) if not _is_registered_bot(to) else []
+                    # Every account, including agents/bots, gets incoming DMs on every live session.
+                    all_socks_to = list(user_sessions.get(to, set()))
                 if sock_to and sock_to not in all_socks_to:
                     all_socks_to.append(sock_to)
                 reason = None
@@ -6889,12 +6913,11 @@ def handle_client(cs, addr):
                     reason = f"Message couldn't be sent because {to} has you blocked."
                 elif sender_has_blocked and sender_has_blocked[0] == 1: 
                     reason = "You have blocked this contact."
-                elif _maybe_send_bot_reply(sock, frm, to, bot_text, msg_uid=msg["id"]):
-                    handled_by_bot = True
-                    delivered_to_user = True
-                    reason = None
                 elif not all_socks_to:
-                    if is_voicemail and _canonical_username(to):
+                    if _maybe_send_bot_reply(sock, frm, to, bot_text, msg_uid=msg["id"]):
+                        handled_by_bot = True
+                        delivered_to_user = True
+                    elif is_voicemail and _canonical_username(to):
                         queued_voicemail = True
                     elif _is_registered_bot(to) and not _is_virtual_bot(to):
                         # An outside bot/agent that signs in by itself (e.g. Adam): keep it for when it's back.
@@ -6913,6 +6936,10 @@ def handle_client(cs, addr):
                             pass
                     if not delivered_to_user:
                         reason = f"{to} is offline."
+                    # Keep the virtual-bot fallback, while allowing every live agent
+                    # session to receive and claim the same incoming event first.
+                    if delivered_to_user and _is_virtual_bot(to):
+                        handled_by_bot = _maybe_send_bot_reply(sock, frm, to, bot_text, msg_uid=msg["id"])
                 if voice_mp3 is not None and not reason and not handled_by_bot:
                     attachment_path = _store_voice_file(msg["id"], voice_mp3, owner=frm)
                     if attachment_path and _is_registered_bot(to) and not _is_virtual_bot(to):
@@ -6966,6 +6993,16 @@ def handle_client(cs, addr):
 
             elif action == "msg_read":
                 _mark_messages_read(user, msg.get("ids") or [])
+
+            elif action == "msg_claim":
+                claimed, reason, detail = _claim_direct_message(user, msg.get("id"), socket_session_ids.get(sock, ""))
+                event = {"action": "msg_claimed", "id": str(msg.get("id") or ""), "by": user, "claimed": claimed, "reason": reason}
+                if detail:
+                    event.update(detail)
+                if claimed:
+                    _send_to_all_sessions({user}, event)
+                else:
+                    _send_json_line(sock, event)
 
             elif action == "ping":
                 _send_json_line(sock, {"action": "pong", "t": msg.get("t")})
