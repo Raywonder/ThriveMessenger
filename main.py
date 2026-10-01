@@ -7528,11 +7528,7 @@ class ChatDialog(wx.Dialog):
         if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             idx = self.hist.GetSelection()
             if idx != wx.NOT_FOUND:
-                links = extract_urls(str(self._history_rows[idx].get("text", "") or ""))
-                if len(links) == 1:
-                    self.on_open_link(links[0])
-                else:
-                    self.on_history_item_activated(event)
+                self.on_history_item_activated(event)
             return
         event.Skip()
     def set_typing_label(self, username, is_typing):

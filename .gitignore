@@ -17,6 +17,9 @@ assets/videos/.narration_work/
 *.pid
 srv/certs/
 srv/~/
+srv/error_log
+srv/voice_messages/
+srv/.app_health/
 
 # Private server credentials and local secrets
 *.env
