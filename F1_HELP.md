@@ -8,9 +8,13 @@
 
 ## Server Manager (No manual .conf edits required)
 - In the Login window, use **Manage Servers...**
+- Use **Refresh Public Directory** to get the signed list of public Thrive servers. It runs in the background and does not remove your saved servers if it cannot refresh.
 - Add/update/remove server entries.
 - Pick any saved server before login.
 - Last selected server is remembered for next launch.
+- A manual address is always available for a private or unlisted server.
+- Classic Thrive servers support sign-in, contacts and direct messages. Newer server features are only shown when the server reports support for them.
+- Thrive tries TLS first. If a classic server has no TLS, it warns clearly before any sign-in data is sent over an unencrypted connection.
 
 ## TappedIn Default Server
 - Host: `im.tappedin.fm`

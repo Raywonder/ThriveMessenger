@@ -7,8 +7,52 @@ struct ServerEntry: Codable, Hashable, Identifiable {
     var name: String
     var host: String
     var port: UInt16
+    var description: String = ""
+    var allowsSignUp: Bool = true
+    /// A directory entry can state this up front; a live capability probe remains authoritative.
+    var compatibility: [String: Bool] = [:]
+    var listed: Bool = false
 
-    static let tappedIn = ServerEntry(id: "im.tappedin.fm:2005", name: "TappedIn.fm", host: "im.tappedin.fm", port: 2005)
+    static let tappedIn = ServerEntry(id: "im.tappedin.fm:2005", name: "TappedIn.fm", host: "im.tappedin.fm", port: 2005,
+                                      description: "The public Thrive server operated by TappedIn.fm.", allowsSignUp: true,
+                                      compatibility: ["classic": true], listed: true)
+}
+
+/// The published directory is an envelope: its UTF-8 `payload` is signed off-line and the client
+/// verifies the signature before reading it. Keeping the envelope separate avoids cross-language
+/// JSON canonicalisation differences between iOS, macOS, and Windows.
+struct ServerDirectoryEnvelope: Codable {
+    let format: Int
+    let generatedAt: String
+    let payload: String
+    let signature: String
+    let keyID: String
+
+    enum CodingKeys: String, CodingKey { case format, generatedAt = "generated_at", payload, signature, keyID = "key_id" }
+}
+
+struct ServerDirectoryPayload: Codable {
+    let servers: [ServerDirectoryItem]
+}
+
+struct ServerDirectoryItem: Codable, Hashable {
+    let id: String
+    let name: String
+    let description: String
+    let host: String
+    let port: UInt16
+    let allowsSignUp: Bool
+    let compatibility: [String: Bool]
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, description, host, port, compatibility
+        case allowsSignUp = "allows_sign_up"
+    }
+
+    var entry: ServerEntry {
+        ServerEntry(id: id, name: name, host: host, port: port, description: description,
+                    allowsSignUp: allowsSignUp, compatibility: compatibility, listed: true)
+    }
 }
 
 struct Contact: Identifiable, Hashable {

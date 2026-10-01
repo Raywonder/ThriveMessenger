@@ -35,6 +35,7 @@ struct SignInView: View {
     @State private var password = ""
     @State private var remember = true
     @State private var showForgotPassword = false
+    @State private var showServers = false
     @FocusState private var focus: Field?
     enum Field { case user, password }
 
@@ -42,7 +43,13 @@ struct SignInView: View {
         NavigationStack {
             Form {
                 Section("Server") {
-                    Text(model.server.name).accessibilityLabel("Server: \(model.server.name)")
+                    Button { showServers = true } label: {
+                        LabeledContent("Server", value: model.server.name)
+                    }
+                    .accessibilityHint("Opens the Thrive server directory. You can also add a server manually.")
+                    if !model.serverCompatibilityNote.isEmpty {
+                        Text(model.serverCompatibilityNote).foregroundStyle(.orange)
+                    }
                 }
                 Section {
                     TextField("Username", text: $user)
@@ -65,12 +72,58 @@ struct SignInView: View {
             .navigationTitle("Thrive")
             .onAppear { user = model.username; focus = user.isEmpty ? .user : .password }
             .sheet(isPresented: $showForgotPassword) { ForgotPasswordView() }
+            .sheet(isPresented: $showServers) { ServerDirectoryView() }
         }
     }
 
     private func signIn() {
         guard !user.isEmpty, !password.isEmpty else { return }
         model.signIn(user: user, password: password, remember: remember)
+    }
+}
+
+struct ServerDirectoryView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var manual = false
+    @State private var name = ""
+    @State private var host = ""
+    @State private var port = "2005"
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Thrive servers") {
+                    ForEach(model.servers.filter(\.listed)) { server in
+                        Button {
+                            model.chooseServer(server); dismiss()
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(server.name)
+                                Text(server.description.isEmpty ? server.host : server.description).font(.footnote).foregroundStyle(.secondary)
+                                Text(server.allowsSignUp ? "Sign-up available" : "Sign-up by invitation only").font(.footnote)
+                            }
+                        }
+                        .accessibilityLabel("\(server.name). \(server.description). \(server.allowsSignUp ? "Sign-up available" : "Sign-up by invitation only")")
+                    }
+                } footer: { Text("The list refreshes quietly and is cached. A server can choose not to be listed.") }
+                Section("Add a server manually") {
+                    if manual {
+                        TextField("Name", text: $name)
+                        TextField("Address", text: $host).textInputAutocapitalization(.never).autocorrectionDisabled()
+                        TextField("Port", text: $port).keyboardType(.numberPad)
+                        Button("Add server") {
+                            model.addManualServer(name: name, host: host, port: UInt16(port) ?? 2005); dismiss()
+                        }.disabled(name.isEmpty || host.isEmpty)
+                    } else { Button("Add a server manually") { manual = true } }
+                }
+            }
+            .navigationTitle("Server directory")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .topBarTrailing) { Button("Refresh") { model.refreshServerDirectory(quiet: false) } }
+            }
+        }
     }
 }
 

@@ -168,7 +168,7 @@ struct SettingsCategoryView: View {
                     Text(s.id == model.wrappedValue.server.id ? "\(s.name), current" : s.name)
                 }
             } header: { Text("Servers").accessibilityAddTraits(.isHeader) } footer: {
-                Text("More servers, including your own, are coming in a later version.")
+                Text("On the sign-in screen, choose Server to browse the public directory or add a server manually. Classic servers keep chats and contacts available; newer features appear only when the server supports them.")
             }
         case (.help, "Messages"):
             Section {
@@ -198,6 +198,9 @@ struct SettingsCategoryView: View {
             }
         case (.help, _):
             Section {
+                Text("Choose Server on the sign-in screen to browse Thrive servers or add one by address. The directory refreshes quietly and keeps its last list when you are offline.")
+                Text("Classic Thrive servers still support sign-in, contacts and direct messages. Features introduced later, such as rooms, multi-session, admin tools, backups and transcription, stay unavailable unless that server says it supports them.")
+                Text("Thrive uses encryption when the server offers it. Before signing in to a classic unencrypted server, Thrive tells you that network operators could read your sign-in and messages.")
                 Text("Voice messages now pause and carry on. Activating one starts it, activating it again pauses it, and again resumes it instead of jumping back to the beginning.")
                 Text("The separate \"Play voice message\" action is gone from messages, because activating the message already plays it.")
                 Text("The \"Seen\" reaction is gone. Thrive already tells the sender you've read a message a few seconds after you reach it.")

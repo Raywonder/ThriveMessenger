@@ -1,5 +1,13 @@
 # Thrive Messenger, chat like it's 2005!
 
+## Choosing a server
+
+Thrive has an in-app server directory so new users can choose a public server without knowing its address. A server address remains available as an optional manual entry for private, self-hosted, or unlisted servers. Directory entries state the server name, description, address, sign-up policy, encryption expectation, and supported Thrive extensions.
+
+The published directory is an off-line signed JSON envelope. Clients refresh it quietly, cache the last verified list, and fall back to their built-in public entries if it cannot be refreshed. Server operators may opt in or out; third-party servers are listed only after their public sign-up policy has been verified and recorded in the directory source.
+
+Classic G4p Thrive servers use the same newline-delimited JSON protocol. Sign-in, contacts, and direct messages remain available there. Newer controls are feature-detected, so rooms, multi-session, administrator tools, backups, and transcription are not shown as usable unless the connected server advertises them. Thrive attempts TLS first and gives a clear warning before using an unencrypted classic server.
+
 ## Introduction
 
 Thrive Messenger is an instant messaging service that aims to bring back the speed, simplicity, fun and excitement of instant messengers from the 90s and 2000s, such as AIM, ICQ and MSN/Windows Live Messenger. It is not a revival project like [Escargot Chat](https://escargot.chat). Rather, it is an entirely new IM platform built from scratch. We're not reviving any old services, we're reviving the vibe of those services.

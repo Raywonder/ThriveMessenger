@@ -41,3 +41,9 @@ What to check:
 7. With a hardware keyboard: Enter on a voice message plays it, Enter again pauses, Enter again
    resumes -- and it never plays and pauses on one press.
 8. Enter in the typing box still sends the message, and Enter on a text message does nothing.
+# Next TestFlight batch
+
+- Choose a Thrive server from the in-app directory, or add a server manually when it is private or not listed.
+- The directory refreshes quietly and keeps the last safe list when you are offline.
+- Classic Thrive servers now have a clear compatibility note. Chats and contacts remain available while newer server-only features stay out of the way.
+- Thrive warns plainly before signing in to a server that does not offer encryption.

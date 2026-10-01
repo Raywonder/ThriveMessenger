@@ -1,4 +1,5 @@
 import AudioToolbox
+import CryptoKit
 import Foundation
 import Network
 import Observation
@@ -50,6 +51,8 @@ final class AppModel {
     var conversations: [String: Conversation] = [:]
     var linkTitles: [String: String] = [:]
     var openConversation: String?
+    var connectionEncrypted = true
+    var serverCompatibilityNote = ""
 
     // Settings (the same names as desktop where they exist)
     var sendReadReceipts: Bool { didSet { defaults.set(sendReadReceipts, forKey: "send_read_receipts") } }
@@ -100,6 +103,16 @@ final class AppModel {
         otherChatAlert = defaults.string(forKey: "other_chat_new_message") ?? "read"
         enterKeySendsMessage = defaults.object(forKey: "enter_key_sends_message") as? Bool ?? true
         username = defaults.string(forKey: "username") ?? ""
+        if let cached = defaults.data(forKey: "server_directory_cache"),
+           let envelope = try? JSONDecoder().decode(ServerDirectoryEnvelope.self, from: cached),
+           Self.verifyDirectory(envelope),
+           let payload = envelope.payload.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(ServerDirectoryPayload.self, from: payload) {
+            mergeDirectoryEntries(decoded.servers.map(\.entry))
+        }
+        if let savedID = defaults.string(forKey: "last_server_id"), let saved = servers.first(where: { $0.id == savedID }) {
+            server = saved
+        }
         if ProcessInfo.processInfo.arguments.contains("--reset-for-tests") {
             Keychain.delete(server: server.id, user: username)
             username = ""
@@ -109,6 +122,7 @@ final class AppModel {
             Task { @MainActor in self?.networkChanged() }
         }
         pathMonitor.start(queue: DispatchQueue(label: "fm.tappedin.thrive.path"))
+        refreshServerDirectory(quiet: true)
     }
 
     // MARK: sign-in and connection
@@ -149,7 +163,10 @@ final class AppModel {
             Task { @MainActor in
                 guard let self, let c, c === self.connection else { return }
                 switch state {
-                case .ready: self.sendLogin()
+                case .ready(let encrypted):
+                    self.connectionEncrypted = encrypted
+                    self.serverCompatibilityNote = encrypted ? "" : "This server does not offer encryption. Your sign-in and messages can be read by people operating the network."
+                    self.sendLogin()
                 case .failed(let why): self.connectionLost(why)
                 default: break
                 }
@@ -184,6 +201,15 @@ final class AppModel {
             }
             send(["action": "get_feature_caps"])
             send(["action": "group_room_list"])
+            // Classic servers do not answer capability requests. Keep core chat available and state
+            // plainly why extension-only areas (such as rooms) may be empty.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, self.phase == .online, self.featureCaps.isEmpty else { return }
+                self.serverCompatibilityNote = self.connectionEncrypted
+                    ? "This is a classic Thrive server. Chats and contacts work; this server does not report support for newer features such as rooms, multi-session, admin tools, backups, or transcription."
+                    : self.serverCompatibilityNote + " It is also a classic server, so newer features may not be available."
+            }
         } else {
             let reason = obj["reason"] as? String ?? "Sign-in failed."
             connection?.stop()
@@ -274,6 +300,53 @@ final class AppModel {
 
     func send(_ payload: [String: Any]) {
         connection?.send(payload)
+    }
+
+    func chooseServer(_ entry: ServerEntry) {
+        guard phase == .signedOut else { return }
+        server = entry
+        if !servers.contains(entry) { servers.append(entry) }
+        defaults.set(entry.id, forKey: "last_server_id")
+        signInError = ""
+    }
+
+    func addManualServer(name: String, host: String, port: UInt16) {
+        let cleanHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !cleanHost.isEmpty else { return }
+        chooseServer(ServerEntry(id: "\(cleanHost.lowercased()):\(port)", name: name, host: cleanHost, port: port))
+    }
+
+    func refreshServerDirectory(quiet: Bool) {
+        let url = URL(string: "https://im.tappedin.fm/thrive/directory.json")!
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+            guard let self, let data,
+                  let envelope = try? JSONDecoder().decode(ServerDirectoryEnvelope.self, from: data),
+                  Self.verifyDirectory(envelope),
+                  let payload = envelope.payload.data(using: .utf8),
+                  let decoded = try? JSONDecoder().decode(ServerDirectoryPayload.self, from: payload) else { return }
+            let valid = decoded.servers.filter { !$0.name.isEmpty && !$0.host.isEmpty && $0.port > 0 }
+            guard !valid.isEmpty else { return }
+            Task { @MainActor in
+                self.mergeDirectoryEntries(valid.map(\.entry))
+                UserDefaults.standard.set(data, forKey: "server_directory_cache")
+            }
+        }.resume()
+    }
+
+    private func mergeDirectoryEntries(_ incoming: [ServerEntry]) {
+        var byID = Dictionary(uniqueKeysWithValues: servers.map { ($0.id, $0) })
+        for entry in incoming { byID[entry.id] = entry }
+        servers = byID.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private static func verifyDirectory(_ envelope: ServerDirectoryEnvelope) -> Bool {
+        guard envelope.format == 1,
+              envelope.keyID == "2026-10-primary",
+              let publicData = Data(base64Encoded: "QxOY9Q3BbqJ79uYPPuZvdzHmM38wWIv+r3BLoV5ttyQ="),
+              let signature = Data(base64Encoded: envelope.signature),
+              let payload = envelope.payload.data(using: .utf8),
+              let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: publicData) else { return false }
+        return publicKey.isValidSignature(signature, for: payload)
     }
 
     private func resyncOpen() {
