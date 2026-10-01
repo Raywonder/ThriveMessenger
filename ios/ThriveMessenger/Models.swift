@@ -21,6 +21,22 @@ struct Contact: Identifiable, Hashable {
     var unread: Int = 0
 }
 
+/// One row of the server's `feature_caps` table. `uiVisible` is the server saying whether the control
+/// should be offered at all; `canUse` is whether this account may actually use it.
+struct FeatureCap: Hashable {
+    var enabled: Bool
+    var uiVisible: Bool
+    var scope: String
+    var canUse: Bool
+
+    init(_ d: [String: Any]) {
+        enabled = d["enabled"] as? Bool ?? false
+        uiVisible = d["ui_visible"] as? Bool ?? false
+        scope = d["scope"] as? String ?? "all"
+        canUse = d["can_use"] as? Bool ?? false
+    }
+}
+
 struct ReactionGroup: Hashable {
     var emoji: String
     var users: [String]
@@ -112,7 +128,7 @@ let roleRank: [String: Int] = ["guest": 0, "user": 1, "moderator": 2, "admin": 3
 enum Reactions {
     static let quick: [(String, String)] = [("\u{1F44D}", "thumbs up"), ("\u{1F44E}", "thumbs down"), ("\u{2764}\u{FE0F}", "heart"),
                                             ("\u{1F602}", "laugh"), ("\u{1F62E}", "wow"), ("\u{1F622}", "sad"),
-                                            ("\u{1F389}", "celebrate"), ("\u{2705}", "check mark"), ("\u{1F440}", "seen")]
+                                            ("\u{1F389}", "celebrate"), ("\u{2705}", "check mark")]
     static func name(_ emoji: String) -> String {
         if let hit = quick.first(where: { $0.0 == emoji }) { return hit.1 }
         return emoji.unicodeScalars.first?.properties.name?.lowercased() ?? emoji

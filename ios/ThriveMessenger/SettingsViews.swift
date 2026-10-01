@@ -3,7 +3,7 @@ import SwiftUI
 /// Settings, the VoiceLink way: the root is only a list of categories with a one-line hint each (nothing can be
 /// changed there). A category opens its own screen, with its settings grouped into tabs by a segmented control.
 enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
-    case general, notifications, privacy, profile
+    case general, notifications, privacy, profile, help
     var id: String { rawValue }
 
     var title: String {
@@ -12,6 +12,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .notifications: return "Notifications"
         case .privacy: return "Privacy"
         case .profile: return "Profile and Authentication"
+        case .help: return "Help and What's New"
         }
     }
     var hint: String {
@@ -20,6 +21,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .notifications: return "What you hear when messages arrive."
         case .privacy: return "Read receipts and link titles."
         case .profile: return "Your account, servers and signing out."
+        case .help: return "Every action on a chat, a message and a contact, plus what changed."
         }
     }
     var icon: String {
@@ -28,6 +30,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .notifications: return "bell"
         case .privacy: return "lock.shield"
         case .profile: return "person.circle"
+        case .help: return "questionmark.circle"
         }
     }
     var tabs: [String] {
@@ -36,6 +39,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .notifications: return ["Chats", "Rooms"]
         case .privacy: return ["Messages", "Links"]
         case .profile: return ["Account", "Servers"]
+        case .help: return ["Messages", "Contacts", "Keyboard", "What's new"]
         }
     }
 }
@@ -165,6 +169,38 @@ struct SettingsCategoryView: View {
                 }
             } header: { Text("Servers").accessibilityAddTraits(.isHeader) } footer: {
                 Text("More servers, including your own, are coming in a later version.")
+            }
+        case (.help, "Messages"):
+            Section {
+                Text("Double-tap a message to use it: a message with one link opens that link, and a voice message starts playing. Double-tap the same voice message again to pause it, and once more to carry on from where it stopped.")
+                Text("Swipe up or down with one finger on a message to hear its other actions: Copy, React, Thumbs up, Links in this message, and Edit or Delete for everyone on your own recent messages.")
+                Text("There is no separate Play action. Playing is what activating a voice message does.")
+            } header: { Text("In a chat").accessibilityAddTraits(.isHeader) } footer: {
+                Text("Messages are marked read for you automatically a few seconds after you reach them.")
+            }
+        case (.help, "Contacts"):
+            Section {
+                Text("Double-tap a contact to open the chat. Swipe up or down on a contact for the rest: Message, Voice message, Call when your server offers it, Add to group, Block or Unblock, Remove contact, and Copy username.")
+                Text("Voice message opens the chat and starts recording straight away. Activate the same button again to stop and send it.")
+                Text("Remove contact asks you to confirm first. Block and Unblock are one action that changes name, so you always see the one that applies.")
+            } header: { Text("Chats list").accessibilityAddTraits(.isHeader) } footer: {
+                Text("Touch and hold a contact for the same list without VoiceOver.")
+            }
+        case (.help, "Keyboard"):
+            Section {
+                Text("Enter sends the message you're typing, unless you turn that off in General, Keyboard.")
+                Text("Shift+Enter or Option+Enter always makes a new line. Command+Enter always sends.")
+            } header: { Text("Hardware keyboard").accessibilityAddTraits(.isHeader) } footer: {
+                Text("These only apply with a hardware keyboard connected.")
+            }
+        case (.help, _):
+            Section {
+                Text("Voice messages now pause and carry on. Activating one starts it, activating it again pauses it, and again resumes it instead of jumping back to the beginning.")
+                Text("The separate \"Play voice message\" action is gone from messages, because activating the message already plays it.")
+                Text("The \"Seen\" reaction is gone. Thrive already tells the sender you've read a message a few seconds after you reach it.")
+                Text("Contacts in the Chats list now have actions: Message, Voice message, Call, Add to group, Block, Remove contact and Copy username.")
+            } header: { Text("What's new in this version").accessibilityAddTraits(.isHeader) } footer: {
+                Text("Version \(appVersion).")
             }
         }
     }

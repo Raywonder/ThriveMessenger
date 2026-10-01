@@ -80,6 +80,11 @@ final class AppModel {
     private var pendingReaction: (String, String, Bool)?
     var voicePlayer = VoicePlayer()
     private var pendingVoice: String?
+    private var pendingVoiceLabel = "Voice message"
+    /// Feature switches the server reports in `feature_caps`; actions that need one stay hidden until it says so.
+    var featureCaps: [String: FeatureCap] = [:]
+    /// Set by the contact-row "Voice message" action: the chat opens and starts recording straight away.
+    var startRecordingIn: String?
 
     init() {
         sendReadReceipts = defaults.object(forKey: "send_read_receipts") as? Bool ?? true
@@ -349,10 +354,18 @@ final class AppModel {
         Announce.say("Voice message sent")
     }
 
-    func playVoice(_ m: ChatMessage, in c: Conversation) {
+    /// Play, pause or resume one voice message. The single entry point: the VoiceOver default action on the
+    /// message row and the hardware Return key both call this, so there is only ever one playback path.
+    func toggleVoice(_ m: ChatMessage, in c: Conversation) {
         guard let v = m.voice, !v.serverID.isEmpty else { Announce.say("This voice message isn't available yet."); return }
-        if let data = voicePlayer.cached(v.serverID) { voicePlayer.play(data, label: "Voice message from \(m.sender)"); return }
+        let label = "Voice message from \(m.sender.lowercased() == username.lowercased() ? "you" : m.sender)"
+        if let data = voicePlayer.cached(v.serverID) {
+            voicePlayer.toggle(id: v.serverID, data: data, label: label)
+            return
+        }
+        guard pendingVoice != v.serverID else { return }   // already fetching it; don't ask twice
         pendingVoice = v.serverID
+        pendingVoiceLabel = label
         Announce.say("Getting the voice message")
         switch c.kind {
         case .direct: send(["action": "voice_fetch", "id": v.serverID])
@@ -483,6 +496,9 @@ final class AppModel {
             }
         case "feature_caps":
             if let a = obj["is_admin"] as? Bool { isAdmin = a }
+            if let caps = obj["caps"] as? [String: [String: Any]] {
+                featureCaps = caps.mapValues { FeatureCap($0) }
+            }
         case "msg": incomingDirect(obj)
         case "msg_sent":
             guard let to = obj["to"] as? String, let cid = obj["client_id"] as? String, let id = obj["id"] as? String else { return }
@@ -532,13 +548,32 @@ final class AppModel {
             pendingVoice = nil
             if obj["ok"] as? Bool == true, let b64 = obj["b64"] as? String, let data = Data(base64Encoded: b64) {
                 voicePlayer.store(id ?? "", data)
-                voicePlayer.play(data, label: "Voice message")
+                voicePlayer.play(id: id ?? "", data: data, label: pendingVoiceLabel)
             } else { Announce.say("This voice message isn't available any more.") }
         case "typing":
             guard let from = obj["from"] as? String else { return }
             let c = conversation(.direct(from))
             c.typing = (obj["typing"] as? Bool ?? false) ? [from] : []
         case "pong": break
+        case "voice_call_result":
+            if obj["ok"] as? Bool == false {
+                Announce.say(obj["reason"] as? String ?? "That call couldn't be placed.", important: true)
+            } else if let ev = obj["event"] as? String {
+                Announce.say(ev == "ringing" ? "Ringing" : ev.replacingOccurrences(of: "_", with: " "))
+            }
+        case "voice_call_request":
+            Announce.say("Incoming call from \(obj["from"] as? String ?? "someone")", important: true)
+        case "voice_call_event":
+            let ev = obj["event"] as? String ?? ""
+            let who = (obj["by"] ?? obj["from"]) as? String ?? ""
+            switch ev {
+            case "accepted": Announce.say("\(who) answered")
+            case "declined": Announce.say("\(who) declined the call")
+            case "ended": Announce.say("Call ended")
+            default: if !ev.isEmpty { Announce.say(ev.replacingOccurrences(of: "_", with: " ")) }
+            }
+        case "feature_denied":
+            Announce.say(obj["reason"] as? String ?? "That isn't switched on for your account.", important: true)
         default:
             if act.hasPrefix("group_room_") { handleRoom(act, obj) }
         }
@@ -790,6 +825,52 @@ final class AppModel {
         if ["joined", "left", "kicked", "banned", "unbanned", "muted", "unmuted"].contains(ev), !(me && ["kicked", "banned", "left"].contains(ev)) {
             send(["action": "group_room_open", "room_id": roomID, "limit": 1])
         }
+    }
+
+    // MARK: contacts
+
+    func canUseFeature(_ key: String) -> Bool { featureCaps[key]?.canUse ?? false }
+
+    /// Whether an action should appear at all. The server hides features it isn't ready to offer
+    /// (`voice_call` ships switched off because call audio needs a media engine), and an action that is
+    /// always there but always fails is worse than no action with VoiceOver.
+    func featureVisible(_ key: String) -> Bool { featureCaps[key]?.uiVisible ?? false }
+
+    /// Rooms where you are a moderator or above, so "Add to group" only offers rooms the server will accept.
+    var roomsICanAddTo: [RoomSummary] { rooms.filter { (roleRank[$0.role] ?? -1) >= 2 } }
+
+    /// Block or unblock a contact. The server stores the flag and sends nothing back, so update the row
+    /// here and say what happened — a silent action reads as a broken one with VoiceOver.
+    func setBlocked(_ blocked: Bool, user: String) {
+        send(["action": blocked ? "block_contact" : "unblock_contact", "to": user])
+        if let i = contacts.firstIndex(where: { $0.user.lowercased() == user.lowercased() }) {
+            contacts[i].blocked = blocked
+        }
+        Announce.say(blocked ? "Blocked \(user)" : "Unblocked \(user)")
+    }
+
+    /// Remove a contact. Destructive, so the caller confirms first. The server sends no reply here either.
+    func deleteContact(_ user: String) {
+        send(["action": "delete_contact", "to": user])
+        contacts.removeAll { $0.user.lowercased() == user.lowercased() }
+        let key = ConversationKind.direct(user).key
+        conversations[key] = nil
+        if openConversation == key { openConversation = nil }
+        Announce.say("Removed \(user) from your contacts")
+    }
+
+    func callContact(_ user: String) {
+        guard canUseFeature("voice_call") else {
+            Announce.say("Calling isn't switched on for your account on this server.", important: true)
+            return
+        }
+        send(["action": "voice_call_request", "to": user, "mode": "voice"])
+        Announce.say("Calling \(user)")
+    }
+
+    func addContactToRoom(_ user: String, room: RoomSummary) {
+        roomAction("group_room_add_member", room: room.id, ["username": user, "role": "user"])
+        Announce.say("Adding \(user) to \(room.name)")
     }
 
     func roomAction(_ action: String, room: String, _ extra: [String: Any] = [:]) {

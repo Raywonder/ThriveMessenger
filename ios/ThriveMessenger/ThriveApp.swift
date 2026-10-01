@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct ThriveApp: App {
@@ -78,7 +79,7 @@ struct MainView: View {
 
     var body: some View {
         TabView {
-            NavigationStack { ContactsView() }
+            ContactsView()
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right") }
             RoomsView()
                 .tabItem { Label("Rooms", systemImage: "person.3") }
@@ -97,8 +98,15 @@ struct MainView: View {
 
 struct ContactsView: View {
     @Environment(AppModel.self) private var model
+    @State private var path: [ConversationKind] = []
+    @State private var addingToGroup: Contact?
+    @State private var removing: Contact?
 
     var body: some View {
+        NavigationStack(path: $path) { list }
+    }
+
+    private var list: some View {
         List(model.contacts) { c in
             NavigationLink(value: ConversationKind.direct(c.user)) {
                 VStack(alignment: .leading) {
@@ -107,10 +115,71 @@ struct ContactsView: View {
                 }
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("\(c.user), \(c.online ? "online" : "offline")\(c.statusText.isEmpty ? "" : ", \(c.statusText)")\(c.unread > 0 ? ", \(c.unread) unread" : "")")
+                // Both of these go on the VStack that owns the accessibility element. Attached to the
+                // NavigationLink instead, they never reach the Actions rotor.
+                .accessibilityActions { actions(c) }
+                .contextMenu { actions(c) }
             }
         }
         .overlay { if model.contacts.isEmpty { ContentUnavailableView("No contacts yet", systemImage: "person.crop.circle.badge.plus") } }
         .navigationTitle("Chats")
         .navigationDestination(for: ConversationKind.self) { kind in ChatView(kind: kind) }
+        .sheet(item: $addingToGroup) { c in AddToGroupSheet(contact: c) }
+        .confirmationDialog("Remove \(removing?.user ?? "this contact")?", isPresented: removingConfirm, titleVisibility: .visible) {
+            Button("Remove contact", role: .destructive) { if let r = removing { model.deleteContact(r.user) }; removing = nil }
+            Button("Keep contact", role: .cancel) { removing = nil }
+        } message: {
+            Text("This takes \(removing?.user ?? "them") off your contact list on this server.")
+        }
+    }
+
+    private var removingConfirm: Binding<Bool> {
+        Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })
+    }
+
+    /// Same set for touch (context menu) and VoiceOver (Actions rotor). Every one of them speaks a result.
+    @ViewBuilder
+    private func actions(_ c: Contact) -> some View {
+        Button("Message") { path.append(.direct(c.user)) }
+        Button("Voice message") { model.startRecordingIn = c.user; path.append(.direct(c.user)) }
+        if model.featureVisible("voice_call") {
+            Button("Call") { model.callContact(c.user) }
+        }
+        if !model.roomsICanAddTo.isEmpty {
+            Button("Add to group") { addingToGroup = c }
+        }
+        Button(c.blocked ? "Unblock" : "Block") { model.setBlocked(!c.blocked, user: c.user) }
+        Button("Remove contact", role: .destructive) { removing = c }
+        Button("Copy username") { UIPasteboard.general.string = c.user; Announce.say("Copied") }
+    }
+}
+
+/// Picks which of your rooms to add a contact to. Only rooms where you're a moderator or above are listed,
+/// because those are the only ones the server will accept `group_room_add_member` for.
+struct AddToGroupSheet: View {
+    let contact: Contact
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if model.roomsICanAddTo.isEmpty {
+                    Text("You aren't a moderator or owner of any room, so there's nowhere to add \(contact.user).")
+                } else {
+                    ForEach(model.roomsICanAddTo) { r in
+                        Button(r.name) {
+                            model.addContactToRoom(contact.user, room: r)
+                            dismiss()
+                        }
+                        .accessibilityLabel("\(r.name), \(r.roleLabel), \(r.memberCount) member\(r.memberCount == 1 ? "" : "s")")
+                    }
+                }
+            }
+            .navigationTitle("Add \(contact.user)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+            .onAppear { model.send(["action": "group_room_list"]) }
+        }
     }
 }

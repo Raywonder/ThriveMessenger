@@ -41,6 +41,11 @@ struct ChatView: View {
         .onAppear {
             conv = model.open(kind)
             if let conv, let last = conv.messages.last { model.markRead(upTo: last, in: conv) }
+            // Arrived from the contact row's "Voice message" action: start recording straight away.
+            if case .direct(let user) = kind, model.startRecordingIn?.lowercased() == user.lowercased() {
+                model.startRecordingIn = nil
+                if let conv { Task { await toggleRecording(conv) } }
+            }
         }
         .onDisappear { if model.openConversation == kind.key { model.openConversation = nil } }
     }
@@ -129,10 +134,17 @@ struct ChatView: View {
         .accessibilityAction(named: "Copy") { UIPasteboard.general.string = m.text; Announce.say("Copied") }
         .accessibilityAction(named: "React") { sheet = .react(m.id) }
         .accessibilityAction(named: "Thumbs up") { model.toggleReaction("\u{1F44D}", on: m, in: c) }
-        .accessibilityAction(named: "Seen") { model.toggleReaction("\u{1F440}", on: m, in: c) }
+        // The unnamed default action. With VoiceOver on, a double-tap on the focused row arrives as
+        // accessibilityActivate(), not as a two-count tap gesture, so onTapGesture alone never fires and
+        // there would be no way at all to play a voice message. Activation opens a lone link, or
+        // plays/pauses a voice message.
+        .accessibilityAction {
+            if let first = links.first { openLink(first.url) }
+            else if m.voice != nil { model.toggleVoice(m, in: c) }
+        }
         .modifier(OptionalActions(m: m, c: c, links: links, host: self))
         .contextMenu { menu(m, c, links) }
-        .onTapGesture(count: 2) { if let first = links.first { openLink(first.url) } else if m.voice != nil { model.playVoice(m, in: c) } }
+        .onTapGesture(count: 2) { if let first = links.first { openLink(first.url) } else if m.voice != nil { model.toggleVoice(m, in: c) } }
     }
 
     @ViewBuilder
@@ -142,7 +154,6 @@ struct ChatView: View {
             ForEach(Reactions.quick, id: \.0) { r in Button("\(r.0) \(r.1)") { model.toggleReaction(r.0, on: m, in: c) } }
             Button("More…") { sheet = .react(m.id) }
         }
-        if m.voice != nil { Button("Play voice message") { model.playVoice(m, in: c) } }
         if !links.isEmpty {
             Menu("Links in this message (\(links.count))") {
                 ForEach(links, id: \.url) { l in
@@ -253,7 +264,6 @@ private struct OptionalActions: ViewModifier {
     func body(content: Content) -> some View {
         content
             .accessibilityActions {
-                if m.voice != nil { Button("Play voice message") { model.playVoice(m, in: c) } }
                 if links.count == 1 { Button("Open link") { host.openLink(links[0].url) } }
                 if !links.isEmpty { Button("Links in this message") { host.showLinks(m.id) } }
                 if model.canEdit(m, in: c) {

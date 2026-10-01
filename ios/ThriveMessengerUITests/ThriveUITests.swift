@@ -107,7 +107,7 @@ final class ThriveUITests: XCTestCase {
     func testSettingsCategoriesAndTabs() throws {
         try signIn()
         app.tabBars.buttons["Settings"].tap()
-        for id in ["general", "notifications", "privacy", "profile"] {
+        for id in ["general", "notifications", "privacy", "profile", "help"] {
             XCTAssertTrue(app.buttons["settings.category.\(id)"].waitForExistence(timeout: 10), "category \(id)")
         }
         XCTAssertEqual(app.switches.count, 0, "nothing can be changed on the Settings root")
