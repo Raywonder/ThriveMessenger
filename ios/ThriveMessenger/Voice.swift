@@ -8,6 +8,11 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
     private var cache: [String: Data] = [:]
     /// Which message the live player belongs to, so a second activation pauses instead of restarting.
     private(set) var loadedID: String?
+    /// When the last toggle was accepted. With VoiceOver on and a hardware keyboard, one Return can
+    /// reach the app twice -- once as accessibilityActivate() and once as the raw key press -- and
+    /// that would play and then instantly pause. Nobody presses twice on purpose this fast.
+    private var lastToggle: Date = .distantPast
+    private static let toggleDebounce: TimeInterval = 0.25
 
     func cached(_ id: String) -> Data? { cache[id] }
     func store(_ id: String, _ data: Data) { if !id.isEmpty { cache[id] = data } }
@@ -16,6 +21,9 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
     /// go through here, so they can never end up with two competing players.
     /// Same message playing -> pause. Same message paused -> resume. Anything else -> start from 0:00.
     func toggle(id: String, data: Data, label: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastToggle) > Self.toggleDebounce else { return }
+        lastToggle = now
         if let live = player, loadedID == id, !id.isEmpty {
             if live.isPlaying {
                 live.pause()

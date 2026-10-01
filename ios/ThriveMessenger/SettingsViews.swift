@@ -175,6 +175,7 @@ struct SettingsCategoryView: View {
                 Text("Double-tap a message to use it: a message with one link opens that link, and a voice message starts playing. Double-tap the same voice message again to pause it, and once more to carry on from where it stopped.")
                 Text("Swipe up or down with one finger on a message to hear its other actions: Copy, React, Thumbs up, Links in this message, and Edit or Delete for everyone on your own recent messages.")
                 Text("There is no separate Play action. Playing is what activating a voice message does.")
+                Text("With a hardware keyboard you can press Enter on the message instead of double-tapping it.")
             } header: { Text("In a chat").accessibilityAddTraits(.isHeader) } footer: {
                 Text("Messages are marked read for you automatically a few seconds after you reach them.")
             }
@@ -190,6 +191,7 @@ struct SettingsCategoryView: View {
             Section {
                 Text("Enter sends the message you're typing, unless you turn that off in General, Keyboard.")
                 Text("Shift+Enter or Option+Enter always makes a new line. Command+Enter always sends.")
+                Text("Enter on a voice message, when you're on the message itself and not in the typing box, plays it. Enter again pauses it, and once more carries on from where it stopped. It's the same play and pause as double-tapping the message.")
             } header: { Text("Hardware keyboard").accessibilityAddTraits(.isHeader) } footer: {
                 Text("These only apply with a hardware keyboard connected.")
             }
@@ -199,6 +201,7 @@ struct SettingsCategoryView: View {
                 Text("The separate \"Play voice message\" action is gone from messages, because activating the message already plays it.")
                 Text("The \"Seen\" reaction is gone. Thrive already tells the sender you've read a message a few seconds after you reach it.")
                 Text("Contacts in the Chats list now have actions: Message, Voice message, Call, Add to group, Block, Remove contact and Copy username.")
+                Text("With a hardware keyboard, Enter on a voice message plays, pauses and resumes it, so you don't have to double-tap.")
             } header: { Text("What's new in this version").accessibilityAddTraits(.isHeader) } footer: {
                 Text("Version \(appVersion).")
             }

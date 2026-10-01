@@ -14,6 +14,11 @@ Voice messages now pause and carry on:
 - With VoiceOver on, a double-tap on a message now reaches the app at all. It used to be dropped,
   which is why the rotor action was the only way to play anything.
 
+With a hardware keyboard, **Enter on a voice message plays, pauses and resumes it** -- no
+double-tap needed. It runs through the same play/pause as double-tapping does, so the key and the
+double-tap always agree about what is paused. Enter still sends your message while you are in the
+typing box, and Enter on a text message does nothing.
+
 The "Seen" reaction is gone. Thrive already tells the sender you have read a message a few
 seconds after you reach it, so the manual eyes reaction was duplicate work.
 
@@ -33,3 +38,6 @@ What to check:
 5. Each contact action speaks its result, and Remove contact asks first.
 6. Message rows still read "sender, time, text, links, reactions, status"; contacts still read
    "name, online or offline, status, unread count".
+7. With a hardware keyboard: Enter on a voice message plays it, Enter again pauses, Enter again
+   resumes -- and it never plays and pauses on one press.
+8. Enter in the typing box still sends the message, and Enter on a text message does nothing.

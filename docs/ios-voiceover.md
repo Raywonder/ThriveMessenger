@@ -34,6 +34,9 @@ Each message is one item that reads "sender, time, text, links, reactions, statu
 
 There is no separate "Play voice message" action. Playing is what activating a voice message does.
 
+With a hardware keyboard you can press **Enter** on the message instead of double-tapping it. See
+Hardware keyboard below.
+
 Swipe up or down on a message for its other actions: Copy, React, Thumbs up, Open link,
 Links in this message, and Edit or Delete for everyone on your own recent messages.
 
@@ -43,11 +46,23 @@ you have read a message a few seconds after you reach it.
 
 ## Hardware keyboard
 
+While you are in the typing box:
+
 - **Enter** sends the message you are typing, unless you turn that off in Settings, General, Keyboard.
 - **Shift+Enter** or **Option+Enter** always makes a new line.
 - **Command+Enter** always sends, even with the Enter setting off.
 
+While you are on a message rather than the typing box:
+
+- **Enter** on a voice message plays it. **Enter** again pauses it, and once more carries on from
+  where it stopped. This is the same play and pause as double-tapping the message, not a second
+  player, so the two can never disagree about what is paused.
+- **Enter** on any other message does nothing.
+
 These only apply with a hardware keyboard connected.
+
+Recording a voice reply to a particular message is not a key yet, because Thrive has no reply or
+quote feature on any client. When replies arrive, the key goes in here.
 
 ## What you hear
 

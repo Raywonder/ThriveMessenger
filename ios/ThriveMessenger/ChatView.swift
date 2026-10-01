@@ -15,6 +15,7 @@ struct ChatView: View {
     @State private var recording = false
     @State private var backStack: [String] = []
     @AccessibilityFocusState private var focusedMessage: String?
+    @FocusState private var composerFocused: Bool
     @State private var scrollTarget: String?
 
     enum SheetKind: Identifiable {
@@ -84,6 +85,7 @@ struct ChatView: View {
             }
             composer(c)
         }
+        .onKeyPress(phases: .down) { press in handleMessageReturnKey(press, c) }
         .navigationTitle(c.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -175,6 +177,7 @@ struct ChatView: View {
             TextField(editing == nil ? "Message" : "Edit message", text: $draft, axis: .vertical)
                 .lineLimit(1...5)
                 .textFieldStyle(.roundedBorder)
+                .focused($composerFocused)
                 .onChange(of: draft) { _, text in sendTyping(c, typing: !text.isEmpty) }
                 .onKeyPress(phases: .down) { press in handleReturnKey(press, c) }
             Button {
@@ -213,6 +216,20 @@ struct ChatView: View {
         guard sendsMessage, !press.modifiers.contains(.shift), !press.modifiers.contains(.option) else { return .ignored }
         guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return .ignored }
         send(c)
+        return .handled
+    }
+
+    /// Hardware keyboard Return while a message row has focus rather than the composer: play, pause
+    /// or resume the focused voice message. This goes through `AppModel.toggleVoice`, the same single
+    /// state machine the VoiceOver default action uses, so the key and the double-tap share one
+    /// player and one notion of what is paused. Plain Return only; Shift+Return is left alone until
+    /// Thrive has a reply feature to attach a voice reply to.
+    private func handleMessageReturnKey(_ press: KeyPress, _ c: Conversation) -> KeyPress.Result {
+        guard press.key == .return, GCKeyboard.coalesced != nil else { return .ignored }
+        guard !composerFocused, press.modifiers.isEmpty else { return .ignored }
+        guard let id = focusedMessage,
+              let m = c.messages.first(where: { $0.id == id }), m.voice != nil else { return .ignored }
+        model.toggleVoice(m, in: c)
         return .handled
     }
 
