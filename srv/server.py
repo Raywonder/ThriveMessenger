@@ -203,6 +203,39 @@ _INTERNAL_SCHEMA_LEAK_RE = re.compile(
     re.IGNORECASE,
 )
 _CODE_FENCE_RE = re.compile(r'```([a-zA-Z0-9_+-]*)\s*([\s\S]*?)```', re.MULTILINE)
+# Error-like bot/agent output must never reach a chat (Dom: no error text in chats).
+# Mirrors sysmon-thrive relay.py's ERROR_REPLY so both guards catch the same shapes.
+_ERROR_LIKE_REPLY_RE = re.compile(
+    r"^(something went wrong running|claude stopped|codex stopped|claude finished without|codex finished without)"
+    r"|traceback \(most recent call last\)|stopped with an error|\busage limit\b.*\b(hit|reached)\b"
+    r"|^\s*[\[{]\s*\"?(error|type)\"?\s*:|\b(ECONNREFUSED|ETIMEDOUT|EAI_AGAIN)\b|\bHTTP (4|5)\d\d\b",
+    re.IGNORECASE | re.DOTALL)
+
+def _looks_like_error_reply(text):
+    raw = str(text or "")
+    return (not raw.strip()) or bool(_ERROR_LIKE_REPLY_RE.search(raw[:600]))
+
+_APP_HEALTH_CLIENT = None
+
+def _app_health_client():
+    """Best-effort, never raises: a missing/broken app_health module must never affect chat."""
+    global _APP_HEALTH_CLIENT
+    if _APP_HEALTH_CLIENT is None:
+        try:
+            from app_health import AppHealth
+            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".app_health")
+            _APP_HEALTH_CLIENT = AppHealth("thrive", "ah1-thrive-c0ce2f6aebba73a2", "server", data_dir=data_dir)
+        except Exception:
+            _APP_HEALTH_CLIENT = False
+    return _APP_HEALTH_CLIENT or None
+
+def _report_blocked_bot_reply(reason, excerpt):
+    try:
+        client = _app_health_client()
+        if client:
+            client.report_error("error", "blocked bot reply (%s): %s" % (reason, excerpt), stage="runtime")
+    except Exception:
+        pass
 
 def _strip_internal_markup(text):
     text = re.sub(r'<invoke\b[\s\S]*?</invoke>', '', text, flags=re.IGNORECASE)
@@ -266,6 +299,9 @@ def _user_facing_bot_output(text):
         return "", True, "sanitized-json-tool-payload"
     if _INTERNAL_SCHEMA_LEAK_RE.search(cleaned):
         return "", True, "sanitized-internal-schema-or-message-metadata"
+    if _looks_like_error_reply(cleaned):
+        _report_blocked_bot_reply("error-like-reply", cleaned[:200])
+        return "", True, "error-like-reply"
     return cleaned, False, None
 
 def _message_too_long(text, max_chars):
@@ -861,6 +897,35 @@ def _deliver_pending_bot_messages(sock, username):
                 delivered += 1
             con = sqlite3.connect(DB)
             con.execute("DELETE FROM pending_bot_messages WHERE msg_uid=?", (uid,))
+            con.execute("UPDATE direct_message_history SET delivered=1, delivered_at=COALESCE(delivered_at, ?) WHERE msg_uid=?", (_iso_utc_now(), uid))
+            con.commit(); con.close()
+        except Exception:
+            break
+    if delivered:
+        _clear_unreachable_notices(username)
+    return delivered
+
+def _deliver_pending_offline_messages(sock, username):
+    """DMs kept while a human recipient was offline, delivered in order when they sign in."""
+    con = sqlite3.connect(DB)
+    try:
+        rows = con.execute(
+            "SELECT p.msg_uid, h.frm, h.to_user, h.body, h.created_at, h.deleted_at, h.transcript FROM pending_offline_messages p "
+            "JOIN direct_message_history h ON h.msg_uid = p.msg_uid WHERE lower(p.to_user)=lower(?) ORDER BY h.id", (username,)).fetchall()
+    finally:
+        con.close()
+    delivered = 0
+    for uid, frm, to_user, body, created_at, deleted_at, transcript in rows:
+        try:
+            if not deleted_at:
+                payload = {"action": "msg", "from": frm, "to": to_user, "msg": body, "id": uid,
+                          "time": created_at + "Z", "server_time": created_at + "Z", "delayed": True}
+                if transcript:
+                    payload["transcript"] = transcript
+                _send_json_line(sock, payload)
+                delivered += 1
+            con = sqlite3.connect(DB)
+            con.execute("DELETE FROM pending_offline_messages WHERE msg_uid=?", (uid,))
             con.execute("UPDATE direct_message_history SET delivered=1, delivered_at=COALESCE(delivered_at, ?) WHERE msg_uid=?", (_iso_utc_now(), uid))
             con.commit(); con.close()
         except Exception:
@@ -4408,6 +4473,7 @@ def init_db():
     )''')
     cur.execute("CREATE TABLE IF NOT EXISTS pending_voicemail (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS pending_bot_messages (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
+    cur.execute("CREATE TABLE IF NOT EXISTS pending_offline_messages (msg_uid TEXT PRIMARY KEY, to_user TEXT NOT NULL, created_at TEXT NOT NULL)")
     cur.execute("CREATE TABLE IF NOT EXISTS link_titles (url TEXT PRIMARY KEY, title TEXT, fetched_at REAL)")
     _init_reactions(cur)
     cur.execute('''CREATE TABLE IF NOT EXISTS bot_message_cursors (
@@ -5378,6 +5444,7 @@ def handle_client(cs, addr):
         # Voicemail left while this user was offline arrives shortly after sign-in.
         threading.Timer(2.0, _deliver_pending_voicemail, args=(sock, user)).start()
         threading.Timer(2.5, _deliver_pending_bot_messages, args=(sock, user)).start()
+        threading.Timer(2.5, _deliver_pending_offline_messages, args=(sock, user)).start()
 
         # Optional alert to the existing signed-in device when another login happens.
         if prior_sock and prior_sock is not sock:
@@ -6905,6 +6972,7 @@ def handle_client(cs, addr):
                 attachment_path = None
                 queued_voicemail = False
                 queued_for_bot = False
+                queued_offline = False
                 is_voicemail = bool(voice_mp3 is not None and msg.get("voice", {}).get("voicemail"))
                 bot_text = msg.get("msg", "")
                 if voice_mp3 is not None and _is_virtual_bot(to):
@@ -6922,6 +6990,9 @@ def handle_client(cs, addr):
                     elif _is_registered_bot(to) and not _is_virtual_bot(to):
                         # An outside bot/agent that signs in by itself (e.g. Adam): keep it for when it's back.
                         queued_for_bot = True
+                    elif _canonical_username(to):
+                        # A real human account that's simply offline right now: keep the DM for next sign-in.
+                        queued_offline = True
                     else:
                         reason = f"{to} is offline."
                 else:
@@ -6935,7 +7006,10 @@ def handle_client(cs, addr):
                         except Exception:
                             pass
                     if not delivered_to_user:
-                        reason = f"{to} is offline."
+                        if _canonical_username(to):
+                            queued_offline = True
+                        else:
+                            reason = f"{to} is offline."
                     # Keep the virtual-bot fallback, while allowing every live agent
                     # session to receive and claim the same incoming event first.
                     if delivered_to_user and _is_virtual_bot(to):
@@ -6947,7 +7021,7 @@ def handle_client(cs, addr):
                         threading.Thread(target=_deliver_agent_voice_transcript, name=f"agent-voice-transcript-{to}",
                                          daemon=True, args=(to, msg["id"], attachment_path, frm,
                                                             msg.get("voice", {}).get("duration"), is_voicemail)).start()
-                if not reason or handled_by_bot or _is_registered_bot(to):
+                if not reason or handled_by_bot or _is_registered_bot(to) or queued_offline:
                     _record_direct_message_history(
                         frm,
                         to,
@@ -6966,6 +7040,14 @@ def handle_client(cs, addr):
                         if _first_unreachable_notice(frm, to):
                             _send_json_line(sock, {"action": "msg_failed", "to": to, "queued": True,
                                                    "reason": f"{to} isn't connected right now; your message will be delivered when {to} is back."})
+                    if queued_offline:
+                        con = sqlite3.connect(DB)
+                        con.execute("INSERT OR REPLACE INTO pending_offline_messages(msg_uid, to_user, created_at) VALUES(?,?,?)",
+                                    (msg["id"], to, _iso_utc_now()))
+                        con.commit(); con.close()
+                        if _first_unreachable_notice(frm, to):
+                            _send_json_line(sock, {"action": "msg_failed", "to": to, "queued": True,
+                                                   "reason": f"{to} is offline; your message will be delivered when {to} is back."})
                     if queued_voicemail:
                         con = sqlite3.connect(DB)
                         con.execute("INSERT OR REPLACE INTO pending_voicemail(msg_uid, to_user, created_at) VALUES(?,?,?)",
