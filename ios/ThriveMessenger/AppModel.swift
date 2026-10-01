@@ -79,8 +79,13 @@ final class AppModel {
     private var titlesAsked = Set<String>()
     private var pendingReaction: (String, String, Bool)?
     var voicePlayer = VoicePlayer()
-    private var pendingVoice: String?
-    private var pendingVoiceLabel = "Voice message"
+    /// Voice fetches still in the air, server id -> the label to announce it with. Keyed by id, not one
+    /// slot: two fetches can overlap, and a single slot silently threw away whichever one didn't come
+    /// back first, leaving that message unplayable for good.
+    private var pendingVoice: [String: String] = [:]
+    /// The id the user activated most recently. Only that one starts playing by itself when it lands --
+    /// an older arrival is still cached, but playing it would talk over whatever is playing now.
+    private var latestVoiceRequest: String?
     /// Feature switches the server reports in `feature_caps`; actions that need one stay hidden until it says so.
     var featureCaps: [String: FeatureCap] = [:]
     /// Set by the contact-row "Voice message" action: the chat opens and starts recording straight away.
@@ -363,9 +368,9 @@ final class AppModel {
             voicePlayer.toggle(id: v.serverID, data: data, label: label)
             return
         }
-        guard pendingVoice != v.serverID else { return }   // already fetching it; don't ask twice
-        pendingVoice = v.serverID
-        pendingVoiceLabel = label
+        latestVoiceRequest = v.serverID                      // what to start playing when the bytes land
+        guard pendingVoice[v.serverID] == nil else { return } // already fetching it; don't ask twice
+        pendingVoice[v.serverID] = label
         Announce.say("Getting the voice message")
         switch c.kind {
         case .direct: send(["action": "voice_fetch", "id": v.serverID])
@@ -543,13 +548,19 @@ final class AppModel {
         case "link_titles":
             for (u, t) in obj["titles"] as? [String: String] ?? [:] where !t.isEmpty { linkTitles[u] = t }
         case "voice_data", "group_room_voice_data":
-            let id = (obj["id"] ?? obj["message_id"]) as? String
-            guard id == pendingVoice else { return }
-            pendingVoice = nil
+            let id = (obj["id"] ?? obj["message_id"]) as? String ?? ""
+            // Any id we asked for, not just the newest one: a fetch that lost the race still has to be
+            // kept, or that message could never be played again.
+            guard let label = pendingVoice.removeValue(forKey: id) else { return }
+            let isLatest = id == latestVoiceRequest
+            if isLatest { latestVoiceRequest = nil }
             if obj["ok"] as? Bool == true, let b64 = obj["b64"] as? String, let data = Data(base64Encoded: b64) {
-                voicePlayer.store(id ?? "", data)
-                voicePlayer.play(id: id ?? "", data: data, label: pendingVoiceLabel)
-            } else { Announce.say("This voice message isn't available any more.") }
+                voicePlayer.store(id, data)
+                // Only what the user asked for last starts playing; an older arrival waits to be activated.
+                if isLatest { voicePlayer.play(id: id, data: data, label: label) }
+            } else if isLatest {
+                Announce.say("This voice message isn't available any more.")
+            }
         case "typing":
             guard let from = obj["from"] as? String else { return }
             let c = conversation(.direct(from))

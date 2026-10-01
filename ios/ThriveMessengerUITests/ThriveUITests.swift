@@ -103,6 +103,47 @@ final class ThriveUITests: XCTestCase {
         try app.performAccessibilityAudit(for: [.sufficientElementDescription, .hitRegion]) { _ in false }
     }
 
+    /// Does the contact row survive being a `NavigationLink` label? `ContactsView.list` puts
+    /// `.accessibilityElement(children: .ignore)`, the merged label, `.accessibilityActions` and
+    /// `.contextMenu` on the inner `VStack`, and SwiftUI folds a link's label into the link's own element.
+    /// What we want is the link's Button carrying our merged label -- then the actions attached beside
+    /// that label are on the element VoiceOver lands on. What we do not want is the Button falling back
+    /// to reading its raw contents, which is what happens if these modifiers are moved out onto the link.
+    /// XCUITest can't enumerate rotor custom actions, so this doesn't replace the device pass.
+    func testContactRowIsOneMergedActivatableElement() throws {
+        try signIn()
+        let peer = try XCTUnwrap(env["THRIVE_PEER"])
+
+        let buttons = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", peer))
+        XCTAssertTrue(buttons.firstMatch.waitForExistence(timeout: 15), "contact row for \(peer)")
+        let rows = buttons.allElementsBoundByIndex
+        for e in rows { print("CONTACT ROW BUTTON: label=\(e.label) hittable=\(e.isHittable)") }
+        XCTAssertEqual(rows.count, 1, "one row element, got \(rows.map(\.label))")
+
+        let row = rows[0]
+        // "<user>, online/offline[, status][, N unread]". The throwaway peer has no status and no unread,
+        // and its status text is just the presence word, which `rowLabel` folds away instead of repeating.
+        XCTAssertTrue(row.label == "\(peer), offline" || row.label == "\(peer), online",
+                      "merged label on the link's own element, got \(row.label)")
+        XCTAssertTrue(row.isHittable, "row is reachable")
+        // The raw subtitle must not be what the row reads; that would mean our label never reached it.
+        XCTAssertFalse(row.label.contains("Offline") || row.label.contains("Online"),
+                       "row is reading its raw contents instead of the merged label: \(row.label)")
+
+        try app.performAccessibilityAudit(for: [.sufficientElementDescription, .hitRegion]) { issue in
+            print("AUDIT Chats: \(issue.auditType) \(issue.compactDescription)")
+            return true   // reported, not failed: this run is here to say what the audit sees
+        }
+
+        row.tap()
+        XCTAssertTrue(app.textFields["Message"].waitForExistence(timeout: 15),
+                      "activating the merged element still navigates into the chat")
+        try app.performAccessibilityAudit(for: [.sufficientElementDescription, .hitRegion]) { issue in
+            print("AUDIT Chat: \(issue.auditType) \(issue.compactDescription)")
+            return true
+        }
+    }
+
     /// Settings root is only categories with a hint each; a category opens its own screen with segmented tabs.
     func testSettingsCategoriesAndTabs() throws {
         try signIn()

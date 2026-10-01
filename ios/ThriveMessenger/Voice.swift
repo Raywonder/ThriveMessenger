@@ -11,6 +11,8 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
     /// When the last toggle was accepted. With VoiceOver on and a hardware keyboard, one Return can
     /// reach the app twice -- once as accessibilityActivate() and once as the raw key press -- and
     /// that would play and then instantly pause. Nobody presses twice on purpose this fast.
+    /// It only ever suppresses a repeat of the message that is already loaded: swiping to a different
+    /// message and double-tapping straight away is a real request, not the duplicate we are collapsing.
     private var lastToggle: Date = .distantPast
     private static let toggleDebounce: TimeInterval = 0.25
 
@@ -22,7 +24,7 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
     /// Same message playing -> pause. Same message paused -> resume. Anything else -> start from 0:00.
     func toggle(id: String, data: Data, label: String) {
         let now = Date()
-        guard now.timeIntervalSince(lastToggle) > Self.toggleDebounce else { return }
+        guard id != loadedID || now.timeIntervalSince(lastToggle) > Self.toggleDebounce else { return }
         lastToggle = now
         if let live = player, loadedID == id, !id.isEmpty {
             if live.isPlaying {

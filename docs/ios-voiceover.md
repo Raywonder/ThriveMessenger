@@ -20,7 +20,8 @@ Swipe up or down with one finger on a contact to hear its actions:
 
 Touch and hold a contact for the same list without VoiceOver.
 
-Each contact reads as "name, online or offline, status, how many unread".
+Each contact reads as "name, online or offline, status, how many unread". When the status is just
+the word "online" or "offline", or already starts with it, it is not said twice.
 
 ## Messages in a chat
 
@@ -33,6 +34,12 @@ Each message is one item that reads "sender, time, text, links, reactions, statu
 - double-tap the same voice message again to pause it, and again to carry on from where it stopped
 
 There is no separate "Play voice message" action. Playing is what activating a voice message does.
+
+The first time you activate a voice message it says "Getting the voice message" while it is fetched.
+You can go on and activate another one before the first arrives: the one you asked for **last** is the
+one that starts playing, and the other is kept, so activating it plays it straight away with nothing to
+wait for. Activating a different voice message while one is playing always switches to it, however
+quickly you do it.
 
 With a hardware keyboard you can press **Enter** on the message instead of double-tapping it. See
 Hardware keyboard below.

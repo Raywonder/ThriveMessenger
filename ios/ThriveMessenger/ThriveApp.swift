@@ -114,9 +114,11 @@ struct ContactsView: View {
                     Text(c.online ? (c.statusText.isEmpty ? "Online" : c.statusText) : "Offline").font(.subheadline).foregroundStyle(.secondary)
                 }
                 .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(c.user), \(c.online ? "online" : "offline")\(c.statusText.isEmpty ? "" : ", \(c.statusText)")\(c.unread > 0 ? ", \(c.unread) unread" : "")")
-                // Both of these go on the VStack that owns the accessibility element. Attached to the
-                // NavigationLink instead, they never reach the Actions rotor.
+                .accessibilityLabel(rowLabel(c))
+                // Both of these go on the VStack that owns the accessibility element. Confirmed on the
+                // simulator: with them here the NavigationLink's own Button element takes over this label,
+                // so the row is one item. Moved out onto the NavigationLink instead, the Button falls back
+                // to reading its raw contents ("a11ytest_b, Offline") and the label set here is lost.
                 .accessibilityActions { actions(c) }
                 .contextMenu { actions(c) }
             }
@@ -135,6 +137,24 @@ struct ContactsView: View {
 
     private var removingConfirm: Binding<Bool> {
         Binding(get: { removing != nil }, set: { if !$0 { removing = nil } })
+    }
+
+    /// "<user>, online/offline[, status][, N unread]". The server's status text usually starts with the
+    /// presence word already ("offline", "online - AI chat assistant ..."), and saying both made every row
+    /// read "a11ytest_b, offline, offline" / "Clawdia, online, online - AI chat assistant ...". When the
+    /// status already covers presence, it speaks for itself.
+    private func rowLabel(_ c: Contact) -> String {
+        let presence = c.online ? "online" : "offline"
+        let status = c.statusText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var parts = [c.user]
+        if status.lowercased().hasPrefix(presence) {
+            parts.append(status)
+        } else {
+            parts.append(presence)
+            if !status.isEmpty { parts.append(status) }
+        }
+        if c.unread > 0 { parts.append("\(c.unread) unread") }
+        return parts.joined(separator: ", ")
     }
 
     /// Same set for touch (context menu) and VoiceOver (Actions rotor). Every one of them speaks a result.

@@ -175,6 +175,7 @@ struct SettingsCategoryView: View {
                 Text("Double-tap a message to use it: a message with one link opens that link, and a voice message starts playing. Double-tap the same voice message again to pause it, and once more to carry on from where it stopped.")
                 Text("Swipe up or down with one finger on a message to hear its other actions: Copy, React, Thumbs up, Links in this message, and Edit or Delete for everyone on your own recent messages.")
                 Text("There is no separate Play action. Playing is what activating a voice message does.")
+                Text("You can activate one voice message while another is still being fetched. The one you asked for last starts playing, and the other is kept ready, so activating it plays it straight away.")
                 Text("With a hardware keyboard you can press Enter on the message instead of double-tapping it.")
             } header: { Text("In a chat").accessibilityAddTraits(.isHeader) } footer: {
                 Text("Messages are marked read for you automatically a few seconds after you reach them.")
@@ -202,6 +203,9 @@ struct SettingsCategoryView: View {
                 Text("The \"Seen\" reaction is gone. Thrive already tells the sender you've read a message a few seconds after you reach it.")
                 Text("Contacts in the Chats list now have actions: Message, Voice message, Call, Add to group, Block, Remove contact and Copy username.")
                 Text("With a hardware keyboard, Enter on a voice message plays, pauses and resumes it, so you don't have to double-tap.")
+                Text("Fixed: asking for a second voice message before the first arrived left the first one silent for good. Both are kept now.")
+                Text("Fixed: moving to another voice message and activating it straight away was sometimes ignored, with nothing spoken.")
+                Text("Fixed: contacts whose status is just \"online\" or \"offline\" read the word twice.")
             } header: { Text("What's new in this version").accessibilityAddTraits(.isHeader) } footer: {
                 Text("Version \(appVersion).")
             }
