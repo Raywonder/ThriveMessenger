@@ -45,6 +45,8 @@ Each conversation has three tabs:
 - Activate a message row (Enter or double-click) to open its link. If the message has no link, Enter opens the full message in a read-only text box you can read line by line; Escape closes it.
 - The context menu (Applications key or Shift+F10) on a message row also has "View Full Message".
 - If multiple links are present, the first one opens.
+- The same context menu has **Copy Link** and **Open Link** next to Copy Message, for picking a specific link. With one link, each acts on it directly; with more than one, each opens a submenu listing the links by URL.
+- Not yet done: showing a page title instead of the raw URL (in the submenu and when arrowing through history), and VoiceOver custom actions for links on iOS/Mac.
 
 ## Messages: Copy, Edit and Delete
 - **Copy Message** (Control+C on a message) copies it to the clipboard and says "Copied".
@@ -111,5 +113,7 @@ Each conversation has three tabs:
 
 ## Notes
 - You can sign in to the same Thrive account on more than one device or approved agent session at once. New direct messages sync to every live session. For agent accounts, the worker that will handle a message claims it first; the other sessions see that claim and do not send a duplicate reply. Read receipts stay shared across your devices.
+- A DM sent to you while you were offline is held and delivered as a normal message the next time you sign in, instead of being lost.
+- A brand-new account's contact list starts empty; you get a one-time offer to search for people to add, or skip it.
 - Server-side account permissions are enforced by each server.
 - This build includes TappedIn server defaults and multi-server profile selection.

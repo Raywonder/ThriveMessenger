@@ -20,6 +20,8 @@ You can create an account from the Thrive Messenger login dialog, or a server ad
 
 Please note: for both security and convenience, if the server you're using has SMTP enabled (see below), you are required to enter a valid email address when creating an account. This is so your account can be verified by email and you can easily reset your password if you forget it.
 
+A new account's contact list starts empty, the same way it always used to; it is never auto-filled with bot contacts. The first time you sign in with no contacts yet, you're offered a one-time choice to search the user directory for people to add, or skip it. This is on by default; server owners can turn it off for the whole server with the `suggest_contact_search_for_new_users` server setting (no console command yet - set it directly in the `server_settings` table until the admin settings GUI/console work lands).
+
 ### Running from source
 
 Note: these instructions are for running Thrive Messenger on Windows.
@@ -158,6 +160,7 @@ When you log into Thrive Messenger, you will land on your contact list. Of cours
 * Alt + U will allow you to set an online status that your contacts will see. You can choose from a list of preset statuses, such as online, offline and busy, or you can choose a custom one and type a personal message. Server owners can customize the character limit for custom statuses via max_status_length, so check that you have enough characters before you start setting System of a Down lyrics as your status.
 * Alt P will check for updates to the program and allow you to auto download them.
 * Pressing Alt F4 will minimize the client to the system tray, ready for you to receive messages. Simply double click or press Enter on the Thrive Messenger system tray item to bring it back up.
+* The message context menu (Applications key or Shift+F10 on a message) has **Copy Link** and **Open Link** next to Copy Message, for any message that has one or more links. With one link, each copies or opens it directly; with more than one, each opens a submenu listing the links so you can pick which one.
 
 ### Message length
 
@@ -206,6 +209,7 @@ Key behavior:
 * Admins can edit and save their own bot rule override from the client UI.
 * Non-admin users can view active bot rules, but cannot edit them.
 * Reset action restores a bot back to global seeded rules for that admin scope.
+* A bot/agent reply that looks like an error (a traceback, "usage limit reached", a raw HTTP/JSON error) is never sent to chat; it's reported to app-health instead, same as any other internal tool/schema noise the server already strips from bot output.
 
 ### Advanced group chat policy controls
 
@@ -326,7 +330,7 @@ The user directory, Alt + Y, allows you to quickly find and chat with anyone on 
 
 ### Offline chats
 
-Think you might have missed messages when you were offline? No problem. When you log back in, the program will check the server for held messages, and if it sees any, will show a dialog asking if you want to see the messages. Clicking yes will show a list of users who sent you messages. Simple press enter on a user to open the chat and see their messages.
+Think you might have missed messages when you were offline? No problem. A direct message sent to you while you were offline isn't dropped: the server holds it and delivers it as a normal message, the next time you sign in, same as it already did for voicemail and for outside bot/agent accounts like Adam.
 
 ### Non-contact chats
 
