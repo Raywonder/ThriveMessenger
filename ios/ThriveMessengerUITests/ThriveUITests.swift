@@ -25,6 +25,22 @@ final class ThriveUITests: XCTestCase {
         pw.typeText(pass)
         app.buttons["Sign in"].tap()
         XCTAssertTrue(app.tabBars.buttons["Chats"].waitForExistence(timeout: 45), "signed in")
+        dismissSavePasswordPrompt()
+    }
+
+    /// DIV-132. A sign-in form with `.textContentType(.password)` makes iOS offer to save the password,
+    /// and from iOS 26 that offer is a modal card in a window above the app. While it is up nothing in the
+    /// app can be touched: every element computes a hit point of {-1, -1}, a raw coordinate tap is swallowed
+    /// by the dimming view, and `app.screenshot()` does not show the card at all, because it is drawn out of
+    /// process. That combination reads exactly like "the app has stopped responding to touch", which is what
+    /// it was first reported as. Its two buttons carry no accessibility labels we can see, so "Not Now" is
+    /// tapped by position in the card's own frame. iOS only offers once per password, so a run that is not
+    /// offered the card is normal, not a failure.
+    private func dismissSavePasswordPrompt() {
+        let card = app.sheets["Save Password?"]
+        guard card.waitForExistence(timeout: 10) else { return }
+        card.coordinate(withNormalizedOffset: CGVector(dx: 0.27, dy: 0.85)).tap()
+        XCTAssertTrue(card.waitForNonExistence(timeout: 10), "Save Password card dismissed")
     }
 
     func testChatRoomsAndVoiceOverLabels() throws {
@@ -169,6 +185,12 @@ final class ThriveUITests: XCTestCase {
         let notif = app.buttons["settings.category.notifications"]
         print("CATEGORY LABEL: \(notif.label) | VALUE: \(notif.value ?? "")")
         XCTAssertEqual(notif.value as? String, "What you hear when messages arrive.")
+        // One element per category, the same rule the contact rows follow. These overrides used to sit on
+        // the NavigationLink itself, which left the link's own Button nested inside a second, non-activatable
+        // element: VoiceOver read the row correctly and then could not open it. DIV-132.
+        XCTAssertEqual(notif.descendants(matching: .button).count, 0,
+                       "category row is one element, not a button inside a button")
+        XCTAssertTrue(notif.isHittable, "category row is reachable")
         try app.performAccessibilityAudit(for: [.sufficientElementDescription, .hitRegion]) { _ in false }
         notif.tap()
         XCTAssertTrue(app.navigationBars["Notifications"].waitForExistence(timeout: 5), "category screen")

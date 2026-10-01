@@ -58,12 +58,14 @@ struct SettingsView: View {
                             }
                         }
                         .padding(.vertical, 2)
+                        // On the label, not on the link. Put on the link instead, SwiftUI keeps the link's
+                        // own Button as a child and adds a second, non-activatable element around it, so
+                        // VoiceOver lands on a row it cannot open. Same rule as the contact rows. DIV-132.
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(cat.title)
+                        .accessibilityValue(cat.hint)
+                        .accessibilityHint("Opens \(cat.title) settings.")
                     }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(cat.title)
-                    .accessibilityValue(cat.hint)
-                    .accessibilityHint("Opens \(cat.title) settings.")
-                    .accessibilityAddTraits(.isButton)
                     .accessibilityIdentifier("settings.category.\(cat.rawValue)")
                 }
             } footer: {
@@ -206,6 +208,7 @@ struct SettingsCategoryView: View {
                 Text("Fixed: asking for a second voice message before the first arrived left the first one silent for good. Both are kept now.")
                 Text("Fixed: moving to another voice message and activating it straight away was sometimes ignored, with nothing spoken.")
                 Text("Fixed: contacts whose status is just \"online\" or \"offline\" read the word twice.")
+                Text("Fixed: the Settings categories read as two items each, and the one VoiceOver landed on couldn't be opened. Each category is one item again.")
             } header: { Text("What's new in this version").accessibilityAddTraits(.isHeader) } footer: {
                 Text("Version \(appVersion).")
             }
