@@ -138,9 +138,23 @@ final class ThriveUITests: XCTestCase {
         row.tap()
         XCTAssertTrue(app.textFields["Message"].waitForExistence(timeout: 15),
                       "activating the merged element still navigates into the chat")
+
+        // The composer's mic and send buttons are bare SF Symbols, so their touch target used to be the
+        // ~20 x 19pt glyph. They now carry a 44pt frame plus a matching contentShape on the label; the
+        // drawn icons are unchanged. Checked directly as well as through the audit, because the send
+        // button is disabled on an empty draft and the audit may skip disabled elements.
+        for name in ["Record voice message", "Send"] {
+            let b = app.buttons[name]
+            XCTAssertTrue(b.waitForExistence(timeout: 5), "composer button \(name)")
+            XCTAssertGreaterThanOrEqual(b.frame.width, 44, "\(name) hit width is \(b.frame.width)")
+            XCTAssertGreaterThanOrEqual(b.frame.height, 44, "\(name) hit height is \(b.frame.height)")
+        }
+
         try app.performAccessibilityAudit(for: [.sufficientElementDescription, .hitRegion]) { issue in
             print("AUDIT Chat: \(issue.auditType) \(issue.compactDescription)")
-            return true
+            // A hit-region issue on the chat screen is a regression of the composer fix, so fail on it.
+            // Everything else stays report-only, the way this run was written.
+            return issue.auditType != .hitRegion
         }
     }
 

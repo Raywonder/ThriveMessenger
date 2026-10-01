@@ -2,6 +2,15 @@ import GameController
 import SafariServices
 import SwiftUI
 
+/// Composer layout constants.
+private enum Composer {
+    /// Apple's minimum touch target (Human Interface Guidelines). The composer's mic and send
+    /// buttons are bare SF Symbols, so without this their tappable area is only the ~20pt glyph.
+    /// Applied to the button *label* with a matching `contentShape`, so the hit rect grows while
+    /// the drawn icon stays its natural size.
+    static let minHitTarget: CGFloat = 44
+}
+
 /// One conversation (direct or room). Every message is a single VoiceOver element that reads
 /// "sender, time, text, links, reactions, status", with actions for everything the desktop menu offers.
 struct ChatView: View {
@@ -184,12 +193,16 @@ struct ChatView: View {
                 Task { await toggleRecording(c) }
             } label: {
                 Image(systemName: recording ? "stop.circle.fill" : "mic.circle")
+                    .frame(minWidth: Composer.minHitTarget, minHeight: Composer.minHitTarget)
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel(recording ? "Stop and send voice message" : "Record voice message")
             Button {
                 send(c)
             } label: {
                 Image(systemName: "paperplane.fill")
+                    .frame(minWidth: Composer.minHitTarget, minHeight: Composer.minHitTarget)
+                    .contentShape(Rectangle())
             }
             .accessibilityLabel(editing == nil ? "Send" : "Save edit")
             .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
