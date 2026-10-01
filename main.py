@@ -7281,9 +7281,13 @@ class ChatDialog(wx.Dialog):
             return
         row = self._history_rows[idx]
         can_edit = self._can_edit_row(row)
+        links = extract_urls(str(row.get("text", "") or ""))
         menu = wx.Menu()
         mi_view = menu.Append(wx.ID_ANY, "View Full Message")
         mi_copy = menu.Append(wx.ID_ANY, "&Copy Message\tCtrl+C")
+        if links:
+            self._add_link_submenu(menu, links, "Copy Lin&k", self.on_copy_link)
+            self._add_link_submenu(menu, links, "&Open Link", self.on_open_link)
         # Edit only appears for your own messages (or any message, for admins); nobody else can edit them.
         mi_edit = menu.Append(wx.ID_ANY, "&Edit Message") if can_edit else None
         mi_remove = menu.Append(wx.ID_ANY, "&Delete Message\tDelete")
@@ -7297,6 +7301,29 @@ class ChatDialog(wx.Dialog):
         self.Bind(wx.EVT_MENU, self.on_undo_last_deleted_message, mi_undo)
         self.PopupMenu(menu)
         menu.Destroy()
+    def _add_link_submenu(self, menu, links, label, handler):
+        """One item that acts on the only link, or a submenu listing each link when there's more than one."""
+        if len(links) == 1:
+            mi = menu.Append(wx.ID_ANY, label)
+            self.Bind(wx.EVT_MENU, lambda evt, u=links[0]: handler(u), mi)
+            return
+        sub = wx.Menu()
+        for url in links:
+            caption = url if len(url) <= 70 else url[:67] + "..."
+            smi = sub.Append(wx.ID_ANY, caption)
+            self.Bind(wx.EVT_MENU, lambda evt, u=url: handler(u), smi)
+        menu.AppendSubMenu(sub, label)
+    def on_copy_link(self, url):
+        copied = False
+        if wx.TheClipboard.Open():
+            try:
+                copied = bool(wx.TheClipboard.SetData(wx.TextDataObject(url)))
+                wx.TheClipboard.Flush()
+            finally:
+                wx.TheClipboard.Close()
+        speak_text("Copied link" if copied else "Could not copy the link", interrupt=True)
+    def on_open_link(self, url):
+        speak_text("Opening link" if open_path_or_url(url) else "Could not open the link", interrupt=True)
     def on_view_selected_message(self, _=None):
         idx = self._selected_history_index()
         if idx is None:
@@ -7501,7 +7528,11 @@ class ChatDialog(wx.Dialog):
         if event.GetKeyCode() in (wx.WXK_RETURN, wx.WXK_NUMPAD_ENTER):
             idx = self.hist.GetSelection()
             if idx != wx.NOT_FOUND:
-                self.on_history_item_activated(event)
+                links = extract_urls(str(self._history_rows[idx].get("text", "") or ""))
+                if len(links) == 1:
+                    self.on_open_link(links[0])
+                else:
+                    self.on_history_item_activated(event)
             return
         event.Skip()
     def set_typing_label(self, username, is_typing):
