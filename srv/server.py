@@ -31,6 +31,11 @@ client_statuses = {}
 session_preferences = {}
 lock = threading.Lock()
 
+# Version 2 status is separate from connection state. A user can be away or
+# busy while all devices remain online; Invisible alone hides live presence.
+STATUS_KINDS = ("available", "away", "busy", "dnd", "invisible")
+STATUS_LABELS = {"available": "available", "away": "away", "busy": "busy", "dnd": "do not disturb", "invisible": "invisible"}
+
 def _parse_duration_seconds(text, default_seconds):
     text = str(text or "").strip().lower()
     if not text:
@@ -2942,16 +2947,90 @@ def _active_usernames():
 def _is_online_user(username):
     return username in _active_usernames()
 
+def _status_record(username):
+    """Return a durable v2 status, resetting an expired temporary choice."""
+    default = {"kind": "available", "custom_text": "", "expires_at": ""}
+    if not username:
+        return default
+    con = sqlite3.connect(DB)
+    try:
+        row = con.execute("SELECT kind, custom_text, expires_at FROM user_status WHERE username=?", (username,)).fetchone()
+        if not row:
+            return default
+        kind, custom_text, expires_at = str(row[0] or "available"), str(row[1] or ""), str(row[2] or "")
+        if expires_at:
+            try:
+                until = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=datetime.timezone.utc)
+                if until <= datetime.datetime.now(datetime.timezone.utc):
+                    con.execute("UPDATE user_status SET kind='available', custom_text='', expires_at='', updated_at=? WHERE username=?",
+                                (datetime.datetime.utcnow().isoformat() + "Z", username))
+                    con.commit()
+                    return default
+            except ValueError:
+                return default
+        return {"kind": kind if kind in STATUS_KINDS else "available", "custom_text": custom_text, "expires_at": expires_at}
+    finally:
+        con.close()
+
+def _status_text(status):
+    label = STATUS_LABELS.get(status.get("kind"), "available")
+    custom = str(status.get("custom_text") or "").strip()
+    return f"{label}: {custom}" if custom else label
+
+def _contact_is_visible(user):
+    return _is_online_user(user) and _status_record(user).get("kind") != "invisible"
+
+def _status_payload(user, online=None):
+    status = _status_record(user)
+    visible = _contact_is_visible(user) if online is None else bool(online)
+    return {"action": "contact_status", "user": user, "online": visible,
+            "status_text": _status_text(status) if visible else "offline",
+            "presence": status["kind"], "custom_status": status["custom_text"], "expires_at": status["expires_at"]}
+
+def _save_status(user, kind, custom_text="", expires_at=""):
+    kind = str(kind or "available").strip().lower()
+    if kind not in STATUS_KINDS:
+        return None, "Unknown status."
+    custom_text = str(custom_text or "").strip()[:max_status_length]
+    expires_at = str(expires_at or "").strip()
+    if expires_at:
+        try:
+            until = datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=datetime.timezone.utc)
+            if until <= datetime.datetime.now(datetime.timezone.utc):
+                return None, "The clear time must be in the future."
+            if until > datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=31):
+                return None, "A temporary status can last up to 31 days."
+            expires_at = until.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            return None, "The clear time is invalid."
+    con = sqlite3.connect(DB)
+    try:
+        con.execute("INSERT INTO user_status(username, kind, custom_text, expires_at, updated_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(username) DO UPDATE SET kind=excluded.kind, custom_text=excluded.custom_text, expires_at=excluded.expires_at, updated_at=excluded.updated_at",
+                    (user, kind, custom_text, expires_at, datetime.datetime.utcnow().isoformat() + "Z"))
+        con.commit()
+    finally:
+        con.close()
+    return {"kind": kind, "custom_text": custom_text, "expires_at": expires_at}, ""
+
 def _status_for_user(username):
     if _is_registered_bot(username):
+        persisted = _status_record(username)
+        if persisted != {"kind": "available", "custom_text": "", "expires_at": ""}:
+            return _status_text(persisted)
         status = bot_status_map.get(username, "online")
         if str(username).lower() == "openclaw-bot" and username not in bot_purpose_map:
             purpose = "automation and assistant bot"
         else:
             purpose = bot_purpose_map.get(username, "")
         return f"{status} - {purpose}" if purpose else status
-    with lock:
-        return client_statuses.get(username, "online" if username in clients else "offline")
+    if not _is_online_user(username):
+        return "offline"
+    return _status_text(_status_record(username))
 
 def _gateway_natural_reply(sender_user, bot_name, text):
     lower = (text or "").strip().lower()
@@ -4453,6 +4532,10 @@ def init_db():
     cur = conn.cursor()
     # Check for columns and add if missing (Migration)
     cur.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, banned_until TEXT, ban_reason TEXT)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS user_status (
+        username TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'available', custom_text TEXT NOT NULL DEFAULT '',
+        expires_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL
+    )''')
     
     # Add new columns for email features if they don't exist
     existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(users)")]
@@ -4972,8 +5055,8 @@ def _provision_wordpress_user(username, email, is_admin=False):
         return {"status": "error", "reason": str(e)}
 
 def broadcast_contact_status(user, online):
-    status_text = _status_for_user(user) if online else "offline"
-    msg = json.dumps({"action":"contact_status","user":user,"online":online,"status_text":status_text}) + "\n"
+    payload = _status_payload(user, _contact_is_visible(user) if online else False)
+    msg = json.dumps(payload) + "\n"
     with lock:
         for owner, sock in clients.items():
             db = sqlite3.connect(DB)
@@ -4982,6 +5065,8 @@ def broadcast_contact_status(user, online):
             if r and r[0] == 0:
                 try: sock.sendall(msg.encode())
                 except: pass
+    for room_id in rooms.rooms_for_user(DB, user):
+        _room_broadcast(room_id, dict(payload, action="room_member_status"))
 
 def kick_if_banned(user):
     with lock: s = clients.get(user)
@@ -5522,16 +5607,17 @@ def handle_client(cs, addr):
         admins = get_admins()
         rows = db.execute("SELECT contact,blocked FROM contacts WHERE owner=?", (user,)).fetchall()
         contacts = [
-            {"user":c, "blocked":b, "online": _is_online_user(c), "is_admin": (c in admins), "status_text": _status_for_user(c)}
-            for c,b in rows
-            if not _should_hide_user_from_viewer(c, user)
+            dict(_status_payload(c), blocked=b, is_admin=(c in admins))
+            for c,b in rows if not _should_hide_user_from_viewer(c, user)
         ]
         sock.sendall((json.dumps({"action":"contact_list","contacts":contacts})+"\n").encode())
         _send_json_line(sock, {
             "action": "server_limits",
             "max_direct_message_length": max_direct_message_length,
             "max_status_length": max_status_length,
+            "status_protocol": 2,
         })
+        _send_json_line(sock, {"action": "my_status", **_status_record(user)})
         _send_feature_caps(sock, user)
         db.close()
 
@@ -5766,8 +5852,7 @@ def handle_client(cs, addr):
                 else:
                     con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (user, contact_to_add))
                     con.commit()
-                    is_online = _is_online_user(contact_to_add)
-                    contact_status_text = _status_for_user(contact_to_add)
+                    status_fields = _status_payload(contact_to_add)
                     admins = get_admins()
                     if is_bot:
                         _ensure_admin_bot_rules_seed(user, contact_to_add)
@@ -5776,9 +5861,12 @@ def handle_client(cs, addr):
                     contact_data = {
                         "user": contact_to_add,
                         "blocked": 0,
-                        "online": is_online,
+                        "online": status_fields["online"],
                         "is_admin": contact_to_add in admins,
-                        "status_text": contact_status_text,
+                        "status_text": status_fields["status_text"],
+                        "presence": status_fields["presence"],
+                        "custom_status": status_fields["custom_status"],
+                        "expires_at": status_fields["expires_at"],
                         "is_bot": bool(is_bot),
                         "bot_origin": "local" if _is_virtual_bot(contact_to_add) else ("external" if is_bot else "user"),
                         "bot_auth_type": _bot_auth_type(contact_to_add) if is_bot else "",
@@ -6192,8 +6280,10 @@ def handle_client(cs, addr):
                     bot_session = _bot_session_snapshot(uname) if is_bot else None
                     directory.append({
                         "user": uname,
-                        "online": _is_online_user(uname),
-                        "status_text": _status_for_user(uname),
+                        "online": _contact_is_visible(uname),
+                        "status_text": _status_for_user(uname) if _contact_is_visible(uname) else "offline",
+                        "presence": _status_record(uname)["kind"],
+                        "custom_status": _status_record(uname)["custom_text"],
                         "is_admin": uname in admins,
                         "is_contact": uname in user_contacts,
                         "is_blocked": user_contacts.get(uname, 0) == 1,
@@ -7420,8 +7510,22 @@ def handle_client(cs, addr):
                     except: pass
 
             elif action == "set_status":
-                status_text = msg.get("status_text", "online")[:max_status_length]
-                with lock: client_statuses[user] = status_text
+                # Version 2 clients send structured status. The legacy text
+                # action remains accepted so classic clients keep working.
+                if "presence" in msg or "custom_status" in msg or "expires_at" in msg:
+                    status, reason = _save_status(user, msg.get("presence"), msg.get("custom_status", ""), msg.get("expires_at", ""))
+                else:
+                    legacy = str(msg.get("status_text", "available") or "available").strip()[:max_status_length]
+                    legacy_kind = {"online": "available", "offline": "invisible", "available": "available", "away": "away", "busy": "busy", "do not disturb": "dnd", "dnd": "dnd", "invisible": "invisible"}.get(legacy.lower(), "available")
+                    legacy_custom = "" if legacy.lower() in ("online", "offline", "available", "away", "busy", "do not disturb", "dnd", "invisible") else legacy
+                    status, reason = _save_status(user, legacy_kind, legacy_custom)
+                if not status:
+                    _send_json_line(sock, {"action": "set_status_result", "ok": False, "reason": reason})
+                    continue
+                with lock:
+                    client_statuses[user] = _status_text(status)
+                _send_to_all_sessions({user}, {"action": "my_status", **status})
+                _send_json_line(sock, {"action": "set_status_result", "ok": True, **status})
                 broadcast_contact_status(user, True)
 
             elif action == "change_password":

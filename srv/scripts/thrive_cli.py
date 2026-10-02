@@ -20,7 +20,7 @@ import sqlite3
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -492,6 +492,23 @@ def cmd_send(args: argparse.Namespace) -> None:
         except socket.timeout:
             pass
         emit({"status": "ok", "sent": True, "to": args.to, "responses": responses}, args.json)
+    finally:
+        sock.close()
+
+
+def cmd_set_status(args: argparse.Namespace) -> None:
+    """Set an agent/user presence without sending a chat message."""
+    sock = login(args)
+    try:
+        expires_at = ""
+        if args.clear_after:
+            expires_at = (datetime.now(timezone.utc) + timedelta(minutes=args.clear_after)).isoformat().replace("+00:00", "Z")
+        send_json(sock, {"action": "set_status", "presence": args.presence, "custom_status": args.text or "", "expires_at": expires_at})
+        event = recv_until_action(sock, ["set_status_result"], timeout=8.0)
+        if not event.get("ok", False):
+            fail(event.get("reason") or "Status was refused.", args.json)
+        emit({"status": "ok", "presence": event.get("kind", args.presence), "text": event.get("custom_text", args.text or ""),
+              "expires_at": event.get("expires_at", expires_at)}, args.json)
     finally:
         sock.close()
 
@@ -1215,6 +1232,13 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for immediate server replies.")
     send.add_argument("--split-at", type=int, default=20000, help="Split longer messages into labelled parts (0 disables).")
     send.set_defaults(func=cmd_send)
+
+    status = sub.add_parser("set-status", help="Set Available/Away/Busy/Do not disturb/Invisible status.")
+    add_login_args(status)
+    status.add_argument("presence", choices=["available", "away", "busy", "dnd", "invisible"])
+    status.add_argument("--text", default="", help="Optional custom text shown after the status.")
+    status.add_argument("--clear-after", type=int, default=0, metavar="MINUTES", help="Clear back to Available after this many minutes.")
+    status.set_defaults(func=cmd_set_status)
 
     react = sub.add_parser("react", help="Add (or with --off remove) a reaction on a message: DM with --to, or --room.")
     add_login_args(react)

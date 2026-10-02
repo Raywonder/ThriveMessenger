@@ -81,6 +81,12 @@ Each conversation has three tabs:
 - Staff can also ask in their own words, such as "is anyone in the music rooms on community?". The answer only uses these same commands and your permissions.
 - **updates** (our server admins) lists the published VoiceLink app versions and any update problems. **unlink** removes your link.
 
+## My Status
+- Open **File > My status** to set Available, Away, Busy, Do not disturb, or Invisible (appear offline). The checked item is your current choice.
+- **Custom status...** asks for the text contacts should see and, optionally, how many minutes before Thrive clears it. **Clear status** returns to Available now.
+- Status is stored by the server, so it remains after reconnecting or signing in on another device. Contacts hear a useful label such as "Dom, busy: in a call".
+- Do not disturb keeps incoming messages visible but suppresses Thrive sounds and notifications, except for people named in your DND allow list.
+
 ## Keyboard Shortcuts
 - `F1`: Open Help
 - `Escape`: Close dialogs/chat
@@ -92,7 +98,7 @@ Each conversation has three tabs:
   - `Alt+S` Start Chat
   - `Alt+F` Send File
   - `Alt+I` Server Info
-  - `Alt+U` Set Status
+  - `Alt+U` Custom status
   - `Alt+Y` User Directory
   - `Alt+V` Server Commands (admin)
   - `Alt+T` Settings
