@@ -5,6 +5,7 @@ import webbrowser
 import keyring
 import concurrent.futures
 import hashlib
+from server_directory import fetch_signed_directory
 try:
     import wx.html2 as wxhtml2
 except Exception:
@@ -3318,13 +3319,16 @@ class ServerManagerDialog(wx.Dialog):
 
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
         add_btn = wx.Button(panel, label="Add")
+        directory_btn = wx.Button(panel, label="Refresh Public Directory")
         del_btn = wx.Button(panel, label="Remove")
         primary_btn = wx.Button(panel, label="Set as Primary")
         close_btn = wx.Button(panel, wx.ID_OK, label="Done")
         add_btn.Bind(wx.EVT_BUTTON, self.on_add)
+        directory_btn.Bind(wx.EVT_BUTTON, self.on_refresh_directory)
         del_btn.Bind(wx.EVT_BUTTON, self.on_delete)
         primary_btn.Bind(wx.EVT_BUTTON, self.on_set_primary)
         btn_row.Add(add_btn, 0, wx.RIGHT, 6)
+        btn_row.Add(directory_btn, 0, wx.RIGHT, 6)
         btn_row.Add(del_btn, 0, wx.RIGHT, 6)
         btn_row.Add(primary_btn, 0, wx.RIGHT, 6)
         btn_row.AddStretchSpacer()
@@ -3352,6 +3356,24 @@ class ServerManagerDialog(wx.Dialog):
         self.entries = dedupe_server_entries(self.entries)
         self._refresh_list()
         self.list.SetSelection(len(self.entries) - 1)
+
+    def on_refresh_directory(self, _):
+        """Refresh off the UI thread; a directory outage leaves saved servers untouched."""
+        def work():
+            try:
+                entries = [item.as_client_entry() for item in fetch_signed_directory()]
+            except Exception as exc:
+                log_event("warn", "server_directory_refresh_failed", {"error": str(exc)})
+                wx.CallAfter(wx.MessageBox, "The public server directory could not be refreshed. Your saved servers are unchanged.",
+                             "Server Directory", wx.OK | wx.ICON_INFORMATION, self)
+                return
+            def apply():
+                self.entries = dedupe_server_entries(self.entries + entries)
+                self._refresh_list()
+                wx.MessageBox("The signed public server directory was refreshed. Choose a server from this list, or add one manually.",
+                              "Server Directory", wx.OK | wx.ICON_INFORMATION, self)
+            wx.CallAfter(apply)
+        threading.Thread(target=work, daemon=True).start()
 
     def on_delete(self, _):
         idx = self.list.GetSelection()

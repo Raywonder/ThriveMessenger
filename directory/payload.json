@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "id": "im.tappedin.fm:2005",
+      "name": "TappedIn.fm",
+      "description": "The public Thrive server operated by TappedIn.fm.",
+      "host": "im.tappedin.fm",
+      "port": 2005,
+      "allows_sign_up": true,
+      "compatibility": {"classic": true, "multi_session": true, "rooms": true, "admin_gui": true, "backups": true, "transcription": true}
+    },
+    {
+      "id": "msg.thecubed.cc:2005",
+      "name": "Thrive Classic",
+      "description": "Original Thrive Messenger classic server, when it is accepting registrations.",
+      "host": "msg.thecubed.cc",
+      "port": 2005,
+      "allows_sign_up": true,
+      "compatibility": {"classic": true, "multi_session": false, "rooms": false, "admin_gui": false, "backups": false, "transcription": false}
+    }
+  ]
+}
