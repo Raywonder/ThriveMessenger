@@ -2655,11 +2655,6 @@ class ClientApp(wx.App):
         if getattr(self, 'frame', None):
             self.frame.refresh_connection_title(connected=True)
         show_notification("Reconnected", f"Connected to {self._current_server_label()}.", timeout=5)
-        try:
-            if getattr(self, 'frame', None) and self.frame.current_status != "online":
-                self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
-        except Exception:
-            pass
         threading.Thread(target=self.listen_loop, daemon=True).start()
         try:
             self.sock.sendall((json.dumps({"action": "get_feature_caps"}) + "\n").encode())
@@ -2820,9 +2815,6 @@ class ClientApp(wx.App):
         active = normalize_server_entry(getattr(self, "active_server_entry", SERVER_CONFIG))
         self.connected_server_names = {active.get("name") or active.get("host") or "Server"}
         self.frame = MainFrame(self.username, self.sock); self.frame.Show()
-        if self.frame.current_status != "online":
-            try: self.sock.sendall((json.dumps({"action": "set_status", "status_text": self.frame.current_status}) + "\n").encode())
-            except Exception: pass
         wx.CallLater(250, self.play_startup_sound)
         threading.Thread(target=self.listen_loop, daemon=True).start()
         try:
