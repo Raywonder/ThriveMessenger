@@ -162,6 +162,7 @@ struct SettingsCategoryView: View {
             Section {
                 LabeledContent("Signed in as", value: model.wrappedValue.username)
                 LabeledContent("Server", value: model.wrappedValue.server.name)
+                NavigationLink("My status") { StatusSettingsView() }
                 Button("Sign out", role: .destructive) { model.wrappedValue.signOut() }
             } header: { Text("Account").accessibilityAddTraits(.isHeader) }
         case (.profile, _):
@@ -208,6 +209,8 @@ struct SettingsCategoryView: View {
                 Text("Fixed: asking for a second voice message before the first arrived left the first one silent for good. Both are kept now.")
                 Text("Fixed: moving to another voice message and activating it straight away was sometimes ignored, with nothing spoken.")
                 Text("Fixed: contacts whose status is just \"online\" or \"offline\" read the word twice.")
+                Text("My status is now in Profile and Authentication. Choose Available, Away, Busy, Do not disturb, or Invisible; add optional text and a clear-after time. VoiceOver announces every change.")
+                Text("My status is now in Profile and Authentication. Choose Available, Away, Busy, Do not disturb, or Invisible; add optional text and a clear-after time. VoiceOver announces every change.")
                 Text("Fixed: the Settings categories read as two items each, and the one VoiceOver landed on couldn't be opened. Each category is one item again.")
             } header: { Text("What's new in this version").accessibilityAddTraits(.isHeader) } footer: {
                 Text("Version \(appVersion).")
@@ -219,5 +222,34 @@ struct SettingsCategoryView: View {
         let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
         let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
         return "\(v) (\(b))"
+    }
+}
+
+struct StatusSettingsView: View {
+    @Environment(AppModel.self) private var model
+    @State private var custom = ""
+    @State private var clearAfter = ""
+    private let choices = [("available", "Available"), ("away", "Away"), ("busy", "Busy"), ("dnd", "Do not disturb"), ("invisible", "Invisible (appear offline)")]
+
+    var body: some View {
+        @Bindable var model = model
+        Form {
+            Section("My status") {
+                Picker("Status", selection: model.statusPresence) {
+                    ForEach(choices, id: \.0) { Text($0.1).tag($0.0) }
+                }
+                .onChange(of: model.statusPresence) { _, value in model.setStatus(presence: value, custom: model.customStatus) }
+                TextField("Custom status", text: $custom)
+                TextField("Clear after minutes (optional)", text: $clearAfter).keyboardType(.numberPad)
+                Button("Set custom status") {
+                    model.setStatus(presence: model.statusPresence, custom: custom, clearAfterMinutes: Int(clearAfter))
+                }
+                Button("Clear status") { custom = ""; clearAfter = ""; model.setStatus(presence: "available") }
+            } footer: {
+                Text("Your current status is shared across signed-in devices. Invisible appears offline to contacts. Do not disturb silences Thrive alerts except for allowed contacts.")
+            }
+        }
+        .navigationTitle("My status")
+        .onAppear { custom = model.customStatus }
     }
 }

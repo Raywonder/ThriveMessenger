@@ -41,3 +41,6 @@ What to check:
 7. With a hardware keyboard: Enter on a voice message plays it, Enter again pauses, Enter again
    resumes -- and it never plays and pauses on one press.
 8. Enter in the typing box still sends the message, and Enter on a text message does nothing.
+## Next batch
+
+- Set Available, Away, Busy, Do not disturb, or Invisible from Profile and Authentication > My status. Add custom text and an optional automatic clear time; VoiceOver announces changes.
