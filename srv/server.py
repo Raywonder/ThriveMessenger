@@ -3015,7 +3015,23 @@ def _save_status(user, kind, custom_text="", expires_at=""):
         con.commit()
     finally:
         con.close()
-    return {"kind": kind, "custom_text": custom_text, "expires_at": expires_at}, ""
+    status = {"kind": kind, "custom_text": custom_text, "expires_at": expires_at}
+    if expires_at:
+        delay = max(1, (until - datetime.datetime.now(datetime.timezone.utc)).total_seconds() + 0.2)
+        def _expire_if_current():
+            con = sqlite3.connect(DB)
+            try:
+                row = con.execute("SELECT expires_at FROM user_status WHERE username=?", (user,)).fetchone()
+            finally:
+                con.close()
+            if row and str(row[0] or "") == expires_at:
+                _status_record(user)  # clears the now-expired row
+                broadcast_contact_status(user, True)
+                _send_to_all_sessions({user}, {"action": "my_status", **_status_record(user)})
+        timer = threading.Timer(delay, _expire_if_current)
+        timer.daemon = True
+        timer.start()
+    return status, ""
 
 def _status_for_user(username):
     if _is_registered_bot(username):
