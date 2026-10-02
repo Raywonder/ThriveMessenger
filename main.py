@@ -2182,7 +2182,8 @@ class ChangePasswordDialog(wx.Dialog):
             wx.MessageBox("New passwords do not match.", "Error", wx.ICON_ERROR); return
         self.EndModal(wx.ID_OK)
 
-STATUS_PRESETS = ["online", "offline", "busy", "away", "on the phone", "doing homework", "in the shower", "watching TV", "hiding from the parents", "fixing my PC", "battery about to die"]
+STATUS_PRESETS = ["available", "away", "busy", "dnd", "invisible"]
+STATUS_LABELS = {"available": "Available", "away": "Away", "busy": "Busy", "dnd": "Do not disturb", "invisible": "Invisible (appear offline)"}
 
 class StatusDialog(wx.Dialog):
     def __init__(self, parent, current_status="online"):
@@ -2896,6 +2897,9 @@ class ClientApp(wx.App):
                 try:
                     if act == "contact_list": wx.CallAfter(self.frame.load_contacts, msg.get("contacts", []))
                     elif act == "contact_status": wx.CallAfter(self.frame.update_contact_status, msg.get("user"), msg.get("online"), msg.get("status_text"))
+                    elif act == "server_limits": wx.CallAfter(self.frame.set_server_limits, msg)
+                    elif act == "my_status": wx.CallAfter(self.frame.set_server_status, msg)
+                    elif act == "set_status_result" and not msg.get("ok", True): wx.CallAfter(speak_text, msg.get("reason", "Status could not be changed."))
                     elif act == "msg": wx.CallAfter(self.frame.receive_message, msg)
                     elif act == "msg_failed": wx.CallAfter(self.frame.on_message_failed, msg.get("to"), msg.get("reason", "Message could not be delivered."))
                     elif act == "add_contact_failed": wx.CallAfter(self.frame.on_add_contact_failed, msg)
@@ -4591,10 +4595,10 @@ class MainFrame(wx.Frame):
                 c["status"] = new_status
                 break
         self._apply_search_filter()
-        if online and not was_online:
+        if online and not was_online and self.status_presence != "dnd":
             wx.GetApp().play_sound("contact_online.wav")
             show_notification("Contact online", f"{self.format_user_label(user)} has come online.")
-        elif not online and was_online:
+        elif not online and was_online and self.status_presence != "dnd":
             wx.GetApp().play_sound("contact_offline.wav")
             show_notification("Contact offline", f"{self.format_user_label(user)} has gone offline.")
 
@@ -4602,7 +4606,11 @@ class MainFrame(wx.Frame):
         self.max_direct_message_length = DEFAULT_MAX_DIRECT_MESSAGE_LENGTH
         super().__init__(None, title="", size=(400,380)); self.user, self.sock = user, sock; self.task_bar_icon = None; self.is_exiting = False; self._directory_dlg = None; self._bot_rules_dlg = None; self._group_policy_dlg = None; self._group_call_dlg = None
         self.refresh_connection_title(connected=True)
-        self.current_status = wx.GetApp().user_config.get('status', 'online')
+        self.current_status = wx.GetApp().user_config.get('status', 'available')
+        self.status_presence = wx.GetApp().user_config.get('status_presence', 'available')
+        self.status_custom = wx.GetApp().user_config.get('status_custom', '')
+        self.status_expires_at = wx.GetApp().user_config.get('status_expires_at', '')
+        self.status_protocol = 0
         self.feature_caps = {}
         self.feature_caps_supported = False
         self._empty_prompt_shown = False
@@ -4664,7 +4672,7 @@ class MainFrame(wx.Frame):
         self.btn_block.Bind(wx.EVT_BUTTON, self.on_block_toggle); self.btn_add.Bind(wx.EVT_BUTTON, self.on_add); self.btn_send.Bind(wx.EVT_BUTTON, self.on_send); self.btn_delete.Bind(wx.EVT_BUTTON, self.on_delete)
         self.btn_send_file.Bind(wx.EVT_BUTTON, self.on_send_file)
         self.btn_info.Bind(wx.EVT_BUTTON, self.on_server_info)
-        self.btn_status.Bind(wx.EVT_BUTTON, self.on_set_status)
+        self.btn_status.Bind(wx.EVT_BUTTON, self.on_custom_status)
         self.autologin_main_cb.Bind(wx.EVT_CHECKBOX, self.on_toggle_autologin)
         self.btn_directory.Bind(wx.EVT_BUTTON, self.on_user_directory)
         self.btn_admin.Bind(wx.EVT_BUTTON, self.on_admin); self.btn_settings.Bind(wx.EVT_BUTTON, self.on_settings)
@@ -4858,8 +4866,20 @@ class MainFrame(wx.Frame):
         self.mi_group_policy = server_menu.Append(wx.ID_ANY, "Manage Group Policy")
         file_menu.AppendSubMenu(server_menu, "Server and Admin")
 
+        self.my_status_menu = wx.Menu()
+        self.status_menu_items = {}
+        for presence in STATUS_PRESETS:
+            item = self.my_status_menu.AppendRadioItem(wx.ID_ANY, STATUS_LABELS[presence])
+            self.status_menu_items[item.GetId()] = presence
+            self.Bind(wx.EVT_MENU, self.on_status_preset, item)
+        self.my_status_menu.AppendSeparator()
+        self.mi_custom_status = self.my_status_menu.Append(wx.ID_ANY, "Custom status...")
+        self.mi_clear_status = self.my_status_menu.Append(wx.ID_ANY, "Clear status")
+        self.Bind(wx.EVT_MENU, self.on_custom_status, self.mi_custom_status)
+        self.Bind(wx.EVT_MENU, self.on_clear_status, self.mi_clear_status)
+        file_menu.AppendSubMenu(self.my_status_menu, "My status")
+
         account_menu = wx.Menu()
-        self.mi_status = account_menu.Append(wx.ID_ANY, "Set Status\tAlt+U")
         self.mi_settings = account_menu.Append(wx.ID_PREFERENCES, "Settings\tCmd+,")
         self.mi_register_passkey = account_menu.Append(wx.ID_ANY, "Register Passkey For This Device")
         self.mi_manage_devices = account_menu.Append(wx.ID_ANY, "Manage Signed-In Devices")
@@ -4909,6 +4929,7 @@ class MainFrame(wx.Frame):
         menubar.Append(view_menu, "&View")
         menubar.Append(help_menu, "&Help")
         self.SetMenuBar(menubar)
+        self._refresh_status_menu()
 
         self.Bind(wx.EVT_MENU, self.on_send, self.mi_start_chat)
         self.Bind(wx.EVT_MENU, self.on_add, self.mi_add_contact)
@@ -4922,7 +4943,6 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_admin, self.mi_admin_console)
         self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
         self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
-        self.Bind(wx.EVT_MENU, self.on_set_status, self.mi_status)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_register_passkey, self.mi_register_passkey)
         self.Bind(wx.EVT_MENU, self.on_manage_devices, self.mi_manage_devices)
@@ -5444,7 +5464,77 @@ class MainFrame(wx.Frame):
             if not is_selection:
                 self.btn_block.SetLabel("&Block")
         if event: event.Skip()
+    def _status_spoken(self):
+        label = STATUS_LABELS.get(self.status_presence, "Available")
+        return f"{label}: {self.status_custom}" if self.status_custom else label
+
+    def _refresh_status_menu(self):
+        for item_id, presence in self.status_menu_items.items():
+            item = self.my_status_menu.FindItemById(item_id)
+            if item:
+                item.Check(presence == self.status_presence)
+
+    def _apply_status(self, presence, custom_text="", expires_at=""):
+        app = wx.GetApp()
+        self.status_presence = presence if presence in STATUS_PRESETS else "available"
+        self.status_custom = str(custom_text or "").strip()
+        self.status_expires_at = str(expires_at or "").strip()
+        self.current_status = self._status_spoken().lower()
+        app.user_config.update({"status": self.current_status, "status_presence": self.status_presence,
+                                "status_custom": self.status_custom, "status_expires_at": self.status_expires_at})
+        save_user_config(app.user_config)
+        payload = {"action": "set_status", "status_text": self.current_status}
+        if self.status_protocol >= 2:
+            payload.update({"presence": self.status_presence, "custom_status": self.status_custom, "expires_at": self.status_expires_at})
+        try:
+            self.sock.sendall((json.dumps(payload) + "\n").encode())
+            self._refresh_status_menu()
+            speak_text(f"Status changed to {self._status_spoken()}")
+        except Exception:
+            speak_text("Status will update when reconnected")
+
+    def on_status_preset(self, event):
+        self._apply_status(self.status_menu_items.get(event.GetId(), "available"), self.status_custom, self.status_expires_at)
+
+    def on_custom_status(self, event=None):
+        with wx.TextEntryDialog(self, "What would you like contacts to see? Leave blank for no custom text.", "Custom status", self.status_custom) as text_dlg:
+            if text_dlg.ShowModal() != wx.ID_OK:
+                return
+            custom = text_dlg.GetValue().strip()
+        with wx.TextEntryDialog(self, "Clear this custom status after how many minutes? Leave blank to keep it until you clear it.", "Clear status") as time_dlg:
+            if time_dlg.ShowModal() != wx.ID_OK:
+                return
+            raw_minutes = time_dlg.GetValue().strip()
+        expires_at = ""
+        if raw_minutes:
+            try:
+                minutes = int(raw_minutes)
+                if minutes < 1:
+                    raise ValueError
+                expires_at = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+            except ValueError:
+                wx.MessageBox("Enter a whole number of minutes, or leave it blank.", "Custom status", wx.ICON_ERROR, self)
+                return
+        self._apply_status(self.status_presence, custom, expires_at)
+
+    def on_clear_status(self, event=None):
+        self._apply_status("available", "", "")
+
+    def set_server_status(self, status):
+        if not isinstance(status, dict):
+            return
+        self.status_presence = str(status.get("kind", self.status_presence) or "available")
+        self.status_custom = str(status.get("custom_text", self.status_custom) or "")
+        self.status_expires_at = str(status.get("expires_at", self.status_expires_at) or "")
+        self.current_status = self._status_spoken().lower()
+        self._refresh_status_menu()
+
+    def set_server_limits(self, values):
+        if isinstance(values, dict):
+            self.status_protocol = int(values.get("status_protocol", 0) or 0)
+
     def on_set_status(self, event):
+        return self.on_custom_status(event)
         menu = wx.Menu()
         app = wx.GetApp()
         status_preset = app.user_config.get('status_preset', 'online')
@@ -6158,11 +6248,13 @@ class MainFrame(wx.Frame):
         dlg.set_typing_label(sender, False)
         self.clear_typing_state(sender)
         is_focused_chat = bool(dlg.IsShown() and wx.GetActiveWindow() is dlg)
+        dnd_allow = {x.strip().lower() for x in str(app.user_config.get("dnd_allow_list", "") or "").split(",") if x.strip()}
+        dnd_suppressed = self.status_presence == "dnd" and sender.lower() not in dnd_allow
         if not is_focused_chat:
             self._mark_unread(sender)
-            if incoming_behavior == 'notify':
+            if incoming_behavior == 'notify' and not dnd_suppressed:
                 show_notification("New message", f"New message from {sender}.", timeout=5)
-            elif incoming_behavior == 'play_sound':
+            elif incoming_behavior == 'play_sound' and not dnd_suppressed:
                 app.play_sound("receive.wav")
         else:
             self._clear_unread(sender)
