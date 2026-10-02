@@ -63,6 +63,12 @@ final class AppModel {
     /// Hardware keyboard only: Return sends the message. Shift+Return or Option+Return always makes a new line;
     /// Command+Return always sends even when this is off. Ignored with no hardware keyboard connected.
     var enterKeySendsMessage: Bool { didSet { defaults.set(enterKeySendsMessage, forKey: "enter_key_sends_message") } }
+    /// Status is server-owned when protocol v2 is advertised; these cached values keep
+    /// the Settings control understandable while reconnecting or on a classic server.
+    var statusPresence: String { didSet { defaults.set(statusPresence, forKey: "status_presence") } }
+    var customStatus: String { didSet { defaults.set(customStatus, forKey: "custom_status") } }
+    var statusExpiresAt: String { didSet { defaults.set(statusExpiresAt, forKey: "status_expires_at") } }
+    var statusProtocol = 0
 
     private let defaults = UserDefaults.standard
     private var connection: ThriveConnection?
@@ -99,6 +105,9 @@ final class AppModel {
         openChatAlert = defaults.string(forKey: "open_chat_new_message") ?? "read"
         otherChatAlert = defaults.string(forKey: "other_chat_new_message") ?? "read"
         enterKeySendsMessage = defaults.object(forKey: "enter_key_sends_message") as? Bool ?? true
+        statusPresence = defaults.string(forKey: "status_presence") ?? "available"
+        customStatus = defaults.string(forKey: "custom_status") ?? ""
+        statusExpiresAt = defaults.string(forKey: "status_expires_at") ?? ""
         username = defaults.string(forKey: "username") ?? ""
         if ProcessInfo.processInfo.arguments.contains("--reset-for-tests") {
             Keychain.delete(server: server.id, user: username)
@@ -499,6 +508,14 @@ final class AppModel {
                 contacts[i].online = obj["online"] as? Bool ?? contacts[i].online
                 contacts[i].statusText = obj["status_text"] as? String ?? contacts[i].statusText
             }
+        case "server_limits":
+            statusProtocol = obj["status_protocol"] as? Int ?? 0
+        case "my_status":
+            statusPresence = obj["kind"] as? String ?? "available"
+            customStatus = obj["custom_text"] as? String ?? ""
+            statusExpiresAt = obj["expires_at"] as? String ?? ""
+        case "set_status_result":
+            if obj["ok"] as? Bool == false { Announce.say(obj["reason"] as? String ?? "Status could not be changed.", important: true) }
         case "feature_caps":
             if let a = obj["is_admin"] as? Bool { isAdmin = a }
             if let caps = obj["caps"] as? [String: [String: Any]] {
@@ -846,6 +863,24 @@ final class AppModel {
     /// (`voice_call` ships switched off because call audio needs a media engine), and an action that is
     /// always there but always fails is worse than no action with VoiceOver.
     func featureVisible(_ key: String) -> Bool { featureCaps[key]?.uiVisible ?? false }
+
+    func setStatus(presence: String, custom: String = "", clearAfterMinutes: Int? = nil) {
+        let allowed = ["available", "away", "busy", "dnd", "invisible"]
+        let kind = allowed.contains(presence) ? presence : "available"
+        var expires = ""
+        if let minutes = clearAfterMinutes, minutes > 0 {
+            expires = ISO8601DateFormatter().string(from: Date().addingTimeInterval(Double(minutes) * 60))
+        }
+        statusPresence = kind; customStatus = custom.trimmingCharacters(in: .whitespacesAndNewlines); statusExpiresAt = expires
+        if statusProtocol >= 2 {
+            send(["action": "set_status", "presence": kind, "custom_status": customStatus, "expires_at": expires])
+        } else {
+            let text = customStatus.isEmpty ? (kind == "available" ? "online" : kind) : customStatus
+            send(["action": "set_status", "status_text": text])
+        }
+        let label = ["available": "Available", "away": "Away", "busy": "Busy", "dnd": "Do not disturb", "invisible": "Invisible"] [kind] ?? "Available"
+        Announce.say(customStatus.isEmpty ? "Status changed to \(label)" : "Status changed to \(label): \(customStatus)")
+    }
 
     /// Rooms where you are a moderator or above, so "Add to group" only offers rooms the server will accept.
     var roomsICanAddTo: [RoomSummary] { rooms.filter { (roleRank[$0.role] ?? -1) >= 2 } }
