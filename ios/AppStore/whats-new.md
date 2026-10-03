@@ -43,4 +43,7 @@ What to check:
 8. Enter in the typing box still sends the message, and Enter on a text message does nothing.
 ## Next batch
 
+- Admins can create a pending Thrive account from Chats > Contacts > Create new account. The person receives the private setup email, chooses their own password, verifies their email, and completes any required authentication.
+- Admins can resend or cancel pending invitations. Invitations expire after the server setting (seven days by default), then the username is free again.
+- Chats > Contacts > Find people searches people on this server and lets you add a selected person to your contacts. VoiceOver reaches these controls in a single sheet level and announces each result.
 - Set Available, Away, Busy, Do not disturb, or Invisible from Profile and Authentication > My status. Add custom text and an optional automatic clear time; VoiceOver announces changes.

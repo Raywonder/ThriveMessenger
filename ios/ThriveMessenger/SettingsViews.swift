@@ -201,6 +201,8 @@ struct SettingsCategoryView: View {
             }
         case (.help, _):
             Section {
+                Text("Admins can create a pending account from Chats > Contacts > Create new account. The person receives the setup email and always chooses their own password.")
+                Text("Chats > Contacts > Find people searches visible people on this server. Admins can also review Pending accounts to resend or cancel an invitation.")
                 Text("Voice messages now pause and carry on. Activating one starts it, activating it again pauses it, and again resumes it instead of jumping back to the beginning.")
                 Text("The separate \"Play voice message\" action is gone from messages, because activating the message already plays it.")
                 Text("The \"Seen\" reaction is gone. Thrive already tells the sender you've read a message a few seconds after you reach it.")

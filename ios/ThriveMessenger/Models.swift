@@ -21,6 +21,34 @@ struct Contact: Identifiable, Hashable {
     var unread: Int = 0
 }
 
+struct DirectoryPerson: Identifiable, Hashable {
+    var id: String { user }
+    var user: String
+    var online: Bool
+    var isContact: Bool
+    var isAdmin: Bool
+
+    init(_ d: [String: Any]) {
+        user = d["user"] as? String ?? ""
+        online = d["online"] as? Bool ?? false
+        isContact = d["is_contact"] as? Bool ?? false
+        isAdmin = d["is_admin"] as? Bool ?? false
+    }
+}
+
+struct PendingAccount: Identifiable, Hashable {
+    var id: String { username }
+    var username: String
+    var email: String
+    var expiresAt: String
+
+    init(_ d: [String: Any]) {
+        username = d["username"] as? String ?? ""
+        email = d["email"] as? String ?? ""
+        expiresAt = d["expires_at"] as? String ?? ""
+    }
+}
+
 /// One row of the server's `feature_caps` table. `uiVisible` is the server saying whether the control
 /// should be offered at all; `canUse` is whether this account may actually use it.
 struct FeatureCap: Hashable {

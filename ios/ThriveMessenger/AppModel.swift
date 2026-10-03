@@ -46,6 +46,8 @@ final class AppModel {
     var username = ""
     var isAdmin = false
     var contacts: [Contact] = []
+    var directoryPeople: [DirectoryPerson] = []
+    var pendingAccounts: [PendingAccount] = []
     var rooms: [RoomSummary] = []
     var conversations: [String: Conversation] = [:]
     var linkTitles: [String: String] = [:]
@@ -521,6 +523,12 @@ final class AppModel {
             if let caps = obj["caps"] as? [String: [String: Any]] {
                 featureCaps = caps.mapValues { FeatureCap($0) }
             }
+        case "user_directory_response":
+            directoryPeople = (obj["users"] as? [[String: Any]] ?? []).map(DirectoryPerson.init).sorted { $0.user.localizedCaseInsensitiveCompare($1.user) == .orderedAscending }
+        case "admin_pending_accounts":
+            pendingAccounts = (obj["accounts"] as? [[String: Any]] ?? []).map(PendingAccount.init)
+        case "admin_account_result":
+            Announce.say(obj["reason"] as? String ?? "Account request complete.", important: obj["ok"] as? Bool == false)
         case "msg": incomingDirect(obj)
         case "msg_sent":
             guard let to = obj["to"] as? String, let cid = obj["client_id"] as? String, let id = obj["id"] as? String else { return }
@@ -904,6 +912,21 @@ final class AppModel {
         if openConversation == key { openConversation = nil }
         Announce.say("Removed \(user) from your contacts")
     }
+
+    func findPeople() { send(["action": "user_directory"]) }
+
+    func addContact(_ user: String) {
+        send(["action": "add_contact", "to": user])
+        Announce.say("Contact request sent to \(user)")
+    }
+
+    func createPendingAccount(username: String, displayName: String, email: String, note: String) {
+        send(["action": "admin_create_account", "username": username, "display_name": displayName, "email": email, "note": note])
+    }
+
+    func loadPendingAccounts() { send(["action": "admin_pending_accounts"]) }
+    func resendPendingAccount(_ username: String) { send(["action": "admin_resend_account", "username": username]) }
+    func cancelPendingAccount(_ username: String) { send(["action": "admin_cancel_account", "username": username]) }
 
     func callContact(_ user: String) {
         guard canUseFeature("voice_call") else {
