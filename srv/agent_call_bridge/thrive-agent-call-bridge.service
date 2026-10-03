@@ -1,0 +1,19 @@
+[Unit]
+Description=Thrive System Monitor WebRTC voice-call bridge
+After=network-online.target audio-cpp-server.service
+Wants=network-online.target
+[Service]
+Type=simple
+User=devinecr
+Group=devinecr
+EnvironmentFile=-/etc/sysmon-thrive/agent-call-bridge.env
+WorkingDirectory=/opt/thrive-agent-call-bridge
+ExecStart=/opt/thrive-agent-call-bridge/venv/bin/python -m agent_call_bridge.thrive_agent_call_bridge
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ReadWritePaths=/var/lib/thrive-agent-call-bridge
+[Install]
+WantedBy=multi-user.target

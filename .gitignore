@@ -1,4 +1,6 @@
 __pycache__/
+srv/agent_call_bridge/.venv/
+srv/agent_call_bridge/.pytest_cache/
 srv/__pycache__/
 build/
 dist/
