@@ -171,6 +171,10 @@ Server owners can configure direct message length with `max_direct_message_lengt
 
 You can start an IM conversation with a contact simply by pressing Enter on them in the contact list. Once you do, you will land on a text field where you can type your message. Pressing Enter will send the message, and pressing Shift + Enter will type a new line. Pressing Shift + Tab once will take you to a checkbox which will allow you to save a permanent log of your chat with the current contact, stored in Documents/ThriveMessenger/chats/<contact>. Pressing Shift + Tab again will show a list of all messages sent and received in the chat. Use the up and down arrow keys to navigate this list. To get out of the chat and go back to the main Thrive Messenger window, simply press the Escape key.
 
+### Sending voice from the command line
+
+Agents and server automation can send a playable voice DM (not a file-transfer offer) with `srv/scripts/thrive_cli.py send-voice USER FILE`. WAV, MP3, OGG, and M4A recordings are accepted up to 6 MiB (roughly three minutes); the server transcodes them to MP3 for clients. Add `--text "caption"` to include an optional caption. For example: `thrive_cli.py --username SystemMonitor send-voice tappedinfm /path/alert.wav --text "Short spoken alert"`.
+
 ### File transfer
 
 As well as sending standard text messages, users can also send files to each other. To send a file, simply highlight the contact you want to send the file to and press Alt + F or click the send file button. A dialog will open where you can choose the file you wish to send. Once you choose your file, the receiving user will get a pop-up message asking if they want to accept the file. Your file will begin sending as soon as the receiver hits yes. Received files are stored in Documents/ThriveMessenger/files.

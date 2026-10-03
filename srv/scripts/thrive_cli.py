@@ -33,8 +33,15 @@ except Exception:  # pragma: no cover - optional server dependency
 
 # Bump this whenever a meaningful CLI feature/fix lands, so `thrive-cli version`
 # and `thrive-cli self-update` have something real to compare against.
-CLI_VERSION = "2026.10.02-contact-admin-cmds"
+CLI_VERSION = "2026.10.03-send-voice"
 REPO_ROOT = Path(__file__).resolve().parents[2]  # .../apps/ThriveMessenger
+MAX_VOICE_BYTES = 6 * 1024 * 1024
+VOICE_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+}
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "srv.conf"
@@ -625,6 +632,47 @@ def cmd_send_file(args: argparse.Namespace) -> None:
         server_transfer_id = response.get("transfer_id")
         send_json(sock, {"action": "file_data", "transfer_id": server_transfer_id, "files": payload_files})
         emit({"status": "ok", "sent": True, "to": args.to, "files": files, "transfer_id": server_transfer_id, "response": response}, args.json)
+    finally:
+        sock.close()
+
+
+def cmd_send_voice(args: argparse.Namespace) -> None:
+    """Send a playable voice DM, rather than offering the audio as a file transfer."""
+    path = Path(args.file).expanduser().resolve()
+    if not path.is_file():
+        fail(f"Voice file not found: {path}", args.json)
+    mime = VOICE_MIME_TYPES.get(path.suffix.lower())
+    if not mime:
+        fail("Voice files must be WAV, MP3, OGG, or M4A.", args.json)
+    size = path.stat().st_size
+    if size > MAX_VOICE_BYTES:
+        fail(f"Voice file is {size:,} bytes; Thrive accepts recordings up to {MAX_VOICE_BYTES:,} bytes (about 3 minutes).", args.json)
+    if not size:
+        fail("Voice file is empty.", args.json)
+    try:
+        audio_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError as exc:
+        fail(f"Could not read voice file: {exc}", args.json)
+
+    sock = login(args)
+    try:
+        send_json(sock, {
+            "action": "msg", "from": args.username, "to": args.user,
+            "msg": args.text or "", "time": datetime.now().isoformat(),
+            "voice": {"b64": audio_b64, "mime": mime},
+        })
+        sock.settimeout(args.wait)
+        responses = []
+        try:
+            while True:
+                responses.append(recv_json_line(sock))
+        except socket.timeout:
+            pass
+        failures = [event for event in responses if event.get("action") == "msg_failed"]
+        if failures:
+            fail(str(failures[-1].get("reason") or "Voice message was refused."), args.json, response=failures[-1])
+        emit({"status": "ok", "sent": True, "to": args.user, "file": str(path), "mime": mime,
+              "caption": args.text or "", "responses": responses}, args.json)
     finally:
         sock.close()
 
@@ -1323,6 +1371,14 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for immediate server replies.")
     send.add_argument("--split-at", type=int, default=20000, help="Split longer messages into labelled parts (0 disables).")
     send.set_defaults(func=cmd_send)
+
+    send_voice = sub.add_parser("send-voice", help="Send a playable voice DM (WAV, MP3, OGG, or M4A; maximum 6 MiB).")
+    add_login_args(send_voice)
+    send_voice.add_argument("user", help="Recipient username or bot.")
+    send_voice.add_argument("file", help="Path to a WAV, MP3, OGG, or M4A recording.")
+    send_voice.add_argument("--text", default="", help="Optional caption to show with the voice message.")
+    send_voice.add_argument("--wait", type=float, default=1.5, help="Seconds to wait for an immediate server error.")
+    send_voice.set_defaults(func=cmd_send_voice)
 
     status = sub.add_parser("set-status", help="Set Available/Away/Busy/Do not disturb/Invisible status.")
     add_login_args(status)

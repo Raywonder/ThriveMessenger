@@ -838,7 +838,8 @@ def _prepare_voice_message(msg):
     msg["voice"] = {"b64": base64.b64encode(mp3).decode("ascii"), "mime": "audio/mpeg",
                     "duration": round(duration, 1), "voicemail": is_voicemail}
     label = "Voicemail" if is_voicemail else "Voice message"
-    msg["msg"] = f"{label} ({_format_duration(duration)})"
+    caption = str(msg.get("msg") or "").strip()
+    msg["msg"] = f"{label} ({_format_duration(duration)})" + (f"\n{caption}" if caption else "")
     return True, "", mp3
 
 def _voice_subfolder(name):
