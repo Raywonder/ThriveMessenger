@@ -101,6 +101,9 @@ struct ContactsView: View {
     @State private var path: [ConversationKind] = []
     @State private var addingToGroup: Contact?
     @State private var removing: Contact?
+    @State private var showFindPeople = false
+    @State private var showCreateAccount = false
+    @State private var showPendingAccounts = false
 
     var body: some View {
         NavigationStack(path: $path) { list }
@@ -126,6 +129,20 @@ struct ContactsView: View {
         .overlay { if model.contacts.isEmpty { ContentUnavailableView("No contacts yet", systemImage: "person.crop.circle.badge.plus") } }
         .navigationTitle("Chats")
         .navigationDestination(for: ConversationKind.self) { kind in ChatView(kind: kind) }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu("Contacts") {
+                    Button("Find people") { showFindPeople = true }
+                    if model.isAdmin && model.canUseFeature("admin_create_account") && model.featureVisible("admin_create_account") {
+                        Button("Create new account") { showCreateAccount = true }
+                        Button("Pending accounts") { showPendingAccounts = true }
+                    }
+                }
+            }
+        }
+        .sheet(isPresented: $showFindPeople) { FindPeopleView() }
+        .sheet(isPresented: $showCreateAccount) { CreateAccountView() }
+        .sheet(isPresented: $showPendingAccounts) { PendingAccountsView() }
         .sheet(item: $addingToGroup) { c in AddToGroupSheet(contact: c) }
         .confirmationDialog("Remove \(removing?.user ?? "this contact")?", isPresented: removingConfirm, titleVisibility: .visible) {
             Button("Remove contact", role: .destructive) { if let r = removing { model.deleteContact(r.user) }; removing = nil }
@@ -171,6 +188,95 @@ struct ContactsView: View {
         Button(c.blocked ? "Unblock" : "Block") { model.setBlocked(!c.blocked, user: c.user) }
         Button("Remove contact", role: .destructive) { removing = c }
         Button("Copy username") { UIPasteboard.general.string = c.user; Announce.say("Copied") }
+    }
+}
+
+struct FindPeopleView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
+
+    private var matches: [DirectoryPerson] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        return q.isEmpty ? model.directoryPeople : model.directoryPeople.filter { $0.user.localizedCaseInsensitiveContains(q) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List(matches) { person in
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text(person.user)
+                        Text(person.online ? "Online" : "Offline").foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if person.isContact { Text("Contact").foregroundStyle(.secondary) }
+                    else { Button("Add") { model.addContact(person.user) }.accessibilityLabel("Add \(person.user) to contacts") }
+                }
+                .accessibilityElement(children: .combine)
+            }
+            .searchable(text: $search, prompt: "Username or display name")
+            .navigationTitle("Find People")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+            .onAppear { model.findPeople() }
+        }
+    }
+}
+
+struct CreateAccountView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var username = ""
+    @State private var displayName = ""
+    @State private var email = ""
+    @State private var note = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Person") {
+                    TextField("Username", text: $username).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    TextField("Display name (optional)", text: $displayName)
+                    TextField("Email", text: $email).textContentType(.emailAddress).keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
+                }
+                Section("Private admin note") { TextField("Note (optional)", text: $note, axis: .vertical) }
+                Section { Text("The person receives the setup email, chooses their own password, verifies their email, and completes any authentication this server requires. You never see their password.") }
+            }
+            .navigationTitle("Create New Account")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send invitation") { model.createPendingAccount(username: username, displayName: displayName, email: email, note: note); dismiss() }
+                        .disabled(username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+    }
+}
+
+struct PendingAccountsView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(model.pendingAccounts) { account in
+                VStack(alignment: .leading) {
+                    Text(account.username).font(.headline)
+                    Text(account.email).foregroundStyle(.secondary)
+                    Text("Expires \(account.expiresAt)").font(.footnote).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Resend") { model.resendPendingAccount(account.username) }
+                        Button("Cancel", role: .destructive) { model.cancelPendingAccount(account.username) }
+                    }
+                }
+                .accessibilityElement(children: .contain)
+            }
+            .overlay { if model.pendingAccounts.isEmpty { ContentUnavailableView("No pending accounts", systemImage: "person.crop.circle.badge.clock") } }
+            .navigationTitle("Pending Accounts")
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
+            .onAppear { model.loadPendingAccounts() }
+        }
     }
 }
 
