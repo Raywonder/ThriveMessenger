@@ -421,7 +421,7 @@ To allow your server to send emails, simply add these files to the end of your s
 
 Thrive Messenger can optionally support WordPress authentication by accepting signed account sync events from any WordPress site. This lets existing WordPress user and admin accounts be linked to Thrive accounts while keeping the normal Thrive login flow available: native Thrive passwords, passkey login, SMTP account verification, password reset codes, and admin-created accounts continue to work as before.
 
-The compatible WordPress plugin lives in `wordpress/thrive-server-sync`. Install that folder as a normal WordPress plugin, then configure the Thrive host, port, TLS mode, and shared sync secret from Settings > Thrive Server Sync. The plugin defaults to `im.tappedin.fm` and checks `https://im.tappedin.fm/updates/thrive-server-sync.json` for plugin updates. It is disabled by default and never sends WordPress passwords to Thrive.
+The compatible WordPress plugin lives in `wordpress/thrive-server-sync`. Install that folder as a normal WordPress plugin, then configure the Thrive host, port, TLS mode, the HTTPS sync URL, and the shared sync secret from Settings > Thrive Server Sync. It is disabled by default. When both ends are enabled with the same secret, linked accounts use the same password.
 
 Server operators can install and activate the plugin across detected WordPress sites with:
 
@@ -441,11 +441,23 @@ Enable the matching server endpoint in `srv/srv.conf`:
     sync_secret = use-a-long-random-secret-here
     allow_admin_sync = true
     signature_window_seconds = 300
+    # The server's dedicated HTTPS listener, for example 2006.
+    https_port = 2006
+    # HTTPS WordPress REST endpoints (never use http:// for password sync).
+    provision_url = https://example.com/wp-json/thrive-server-sync/v1/provision-user
+    password_sync_url = https://example.com/wp-json/thrive-server-sync/v1/password
+    password_verify_url = https://example.com/wp-json/thrive-server-sync/v1/verify-password
     ```
 
-The WordPress plugin signs each sync event with HMAC-SHA256. The Thrive server verifies the timestamp, nonce, and signature before linking or creating the Thrive account. Existing Thrive passwords are not overwritten; if the WordPress user or admin does not already exist in Thrive, the server creates a verified linked account with a random password so the person can later reset or use native Thrive authentication when needed.
+The WordPress plugin signs every account event with HMAC-SHA256. Password events additionally sign a digest of the new password, include a timestamp and one-time nonce, and travel only over HTTPS. Neither side logs the plaintext password. A sync-triggered password update is marked as remote so it cannot trigger an echo back to its sender.
 
-The same bridge can also provision WordPress users from Thrive signups. Set `provision_url` to the plugin REST endpoint, usually `https://example.com/wp-json/thrive-server-sync/v1/provision-user`, and keep `auto_provision_wordpress = true`. When a verified Thrive user has an email address, the server signs a provisioning request so WordPress can create or link the matching account and send the normal WordPress new-user notification.
+The same bridge provisions a WordPress user from a Thrive signup when the Thrive user has an email address. It uses the Thrive password (not a generated one) and the role selected in the plugin settings; the default is Subscriber. Existing linked accounts are updated at the instant a password changes. For old links created before password synchronization, a failed password login can make one signed HTTPS verification request to the other side; on success the local hash is updated. If the plugin or server side is not enabled and configured, no password or fallback request is made and the two account systems remain separate.
+
+### What's new: Thrive Server Sync 0.2.0
+
+- Linked Thrive and WordPress accounts can now keep one password across registration, profile edits, resets, and administrative password changes.
+- Added a dedicated signed HTTPS password channel, replay protection, loop suppression, and lazy login migration for existing links.
+- Thrive-created WordPress users use the same password and an administrator-selected role (Subscriber by default).
 
 ### File transfer limits
 

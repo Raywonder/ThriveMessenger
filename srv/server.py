@@ -2,6 +2,8 @@ import sqlite3, threading, socket, json, datetime, sys, configparser, ssl, os, u
 import smtplib, secrets
 import re
 import urllib.request, urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 from email.mime.text import MIMEText
 try:
     from argon2 import PasswordHasher
@@ -2036,6 +2038,9 @@ def load_config():
         'allow_admin_sync': config.getboolean('wordpress', 'allow_admin_sync', fallback=True),
         'signature_window_seconds': config.getint('wordpress', 'signature_window_seconds', fallback=300),
         'provision_url': config.get('wordpress', 'provision_url', fallback=''),
+        'password_sync_url': config.get('wordpress', 'password_sync_url', fallback=''),
+        'password_verify_url': config.get('wordpress', 'password_verify_url', fallback=''),
+        'https_port': config.getint('wordpress', 'https_port', fallback=0),
         'auto_provision_wordpress': config.getboolean('wordpress', 'auto_provision_wordpress', fallback=True),
     }
     enforce_blackfiles = config.getboolean('server', 'enforce_blackfile_list', fallback=False)
@@ -2215,6 +2220,11 @@ def _verify_password_for_login(stored_password, supplied_password):
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
 
+def _hash_thrive_password(password):
+    """Hash newly received passwords; retain plaintext compatibility for old rows."""
+    password = str(password or '')
+    return _ph.hash(password) if _ph is not None else password
+
 def _truthy_flag(value):
     if isinstance(value, bool):
         return value
@@ -2278,6 +2288,65 @@ def _wordpress_hmac(secret, fields):
     message = "\n".join(str(x or '') for x in fields)
     return hmac.new(str(secret).encode('utf-8'), message.encode('utf-8'), hashlib.sha256).hexdigest()
 
+def _wordpress_password_digest(password):
+    return hashlib.sha256(str(password or '').encode('utf-8')).hexdigest()
+
+def _wordpress_password_signature(secret, payload):
+    return _wordpress_hmac(secret, [
+        payload.get('action', ''), payload.get('timestamp', ''), payload.get('nonce', ''),
+        payload.get('wp_user_id', ''), payload.get('username', ''), payload.get('email', ''),
+        payload.get('is_admin', ''), payload.get('origin', ''), payload.get('password_digest', ''),
+    ])
+
+def _verify_wordpress_password_signature(req, expected_origin):
+    """Verify a one-time password event without ever including its plaintext in a signature or log."""
+    if not wordpress_config.get('enabled'):
+        return False, 'WordPress sync is disabled.'
+    secret = str(wordpress_config.get('sync_secret') or '').strip()
+    if not secret:
+        return False, 'WordPress sync secret is not configured.'
+    try:
+        timestamp = int(str(req.get('timestamp', '')).strip())
+    except Exception:
+        return False, 'Missing or invalid timestamp.'
+    window = max(30, int(wordpress_config.get('signature_window_seconds') or 300))
+    if abs(int(time.time()) - timestamp) > window:
+        return False, 'Signature timestamp is outside the allowed window.'
+    nonce = str(req.get('nonce') or '').strip()
+    password = str(req.get('password') or '')
+    if not nonce or not password or str(req.get('origin') or '') != expected_origin:
+        return False, 'Missing required password sync fields.'
+    payload = dict(req)
+    payload['password_digest'] = _wordpress_password_digest(password)
+    expected = _wordpress_password_signature(secret, payload)
+    if not hmac.compare_digest(expected, str(req.get('signature') or '').lower()):
+        return False, 'Invalid signature.'
+    con = sqlite3.connect(DB)
+    try:
+        if con.execute('SELECT 1 FROM wordpress_sync_nonces WHERE nonce=?', (nonce,)).fetchone():
+            return False, 'Replay detected.'
+        con.execute('INSERT INTO wordpress_sync_nonces(nonce, created_at) VALUES(?,?)', (nonce, datetime.datetime.utcnow().isoformat()))
+        cutoff = (datetime.datetime.utcnow() - datetime.timedelta(seconds=max(600, window * 2))).isoformat()
+        con.execute('DELETE FROM wordpress_sync_nonces WHERE created_at < ?', (cutoff,))
+        con.commit()
+    finally:
+        con.close()
+    return True, ''
+
+def _wordpress_https_json(url, payload):
+    """POST a password only to the configured HTTPS WordPress endpoint; never log payloads."""
+    parsed = urllib.parse.urlparse(str(url or '').strip())
+    if parsed.scheme != 'https' or not parsed.netloc:
+        return {'status': 'skipped', 'reason': 'WordPress password endpoint must use HTTPS.'}
+    request = urllib.request.Request(parsed.geturl(), data=json.dumps(payload).encode('utf-8'), method='POST', headers={'Content-Type': 'application/json', 'Accept': 'application/json'})
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            body = response.read().decode('utf-8', errors='replace')
+        data = json.loads(body) if body else {}
+        return data if isinstance(data, dict) else {'status': 'error', 'reason': 'Invalid WordPress response.'}
+    except Exception:
+        return {'status': 'error', 'reason': 'WordPress password request failed.'}
+
 def _verify_wordpress_signature(req):
     if not wordpress_config.get('enabled'):
         return False, "WordPress sync is disabled."
@@ -2337,7 +2406,7 @@ def _handle_wordpress_sync(req):
                 con.execute("UPDATE users SET email=? WHERE username=?", (email, canonical))
         else:
             canonical = username
-            random_password = secrets.token_urlsafe(48)
+            random_password = _hash_thrive_password(secrets.token_urlsafe(48))
             con.execute(
                 "INSERT INTO users(username, password, email, is_verified) VALUES(?,?,?,1)",
                 (canonical, random_password, email),
@@ -2363,7 +2432,72 @@ def _handle_wordpress_sync(req):
         add_admin(canonical)
     return {"status": "ok", "user": canonical, "created": created, "linked": True, "is_admin": bool(is_admin)}
 
-def _provision_wordpress_user(username, email, is_admin=False):
+def _handle_wordpress_password_sync(req):
+    ok, reason = _verify_wordpress_password_signature(req, 'wordpress')
+    if not ok:
+        return {'status': 'error', 'reason': reason}
+    username = str(req.get('username') or '').strip()
+    wp_user_id = str(req.get('wp_user_id') or '').strip()
+    if not username or not wp_user_id:
+        return {'status': 'error', 'reason': 'username and wp_user_id are required.'}
+    con = sqlite3.connect(DB)
+    try:
+        row = con.execute('SELECT username FROM users WHERE username=? COLLATE NOCASE LIMIT 1', (username,)).fetchone()
+        if not row:
+            con.execute('INSERT INTO users(username, password, email, is_verified) VALUES(?,?,?,1)', (username, _hash_thrive_password(req['password']), str(req.get('email') or '').strip().lower()))
+            canonical = username
+        else:
+            canonical = row[0]
+            con.execute('UPDATE users SET password=? WHERE username=?', (_hash_thrive_password(req['password']), canonical))
+        now = datetime.datetime.utcnow().isoformat()
+        con.execute('''INSERT INTO wordpress_account_links(thrive_username, wp_user_id, wp_email, wp_login, linked_at, last_sync_at, is_admin_link)
+            VALUES(?,?,?,?,?,?,?) ON CONFLICT(thrive_username) DO UPDATE SET wp_user_id=excluded.wp_user_id, wp_email=excluded.wp_email, wp_login=excluded.wp_login, last_sync_at=excluded.last_sync_at, is_admin_link=excluded.is_admin_link''',
+            (canonical, wp_user_id, str(req.get('email') or '').strip().lower(), str(req.get('wp_login') or '').strip(), now, now, 1 if _truthy_flag(req.get('is_admin')) else 0))
+        con.commit()
+    finally:
+        con.close()
+    return {'status': 'ok', 'user': canonical, 'linked': True}
+
+def _push_wordpress_password(username, password):
+    """Push a local Thrive password change once. The WP receiver suppresses its echo hook."""
+    url = wordpress_config.get('password_sync_url')
+    secret = str(wordpress_config.get('sync_secret') or '').strip()
+    if not url or not secret:
+        return {'status': 'skipped', 'reason': 'WordPress password sync is not configured.'}
+    con = sqlite3.connect(DB)
+    try:
+        link = con.execute('SELECT wp_user_id, wp_email, wp_login, is_admin_link FROM wordpress_account_links WHERE thrive_username=?', (username,)).fetchone()
+    finally:
+        con.close()
+    if not link:
+        return {'status': 'skipped', 'reason': 'No linked WordPress account.'}
+    payload = {'action': 'thrive_set_password', 'timestamp': str(int(time.time())), 'nonce': secrets.token_urlsafe(18),
+        'wp_user_id': str(link[0] or ''), 'username': str(username), 'email': str(link[1] or ''), 'wp_login': str(link[2] or ''),
+        'is_admin': '1' if link[3] else '0', 'origin': 'thrive', 'password': str(password)}
+    payload['password_digest'] = _wordpress_password_digest(password)
+    payload['signature'] = _wordpress_password_signature(secret, payload)
+    return _wordpress_https_json(url, payload)
+
+def _wordpress_verify_password(username, password):
+    url = wordpress_config.get('password_verify_url')
+    secret = str(wordpress_config.get('sync_secret') or '').strip()
+    if not url or not secret:
+        return False
+    con = sqlite3.connect(DB)
+    try:
+        link = con.execute('SELECT wp_user_id, wp_email, wp_login, is_admin_link FROM wordpress_account_links WHERE thrive_username=?', (username,)).fetchone()
+    finally:
+        con.close()
+    if not link:
+        return False
+    payload = {'action': 'verify_thrive_password', 'timestamp': str(int(time.time())), 'nonce': secrets.token_urlsafe(18),
+        'wp_user_id': str(link[0] or ''), 'username': str(username), 'email': str(link[1] or ''), 'wp_login': str(link[2] or ''),
+        'is_admin': '1' if link[3] else '0', 'origin': 'thrive', 'password': str(password)}
+    payload['password_digest'] = _wordpress_password_digest(password)
+    payload['signature'] = _wordpress_password_signature(secret, payload)
+    return bool(_wordpress_https_json(url, payload).get('matched'))
+
+def _provision_wordpress_user(username, email, password, is_admin=False):
     if not wordpress_config.get('enabled') or not wordpress_config.get('auto_provision_wordpress', True):
         return {"status": "skipped", "reason": "WordPress provisioning is disabled."}
     secret = str(wordpress_config.get('sync_secret') or '').strip()
@@ -2372,6 +2506,9 @@ def _provision_wordpress_user(username, email, is_admin=False):
     email = str(email or '').strip().lower()
     if not secret or not provision_url or not username or not email:
         return {"status": "skipped", "reason": "WordPress provisioning is not configured or user has no email."}
+    parsed_url = urllib.parse.urlparse(provision_url)
+    if parsed_url.scheme != 'https' or not parsed_url.netloc:
+        return {"status": "skipped", "reason": "WordPress provisioning endpoint must use HTTPS."}
     ts = str(int(time.time()))
     nonce = secrets.token_urlsafe(18)
     admin_flag = '1' if is_admin else '0'
@@ -2380,9 +2517,13 @@ def _provision_wordpress_user(username, email, is_admin=False):
         "nonce": nonce,
         "username": username,
         "email": email,
+        "password": str(password),
         "is_admin": admin_flag,
     }
-    payload["signature"] = _wordpress_hmac(secret, [ts, nonce, username, email, admin_flag])
+    payload['password_digest'] = _wordpress_password_digest(password)
+    payload["signature"] = _wordpress_password_signature(secret, dict(payload, action='provision_user', origin='thrive'))
+    payload['action'] = 'provision_user'
+    payload['origin'] = 'thrive'
     req = urllib.request.Request(
         provision_url,
         data=json.dumps(payload).encode('utf-8'),
@@ -2394,6 +2535,16 @@ def _provision_wordpress_user(username, email, is_admin=False):
             body = resp.read().decode('utf-8', errors='replace')
         data = json.loads(body) if body else {}
         if isinstance(data, dict):
+            if data.get('status') == 'ok' and data.get('wp_user_id'):
+                con = sqlite3.connect(DB)
+                try:
+                    now = datetime.datetime.utcnow().isoformat()
+                    con.execute('''INSERT INTO wordpress_account_links(thrive_username, wp_user_id, wp_email, wp_login, linked_at, last_sync_at, is_admin_link)
+                        VALUES(?,?,?,?,?,?,?) ON CONFLICT(thrive_username) DO UPDATE SET wp_user_id=excluded.wp_user_id, wp_email=excluded.wp_email, last_sync_at=excluded.last_sync_at''',
+                        (username, str(data['wp_user_id']), email, username, now, now, 1 if is_admin else 0))
+                    con.commit()
+                finally:
+                    con.close()
             return data
         return {"status": "error", "reason": "Invalid WordPress provisioning response."}
     except Exception as e:
@@ -2577,9 +2728,9 @@ def handle_client(cs, addr):
             code = EmailManager.generate_code() if not verified else None
             
             if row: # Overwriting unverified
-                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (new_pass, email, code, verified, new_user))
+                con.execute("UPDATE users SET password=?, email=?, verification_code=?, is_verified=? WHERE username=?", (_hash_thrive_password(new_pass), email, code, verified, new_user))
             else:
-                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, new_pass, email, code, verified))
+                con.execute("INSERT INTO users(username, password, email, verification_code, is_verified) VALUES(?,?,?,?,?)", (new_user, _hash_thrive_password(new_pass), email, code, verified))
                 for bot in _default_bot_contacts():
                     if bot != new_user:
                         con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (new_user, bot))
@@ -2587,6 +2738,10 @@ def handle_client(cs, addr):
                 con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
             con.commit()
             con.close()
+            # Keep the paired account password identical at the only moment the plaintext exists.
+            # WordPress may have its own verification policy; Thrive verification remains unchanged.
+            if email:
+                _provision_wordpress_user(new_user, email, new_pass, is_admin=False)
 
             if not verified:
                 if EmailManager.send_email(email, "Thrive Messenger - Verify Account", f"Your verification code is: {code}"):
@@ -2598,7 +2753,6 @@ def handle_client(cs, addr):
             else:
                 sock.sendall((json.dumps({"action": "create_account_success"}) + "\n").encode())
                 if email:
-                    _provision_wordpress_user(new_user, email, is_admin=False)
                     EmailManager.send_email(
                         email,
                         "Welcome to Thrive Messenger",
@@ -2616,7 +2770,6 @@ def handle_client(cs, addr):
                 con.execute("UPDATE users SET is_verified=1, verification_code=NULL WHERE username=?", (u_ver,))
                 con.commit(); con.close()
                 if row[1]:
-                    _provision_wordpress_user(u_ver, row[1], is_admin=False)
                     EmailManager.send_email(
                         row[1],
                         "Thrive Messenger - Account Verified",
@@ -2659,8 +2812,9 @@ def handle_client(cs, addr):
             con = sqlite3.connect(DB)
             row = con.execute("SELECT reset_code FROM users WHERE username=?", (t_user,)).fetchone()
             if row and row[0] == t_code and t_code:
-                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (new_p, t_user))
+                con.execute("UPDATE users SET password=?, reset_code=NULL WHERE username=?", (_hash_thrive_password(new_p), t_user))
                 con.commit(); con.close()
+                _push_wordpress_password(t_user, new_p)
                 sock.sendall(json.dumps({"status": "ok"}).encode() + b"\n")
             else:
                 con.close()
@@ -2705,10 +2859,16 @@ def handle_client(cs, addr):
             return
 
         if action == "login":
-            if not _verify_password_for_login(row[1], req.get("pass", "")):
-                sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
-                db.close()
-                return
+            supplied_password = str(req.get("pass", ""))
+            if not _verify_password_for_login(row[1], supplied_password):
+                # Lazy migration for linked accounts whose old hashes predate password sync.
+                if _wordpress_verify_password(row[0], supplied_password):
+                    db.execute("UPDATE users SET password=? WHERE username=?", (_hash_thrive_password(supplied_password), row[0]))
+                    db.commit()
+                else:
+                    sock.sendall(b'{"status":"error","reason":"Invalid credentials"}\n')
+                    db.close()
+                    return
         else:
             passkey_token = str(req.get("passkey_token", "") or "").strip()
             if not passkey_token:
@@ -4273,8 +4433,9 @@ def handle_client(cs, addr):
                         else:
                             ok = (stored == cur_pass)
                     if ok:
-                        con.execute("UPDATE users SET password=? WHERE username=?", (_ph.hash(new_pass), user))
+                        con.execute("UPDATE users SET password=? WHERE username=?", (_hash_thrive_password(new_pass), user))
                         con.commit(); con.close()
+                        _push_wordpress_password(user, new_pass)
                         sock.sendall((json.dumps({"action": "change_password_result", "ok": True}) + "\n").encode())
                     else:
                         con.close()
@@ -4381,11 +4542,71 @@ def serve_loop(config):
             import time
             time.sleep(1)
 
+class _WordPressHTTPSHandler(BaseHTTPRequestHandler):
+    """Small, private HTTPS endpoint for WordPress password events and fallback checks."""
+    def log_message(self, format, *args):
+        # Request paths and bodies can contain sensitive account data; do not emit access logs here.
+        return
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if length < 1 or length > 16384:
+                raise ValueError()
+            request = json.loads(self.rfile.read(length).decode('utf-8'))
+            if not isinstance(request, dict):
+                raise ValueError()
+        except Exception:
+            self._reply({'status': 'error', 'reason': 'Invalid request.'}, 400)
+            return
+        if self.path == '/thrive-server-sync/v1/password':
+            result = _handle_wordpress_password_sync(request)
+            self._reply(result, 200 if result.get('status') == 'ok' else 403)
+            return
+        if self.path == '/thrive-server-sync/v1/verify-password':
+            ok, reason = _verify_wordpress_password_signature(request, 'wordpress')
+            if not ok:
+                self._reply({'status': 'error', 'reason': reason}, 403)
+                return
+            con = sqlite3.connect(DB)
+            try:
+                row = con.execute('SELECT password FROM users WHERE username=? COLLATE NOCASE LIMIT 1', (str(request.get('username') or ''),)).fetchone()
+            finally:
+                con.close()
+            self._reply({'status': 'ok', 'matched': bool(row and _verify_password_for_login(row[0], request.get('password', '')))}, 200)
+            return
+        self._reply({'status': 'error', 'reason': 'Not found.'}, 404)
+
+    def _reply(self, payload, status):
+        encoded = json.dumps(payload).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+def serve_wordpress_https(config):
+    port = int(wordpress_config.get('https_port') or 0)
+    if port < 1:
+        return
+    httpd = _ThreadingHTTPServer((config.get('bind_host', '0.0.0.0'), port), _WordPressHTTPSHandler)
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    try:
+        context.load_cert_chain(certfile=config['certfile'], keyfile=config['keyfile'])
+    except (FileNotFoundError, ssl.SSLError):
+        httpd.server_close()
+        return
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    httpd.serve_forever()
+
 def handle_create(user, password, email=""):
     con = sqlite3.connect(DB)
     existing = con.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?)", (user,)).fetchone()
     if not existing:
-        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, password, email))
+        con.execute("INSERT INTO users(username,password,email,is_verified) VALUES(?,?,?,1)", (user, _hash_thrive_password(password), email))
         con.commit(); con.close()
         print(f"User '{user}' created.")
         return True
@@ -4472,6 +4693,8 @@ def main():
     server_port = config['port']
     init_db()
     threading.Thread(target=serve_loop, args=(config,), daemon=True).start()
+    if int(wordpress_config.get('https_port') or 0) > 0:
+        threading.Thread(target=serve_wordpress_https, args=(config,), daemon=True).start()
     run_cli()
 
 if __name__=="__main__": main()

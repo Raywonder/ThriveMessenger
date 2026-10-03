@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Thrive Server Sync
- * Description: Adds WordPress authentication support by linking WordPress accounts to a Thrive Messenger server without sharing WordPress passwords.
- * Version: 0.1.0
+ * Description: Links WordPress and Thrive Messenger accounts, including secure password synchronization for linked accounts.
+ * Version: 0.2.0
  * Author: Thrive Messenger contributors
  * License: GPL-2.0-or-later
  */
@@ -15,6 +15,8 @@ final class Thrive_Server_Sync_Plugin {
     private const OPTION = 'thrive_server_sync_settings';
     private const META_LAST_SYNC = '_thrive_last_sync';
     private const META_LINKED_USERNAME = '_thrive_linked_username';
+    private static array $pending_passwords = [];
+    private static array $suppress_password_echo = [];
     private const UPDATE_FEED_URL = 'https://im.tappedin.fm/updates/thrive-server-sync.json';
 
     public static function init(): void {
@@ -24,6 +26,9 @@ final class Thrive_Server_Sync_Plugin {
         add_action('profile_update', [__CLASS__, 'sync_user_by_id'], 20, 1);
         add_action('set_user_role', [__CLASS__, 'sync_user_by_id'], 20, 1);
         add_action('wp_login', [__CLASS__, 'sync_user_on_login'], 20, 2);
+        add_filter('wp_pre_insert_user_data', [__CLASS__, 'capture_password_before_user_save'], 20, 4);
+        add_action('wp_set_password', [__CLASS__, 'sync_password_after_set'], 20, 3);
+        add_filter('authenticate', [__CLASS__, 'fallback_authenticate_with_thrive'], 30, 3);
         add_action('rest_api_init', [__CLASS__, 'register_rest_routes']);
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_for_plugin_update']);
         add_filter('plugins_api', [__CLASS__, 'plugin_info'], 10, 3);
@@ -36,6 +41,8 @@ final class Thrive_Server_Sync_Plugin {
             'port' => '2005',
             'use_tls' => '0',
             'sync_secret' => '',
+            'server_rest_url' => '',
+            'provision_role' => 'subscriber',
             'update_feed_url' => self::UPDATE_FEED_URL,
         ];
     }
@@ -76,6 +83,8 @@ final class Thrive_Server_Sync_Plugin {
             'port' => (string) max(1, min(65535, (int) ($input['port'] ?? $defaults['port']))),
             'use_tls' => empty($input['use_tls']) ? '0' : '1',
             'sync_secret' => sanitize_text_field($input['sync_secret'] ?? ''),
+            'server_rest_url' => esc_url_raw($input['server_rest_url'] ?? ''),
+            'provision_role' => sanitize_key($input['provision_role'] ?? 'subscriber'),
             'update_feed_url' => esc_url_raw($input['update_feed_url'] ?? $defaults['update_feed_url']),
         ];
     }
@@ -98,6 +107,7 @@ final class Thrive_Server_Sync_Plugin {
                                 <input type="checkbox" name="<?php echo esc_attr(self::OPTION); ?>[enabled]" value="1" <?php checked($settings['enabled'], '1'); ?>>
                                 <?php esc_html_e('Sync WordPress users to Thrive Messenger', 'thrive-server-sync'); ?>
                             </label>
+                            <p class="description"><?php esc_html_e('When enabled on both systems with the same secret, linked accounts use one password.', 'thrive-server-sync'); ?></p>
                         </td>
                     </tr>
                     <tr>
@@ -121,6 +131,25 @@ final class Thrive_Server_Sync_Plugin {
                         <th scope="row"><label for="thrive-sync-secret"><?php esc_html_e('Sync secret', 'thrive-server-sync'); ?></label></th>
                         <td>
                             <input id="thrive-sync-secret" class="regular-text" type="password" autocomplete="new-password" name="<?php echo esc_attr(self::OPTION); ?>[sync_secret]" value="<?php echo esc_attr($settings['sync_secret']); ?>">
+                            <p class="description"><?php esc_html_e('Use a long, unique secret that exactly matches the Thrive server configuration. Passwords are sent only over HTTPS and are never stored in this setting.', 'thrive-server-sync'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="thrive-server-rest-url"><?php esc_html_e('Thrive HTTPS sync URL', 'thrive-server-sync'); ?></label></th>
+                        <td>
+                            <input id="thrive-server-rest-url" class="regular-text code" type="url" inputmode="url" name="<?php echo esc_attr(self::OPTION); ?>[server_rest_url]" value="<?php echo esc_attr($settings['server_rest_url']); ?>" aria-describedby="thrive-server-rest-url-help">
+                            <p id="thrive-server-rest-url-help" class="description"><?php esc_html_e('Required for password sync and fallback login. Example: https://messenger.example.com:2006', 'thrive-server-sync'); ?></p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="thrive-provision-role"><?php esc_html_e('Role for accounts created from Thrive', 'thrive-server-sync'); ?></label></th>
+                        <td>
+                            <select id="thrive-provision-role" name="<?php echo esc_attr(self::OPTION); ?>[provision_role]" aria-describedby="thrive-provision-role-help">
+                                <?php foreach (wp_roles()->get_names() as $role => $role_name) : ?>
+                                    <option value="<?php echo esc_attr($role); ?>" <?php selected($settings['provision_role'], $role); ?>><?php echo esc_html($role_name); ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                            <p id="thrive-provision-role-help" class="description"><?php esc_html_e('New WordPress accounts created for Thrive users receive this role. Subscriber is the default.', 'thrive-server-sync'); ?></p>
                         </td>
                     </tr>
                     <tr>
@@ -145,7 +174,7 @@ final class Thrive_Server_Sync_Plugin {
             return $transient;
         }
         $plugin_file = plugin_basename(__FILE__);
-        if (version_compare((string) $info['version'], '0.1.0', '<=')) {
+        if (version_compare((string) $info['version'], '0.2.0', '<=')) {
             return $transient;
         }
         $transient->response[$plugin_file] = (object) [
@@ -169,7 +198,7 @@ final class Thrive_Server_Sync_Plugin {
         return (object) [
             'name' => 'Thrive Server Sync',
             'slug' => 'thrive-server-sync',
-            'version' => (string) ($info['version'] ?? '0.1.0'),
+            'version' => (string) ($info['version'] ?? '0.2.0'),
             'author' => 'Thrive Messenger contributors',
             'homepage' => (string) ($info['homepage'] ?? 'https://im.tappedin.fm'),
             'download_link' => (string) ($info['download_url'] ?? ''),
@@ -212,10 +241,53 @@ final class Thrive_Server_Sync_Plugin {
         }
     }
 
+    public static function capture_password_before_user_save(array $data, bool $update, $user_id, array $userdata): array {
+        $login = self::sanitize_thrive_username((string) ($data['user_login'] ?? $userdata['user_login'] ?? ''));
+        $password = (string) ($userdata['user_pass'] ?? '');
+        if ($login !== '' && $password !== '' && substr($password, 0, 1) !== '$') {
+            self::$pending_passwords[$login] = $password;
+        }
+        return $data;
+    }
+
+    public static function sync_password_after_set(string $password, int $user_id, WP_User $old_user_data): void {
+        if (!empty(self::$suppress_password_echo[(string) $user_id])) {
+            return;
+        }
+        $user = get_user_by('id', $user_id);
+        if ($user instanceof WP_User) {
+            self::push_password_to_thrive($user, $password);
+        }
+    }
+
+    public static function fallback_authenticate_with_thrive($user, string $username, string $password) {
+        if (!$user instanceof WP_Error || $username === '' || $password === '') {
+            return $user;
+        }
+        $wp_user = get_user_by('login', $username);
+        if (!$wp_user instanceof WP_User || !self::verify_with_thrive($wp_user, $password)) {
+            return $user;
+        }
+        self::$suppress_password_echo[(string) $wp_user->ID] = true;
+        wp_set_password($password, (int) $wp_user->ID);
+        unset(self::$suppress_password_echo[(string) $wp_user->ID]);
+        return get_user_by('id', (int) $wp_user->ID);
+    }
+
     public static function register_rest_routes(): void {
         register_rest_route('thrive-server-sync/v1', '/provision-user', [
             'methods' => 'POST',
             'callback' => [__CLASS__, 'rest_provision_user'],
+            'permission_callback' => '__return_true',
+        ]);
+        register_rest_route('thrive-server-sync/v1', '/password', [
+            'methods' => 'POST',
+            'callback' => [__CLASS__, 'rest_set_password'],
+            'permission_callback' => '__return_true',
+        ]);
+        register_rest_route('thrive-server-sync/v1', '/verify-password', [
+            'methods' => 'POST',
+            'callback' => [__CLASS__, 'rest_verify_password'],
             'permission_callback' => '__return_true',
         ]);
     }
@@ -230,7 +302,7 @@ final class Thrive_Server_Sync_Plugin {
         if (!is_array($payload)) {
             $payload = [];
         }
-        $verified = self::verify_provision_signature($payload, $settings['sync_secret']);
+        $verified = self::verify_password_event($payload, $settings['sync_secret'], 'thrive', 'provision_user');
         if ($verified !== true) {
             return new WP_REST_Response(['status' => 'error', 'reason' => $verified], 403);
         }
@@ -249,15 +321,23 @@ final class Thrive_Server_Sync_Plugin {
         $created = false;
         if ($user instanceof WP_User) {
             $user_id = (int) $user->ID;
+            self::$suppress_password_echo[(string) $user_id] = true;
+            wp_set_password((string) $payload['password'], $user_id);
+            unset(self::$suppress_password_echo[(string) $user_id]);
         } else {
-            $password = wp_generate_password(32, true, true);
+            $password = (string) ($payload['password'] ?? '');
+            if ($password === '') {
+                return new WP_REST_Response(['status' => 'error', 'reason' => 'Password is required.'], 400);
+            }
+            self::$suppress_password_echo[$username] = true;
             $user_id = wp_insert_user([
                 'user_login' => $username,
                 'user_email' => $email,
                 'user_pass' => $password,
                 'display_name' => $username,
-                'role' => 'subscriber',
+                'role' => self::provision_role($settings),
             ]);
+            unset(self::$suppress_password_echo[$username]);
             if (is_wp_error($user_id)) {
                 return new WP_REST_Response(['status' => 'error', 'reason' => $user_id->get_error_message()], 500);
             }
@@ -281,6 +361,38 @@ final class Thrive_Server_Sync_Plugin {
         ];
     }
 
+    public static function rest_set_password(WP_REST_Request $request) {
+        $settings = self::get_settings();
+        $payload = $request->get_json_params();
+        $payload = is_array($payload) ? $payload : [];
+        $verified = self::verify_password_event($payload, $settings['sync_secret'], 'thrive', 'thrive_set_password');
+        if ($settings['enabled'] !== '1' || $verified !== true) {
+            return new WP_REST_Response(['status' => 'error', 'reason' => $verified === true ? 'Thrive Server Sync is disabled.' : $verified], 403);
+        }
+        $user = get_user_by('id', (int) ($payload['wp_user_id'] ?? 0));
+        if (!$user instanceof WP_User || self::thrive_username($user) !== self::sanitize_thrive_username((string) ($payload['username'] ?? ''))) {
+            return new WP_REST_Response(['status' => 'error', 'reason' => 'Linked WordPress user was not found.'], 404);
+        }
+        self::$suppress_password_echo[(string) $user->ID] = true;
+        wp_set_password((string) $payload['password'], (int) $user->ID);
+        unset(self::$suppress_password_echo[(string) $user->ID]);
+        return ['status' => 'ok'];
+    }
+
+    public static function rest_verify_password(WP_REST_Request $request) {
+        $settings = self::get_settings();
+        $payload = $request->get_json_params();
+        $payload = is_array($payload) ? $payload : [];
+        $verified = self::verify_password_event($payload, $settings['sync_secret'], 'thrive', 'verify_thrive_password');
+        if ($settings['enabled'] !== '1' || $verified !== true) {
+            return new WP_REST_Response(['status' => 'error', 'reason' => $verified === true ? 'Thrive Server Sync is disabled.' : $verified], 403);
+        }
+        $user = get_user_by('id', (int) ($payload['wp_user_id'] ?? 0));
+        $matched = $user instanceof WP_User && self::thrive_username($user) === self::sanitize_thrive_username((string) ($payload['username'] ?? ''))
+            && wp_check_password((string) $payload['password'], (string) $user->user_pass, (int) $user->ID);
+        return ['status' => 'ok', 'matched' => $matched];
+    }
+
     private static function sync_user(WP_User $user): void {
         $settings = self::get_settings();
         if ($settings['enabled'] !== '1' || trim($settings['sync_secret']) === '') {
@@ -288,6 +400,9 @@ final class Thrive_Server_Sync_Plugin {
         }
 
         $username = self::thrive_username($user);
+        if (!empty(self::$suppress_password_echo[$username])) {
+            return;
+        }
         $is_admin = user_can($user, 'manage_options') ? '1' : '0';
         $timestamp = (string) time();
         $nonce = wp_generate_password(24, false, false);
@@ -312,6 +427,11 @@ final class Thrive_Server_Sync_Plugin {
 
         if (($result['status'] ?? '') === 'ok') {
             update_user_meta($user->ID, self::META_LINKED_USERNAME, $username);
+            if (isset(self::$pending_passwords[$username])) {
+                $password = self::$pending_passwords[$username];
+                unset(self::$pending_passwords[$username]);
+                self::push_password_to_thrive($user, $password);
+            }
         }
     }
 
@@ -343,15 +463,24 @@ final class Thrive_Server_Sync_Plugin {
         ]), $secret);
     }
 
-    private static function verify_provision_signature(array $payload, string $secret) {
+    private static function password_digest(string $password): string {
+        return hash('sha256', $password);
+    }
+
+    private static function password_signature(array $payload, string $secret): string {
+        return hash_hmac('sha256', implode("\n", [
+            (string) ($payload['action'] ?? ''), (string) ($payload['timestamp'] ?? ''), (string) ($payload['nonce'] ?? ''),
+            (string) ($payload['wp_user_id'] ?? ''), (string) ($payload['username'] ?? ''), (string) ($payload['email'] ?? ''),
+            (string) ($payload['is_admin'] ?? ''), (string) ($payload['origin'] ?? ''), (string) ($payload['password_digest'] ?? ''),
+        ]), $secret);
+    }
+
+    private static function verify_password_event(array $payload, string $secret, string $origin, string $action) {
         $timestamp = (int) ($payload['timestamp'] ?? 0);
         $nonce = sanitize_text_field((string) ($payload['nonce'] ?? ''));
         $signature = strtolower(sanitize_text_field((string) ($payload['signature'] ?? '')));
-        $username = self::sanitize_thrive_username((string) ($payload['username'] ?? ''));
-        $email = sanitize_email((string) ($payload['email'] ?? ''));
-        $is_admin = empty($payload['is_admin']) || $payload['is_admin'] === '0' ? '0' : '1';
-
-        if (!$timestamp || $nonce === '' || $signature === '') {
+        $password = (string) ($payload['password'] ?? '');
+        if (!$timestamp || $nonce === '' || $signature === '' || $password === '' || ($payload['origin'] ?? '') !== $origin || ($payload['action'] ?? '') !== $action) {
             return 'Missing timestamp, nonce, or signature.';
         }
         if (abs(time() - $timestamp) > 300) {
@@ -362,18 +491,66 @@ final class Thrive_Server_Sync_Plugin {
             return 'Replay detected.';
         }
 
-        $expected = hash_hmac('sha256', implode("\n", [
-            (string) $timestamp,
-            $nonce,
-            $username,
-            $email,
-            $is_admin,
-        ]), $secret);
+        $payload['password_digest'] = self::password_digest($password);
+        $expected = self::password_signature($payload, $secret);
         if (!hash_equals($expected, $signature)) {
             return 'Invalid signature.';
         }
         set_transient($transient_key, '1', 10 * MINUTE_IN_SECONDS);
         return true;
+    }
+
+    private static function provision_role(array $settings): string {
+        $role = sanitize_key((string) ($settings['provision_role'] ?? 'subscriber'));
+        return array_key_exists($role, wp_roles()->get_names()) ? $role : 'subscriber';
+    }
+
+    private static function password_event(WP_User $user, string $password, string $action, string $origin): array {
+        $payload = [
+            'action' => $action,
+            'timestamp' => (string) time(),
+            'nonce' => wp_generate_password(24, false, false),
+            'wp_user_id' => (string) $user->ID,
+            'username' => self::thrive_username($user),
+            'email' => (string) $user->user_email,
+            'wp_login' => (string) $user->user_login,
+            'is_admin' => user_can($user, 'manage_options') ? '1' : '0',
+            'origin' => $origin,
+            'password' => $password,
+        ];
+        $payload['password_digest'] = self::password_digest($password);
+        return $payload;
+    }
+
+    private static function post_to_thrive(string $path, array $payload, array $settings): array {
+        $base = rtrim((string) ($settings['server_rest_url'] ?? ''), '/');
+        if (strpos($base, 'https://') !== 0) {
+            return ['status' => 'skipped'];
+        }
+        $payload['signature'] = self::password_signature($payload, (string) $settings['sync_secret']);
+        $response = wp_remote_post($base . $path, ['timeout' => 12, 'headers' => ['Content-Type' => 'application/json'], 'body' => wp_json_encode($payload)]);
+        if (is_wp_error($response)) {
+            return ['status' => 'error'];
+        }
+        $decoded = json_decode((string) wp_remote_retrieve_body($response), true);
+        return is_array($decoded) ? $decoded : ['status' => 'error'];
+    }
+
+    private static function push_password_to_thrive(WP_User $user, string $password): void {
+        $settings = self::get_settings();
+        if ($settings['enabled'] !== '1' || trim((string) $settings['sync_secret']) === '') {
+            return;
+        }
+        self::post_to_thrive('/thrive-server-sync/v1/password', self::password_event($user, $password, 'wordpress_set_password', 'wordpress'), $settings);
+    }
+
+    private static function verify_with_thrive(WP_User $user, string $password): bool {
+        $settings = self::get_settings();
+        if ($settings['enabled'] !== '1' || trim((string) $settings['sync_secret']) === '') {
+            return false;
+        }
+        $result = self::post_to_thrive('/thrive-server-sync/v1/verify-password', self::password_event($user, $password, 'verify_wordpress_password', 'wordpress'), $settings);
+        return !empty($result['matched']);
     }
 
     private static function send_payload(array $payload, array $settings): array {
