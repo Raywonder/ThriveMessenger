@@ -18,6 +18,7 @@ import re
 import uuid
 import sqlite3
 import ssl
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -28,6 +29,12 @@ try:
     from argon2 import PasswordHasher
 except Exception:  # pragma: no cover - optional server dependency
     PasswordHasher = None  # type: ignore
+
+
+# Bump this whenever a meaningful CLI feature/fix lands, so `thrive-cli version`
+# and `thrive-cli self-update` have something real to compare against.
+CLI_VERSION = "2026.10.02-contact-admin-cmds"
+REPO_ROOT = Path(__file__).resolve().parents[2]  # .../apps/ThriveMessenger
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "srv.conf"
@@ -471,6 +478,90 @@ def cmd_react(args: argparse.Namespace) -> None:
         if ev.get("action") == "reaction_failed":
             fail(ev.get("reason") or "Reaction refused.", args.json)
         emit({"status": "ok", "message_id": args.message_id, "emoji": emoji, "on": not args.off, "reactions": ev.get("reactions")}, args.json)
+    finally:
+        sock.close()
+
+
+def cmd_contact(args: argparse.Namespace) -> None:
+    """Manage your own contact list like the GUI does: add, remove, block, unblock."""
+    sock = login(args)
+    try:
+        act = args.contact_action
+        if act == "add":
+            send_json(sock, {"action": "add_contact", "to": args.username_target})
+            ev = recv_until_action(sock, ["add_contact_success", "add_contact_failed"], timeout=8.0)
+            if ev.get("action") == "add_contact_failed":
+                fail(ev.get("reason") or "Could not add contact.", args.json,
+                     suggest_invite=ev.get("suggest_invite"), invite_methods=ev.get("invite_methods"))
+            emit({"status": "ok", "added": args.username_target, "contact": ev.get("contact")}, args.json)
+        elif act in ("remove", "delete"):
+            send_json(sock, {"action": "delete_contact", "to": args.username_target})
+            time.sleep(0.3)
+            emit({"status": "ok", "removed": args.username_target}, args.json)
+        elif act in ("block", "unblock"):
+            send_json(sock, {"action": f"{act}_contact", "to": args.username_target})
+            time.sleep(0.3)
+            emit({"status": "ok", act + "ed": args.username_target}, args.json)
+    finally:
+        sock.close()
+
+
+def cmd_version(args: argparse.Namespace) -> None:
+    """Show the running CLI version and, if this is a git checkout, the current commit."""
+    info: Dict[str, Any] = {"status": "ok", "version": CLI_VERSION, "path": str(Path(__file__).resolve())}
+    if (REPO_ROOT / ".git").exists():
+        try:
+            commit = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
+                                     capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+            branch = subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+                                     capture_output=True, text=True, timeout=10, check=True).stdout.strip()
+            info.update(commit=commit, branch=branch, repo=str(REPO_ROOT))
+        except Exception as exc:
+            info["git_error"] = str(exc)
+    emit(info, args.json)
+
+
+def cmd_self_update(args: argparse.Namespace) -> None:
+    """Pull the latest thrive_cli.py (and the rest of the repo) from git, so every user/agent stays on the
+    same version as the live server. Safe no-op if already up to date; refuses on a dirty tree unless --force."""
+    if not (REPO_ROOT / ".git").exists():
+        fail(f"{REPO_ROOT} is not a git checkout; can't self-update. Pull manually or reinstall from the repo.", args.json)
+
+    def run(cmd: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60)
+
+    before = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    status = run(["git", "status", "--porcelain"]).stdout
+    dirty = [ln for ln in status.splitlines() if not re.match(r"^\?\? .*\.bak", ln)]
+    if dirty and not args.force:
+        fail("Local changes present in the repo; refusing to update. Re-run with --force to stash and update anyway, "
+             "or commit/discard your changes first.", args.json, dirty_files=[ln.strip() for ln in dirty])
+    stashed = False
+    if dirty and args.force:
+        run(["git", "stash", "push", "-u", "-m", "thrive-cli self-update auto-stash"])
+        stashed = True
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    fetch = run(["git", "fetch", "--all", "--prune"])
+    if fetch.returncode != 0:
+        fail(f"git fetch failed: {fetch.stderr.strip()}", args.json)
+    pull = run(["git", "pull", "--ff-only"])
+    after = run(["git", "rev-parse", "HEAD"]).stdout.strip()
+    if pull.returncode != 0:
+        fail(f"git pull --ff-only failed (branch may have diverged): {pull.stderr.strip()}", args.json,
+             before=before, branch=branch)
+    emit({"status": "ok", "branch": branch, "before": before, "after": after,
+          "updated": before != after, "stashed_local_changes": stashed,
+          "note": "Restart any running thrive_cli listeners/bots so they load the new code."}, args.json)
+
+
+def cmd_admin_cmd(args: argparse.Namespace) -> None:
+    """Run any server admin console slash-command (same ones the GUI's admin console has): help, alert, create,
+    invite, accountlimit, ban, unban, del, admin, unadmin, banfile, unbanfile, gpolicy, restart, exit."""
+    sock = login(args)
+    try:
+        send_json(sock, {"action": "admin_cmd", "cmd": args.cmdline})
+        ev = recv_until_action(sock, ["admin_response"], timeout=10.0)
+        emit({"status": "ok", "response": ev.get("response")}, args.json)
     finally:
         sock.close()
 
@@ -1261,6 +1352,26 @@ def build_parser() -> argparse.ArgumentParser:
     room.add_argument("--limit", type=int, default=30, help="How many messages (history).")
     room.add_argument("--split-at", type=int, default=4000, help="Split longer posts into labelled parts.")
     room.set_defaults(func=cmd_room)
+
+    contact = sub.add_parser("contact", help="Manage your own contact list like the GUI: add, remove, block, unblock.")
+    add_login_args(contact)
+    contact.add_argument("contact_action", choices=["add", "remove", "delete", "block", "unblock"])
+    contact.add_argument("username_target", help="The username to add, remove, block, or unblock.")
+    contact.set_defaults(func=cmd_contact)
+
+    admin_cmd = sub.add_parser("admin-cmd", help="Run any server admin console slash-command, same as the GUI's admin console (admin account required).")
+    add_login_args(admin_cmd)
+    admin_cmd.add_argument("cmdline", help="The slash-command text, e.g. 'help' or 'ban someuser 12/31/2026 spam'.")
+    admin_cmd.set_defaults(func=cmd_admin_cmd)
+
+    version = sub.add_parser("version", help="Show the CLI version and current git commit/branch.")
+    version.add_argument("--json", action="store_true")
+    version.set_defaults(func=cmd_version, json=False)
+
+    self_update = sub.add_parser("self-update", help="git pull the repo this CLI lives in, so it matches the latest server/CLI version.")
+    self_update.add_argument("--json", action="store_true")
+    self_update.add_argument("--force", action="store_true", help="Stash local changes and update anyway.")
+    self_update.set_defaults(func=cmd_self_update, json=False)
 
     send_file = sub.add_parser("send-file", help="Offer one or more files to a user and send after acceptance.")
     add_login_args(send_file)
