@@ -58,6 +58,7 @@ LEGACY_SAFE_FEATURE_CAPS = {
     "group_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "group_policy": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
     "admin_console": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
+    "admin_create_account": {"enabled": False, "ui_visible": False, "scope": "admin", "can_use": False},
     "voice_call": {"enabled": False, "ui_visible": False, "scope": "all", "can_use": False},
     "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "can_use": True},
 }
@@ -2868,6 +2869,8 @@ class ClientApp(wx.App):
                     elif act == "admin_response": wx.CallAfter(self.frame.on_admin_response, msg.get("response", ""))
                     elif act == "server_info_response": wx.CallAfter(self.frame.on_server_info_response, msg)
                     elif act == "user_directory_response": wx.CallAfter(self.frame.on_user_directory_response, msg)
+                    elif act == "admin_pending_accounts": wx.CallAfter(self.frame.on_admin_pending_accounts_response, msg)
+                    elif act == "admin_account_result": wx.CallAfter(self.frame.on_admin_account_result, msg)
                     elif act == "user_joined_server": wx.CallAfter(self.frame.on_user_joined_server, msg.get("user", ""))
                     elif act == "admin_status_change": wx.CallAfter(self.frame.on_admin_status_change, msg.get("user"), msg.get("is_admin"))
                     elif act == "server_alert": wx.CallAfter(self.frame.on_server_alert, msg.get("message", ""))
@@ -3859,7 +3862,7 @@ class SavedMessagesDialog(wx.Dialog):
 
 class UserDirectoryDialog(wx.Dialog):
     def __init__(self, parent_frame, users, my_username, contact_states):
-        super().__init__(parent_frame, title="User Directory", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        super().__init__(parent_frame, title="Find People", size=(550, 500), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_key)
         self.parent_frame = parent_frame; self.my_username = my_username; self.contact_states = contact_states
         self._all_users = users; self._selected_user = None
@@ -4717,6 +4720,10 @@ class MainFrame(wx.Frame):
         self.mi_admin_visible = admin_visible
         if hasattr(self, "mi_admin_console"):
             self.mi_admin_console.Enable(admin_enabled and admin_visible)
+        if hasattr(self, "mi_admin_create_account"):
+            enabled = self._feature_can_use("admin_create_account") and self._feature_ui_visible("admin_create_account")
+            self.mi_admin_create_account.Enable(enabled)
+            self.mi_admin_pending_accounts.Enable(enabled)
         self.btn_admin.Hide()
         self.btn_admin.Enable(admin_enabled and admin_visible)
         if hasattr(self, "btn_settings"):
@@ -4752,7 +4759,7 @@ class MainFrame(wx.Frame):
         self.mi_delete_contact = contacts_actions_menu.Append(wx.ID_ANY, "Delete Contact\tDelete")
         self.mi_file_block_toggle = contacts_actions_menu.Append(wx.ID_ANY, "Block/Unblock\tAlt+B")
         self.mi_file_toggle_chat_log = contacts_actions_menu.Append(wx.ID_ANY, "Toggle Chat History For Selected Contact")
-        self.mi_user_directory = contacts_actions_menu.Append(wx.ID_ANY, "User Directory\tAlt+Y")
+        self.mi_user_directory = contacts_actions_menu.Append(wx.ID_ANY, "Find People\tAlt+Y")
         self.mi_file_refresh_directory = contacts_actions_menu.Append(wx.ID_ANY, "Refresh Directory")
         file_menu.AppendSubMenu(contacts_actions_menu, "Contacts")
 
@@ -4762,6 +4769,8 @@ class MainFrame(wx.Frame):
         self.mi_server_manager = server_menu.Append(wx.ID_ANY, "Server Manager")
         self.mi_bot_rules = server_menu.Append(wx.ID_ANY, "Manage Bot Rules")
         self.mi_group_policy = server_menu.Append(wx.ID_ANY, "Manage Group Policy")
+        self.mi_admin_create_account = server_menu.Append(wx.ID_ANY, "Create New Account...")
+        self.mi_admin_pending_accounts = server_menu.Append(wx.ID_ANY, "Pending Accounts")
         file_menu.AppendSubMenu(server_menu, "Server and Admin")
 
         account_menu = wx.Menu()
@@ -4828,6 +4837,8 @@ class MainFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_admin, self.mi_admin_console)
         self.Bind(wx.EVT_MENU, self.on_manage_bot_rules, self.mi_bot_rules)
         self.Bind(wx.EVT_MENU, self.on_manage_group_policy, self.mi_group_policy)
+        self.Bind(wx.EVT_MENU, self.on_admin_create_account, self.mi_admin_create_account)
+        self.Bind(wx.EVT_MENU, self.on_admin_pending_accounts, self.mi_admin_pending_accounts)
         self.Bind(wx.EVT_MENU, self.on_set_status, self.mi_status)
         self.Bind(wx.EVT_MENU, self.on_settings, self.mi_settings)
         self.Bind(wx.EVT_MENU, self.on_register_passkey, self.mi_register_passkey)
@@ -5174,6 +5185,41 @@ class MainFrame(wx.Frame):
         if self._directory_dlg:
             self._directory_dlg.Raise(); self._directory_dlg.SetFocus(); return
         self.sock.sendall(json.dumps({"action": "user_directory"}).encode() + b"\n")
+
+    def on_admin_create_account(self, _):
+        fields = (("Username", "Choose the person's Thrive username."), ("Display name", "Name shown to other members (optional)."), ("Email", "The person will receive their private setup link here."), ("Admin note", "Optional private note for pending-account administrators."))
+        values = []
+        for title, prompt in fields:
+            with wx.TextEntryDialog(self, prompt, f"Create New Account — {title}") as dlg:
+                if dlg.ShowModal() != wx.ID_OK:
+                    return
+                values.append(dlg.GetValue().strip())
+        if not values[0] or not values[2]:
+            wx.MessageBox("Username and email are required.", "Create New Account", wx.OK | wx.ICON_ERROR); return
+        self.sock.sendall(json.dumps({"action": "admin_create_account", "username": values[0], "display_name": values[1], "email": values[2], "note": values[3]}).encode() + b"\n")
+        show_notification("Create new account", "Account request sent. The person sets their own password from the email.", timeout=7)
+
+    def on_admin_pending_accounts(self, _):
+        self.sock.sendall(json.dumps({"action": "admin_pending_accounts"}).encode() + b"\n")
+
+    def on_admin_pending_accounts_response(self, msg):
+        rows = msg.get("accounts", [])
+        if not rows:
+            wx.MessageBox("There are no pending accounts.", "Pending Accounts", wx.OK | wx.ICON_INFORMATION); return
+        choices = [f"{r.get('username')} — {r.get('email')} — expires {r.get('expires_at')}" for r in rows]
+        with wx.SingleChoiceDialog(self, "Select a pending account. After choosing it, you can resend or cancel.", "Pending Accounts", choices) as dlg:
+            if dlg.ShowModal() != wx.ID_OK: return
+            username = rows[dlg.GetSelection()].get("username")
+        with wx.MessageDialog(self, f"Resend the setup email for {username}? Choose No to cancel the pending account.", "Pending Account", wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION) as action:
+            result = action.ShowModal()
+        if result == wx.ID_YES: self.sock.sendall(json.dumps({"action": "admin_resend_account", "username": username}).encode() + b"\n")
+        elif result == wx.ID_NO: self.sock.sendall(json.dumps({"action": "admin_cancel_account", "username": username}).encode() + b"\n")
+
+    def on_admin_account_result(self, msg):
+        title = "Account administration"
+        text = msg.get("reason", "Request complete.")
+        show_notification(title, text, timeout=8)
+        if not msg.get("ok", False): wx.MessageBox(text, title, wx.OK | wx.ICON_ERROR)
     def on_user_directory_response(self, msg):
         app = wx.GetApp()
         active = normalize_server_entry(getattr(app, "active_server_entry", {}))

@@ -16,7 +16,7 @@ Thrive Messenger is open source, meaning anyone is free to download, view and mo
 
 In order to use Thrive Messenger, you will need a Thrive Messenger account. All you need for an account is a username which will be used to add you as a contact, an optional email address, and a strong password that nobody can guess.
 
-You can create an account from the Thrive Messenger login dialog, or a server admin can create an account for you.
+You can create an account from the Thrive Messenger login dialog. An administrator can also send you a pending-account invitation: you still choose your own password, verify your email, and complete any authentication required by the server. Administrators cannot see or set your password. Pending invitations expire after the server's configured period (seven days by default), after which the username becomes available again.
 
 Please note: for both security and convenience, if the server you're using has SMTP enabled (see below), you are required to enter a valid email address when creating an account. This is so your account can be verified by email and you can easily reset your password if you forget it.
 

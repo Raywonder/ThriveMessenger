@@ -66,6 +66,7 @@ FEATURE_DEFAULTS = {
     "voice_call": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Direct voice call session and signaling features."},
     "group_policy": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Group policy management features."},
     "admin_console": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Server side admin command console."},
+    "admin_create_account": {"enabled": True, "ui_visible": True, "scope": "admin", "description": "Create and manage pending accounts on behalf of a person."},
     "server_manager": {"enabled": True, "ui_visible": True, "scope": "all", "description": "Server manager and server tools UI."},
 }
 
@@ -2191,6 +2192,8 @@ def init_db():
     cur.execute('''CREATE TABLE IF NOT EXISTS feature_allow_users (feature_key TEXT, username TEXT, PRIMARY KEY(feature_key, username))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS user_access_groups (group_name TEXT, username TEXT, PRIMARY KEY(group_name, username))''')
     cur.execute('''CREATE TABLE IF NOT EXISTS feature_allow_groups (feature_key TEXT, group_name TEXT, PRIMARY KEY(feature_key, group_name))''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS pending_accounts (username TEXT PRIMARY KEY, display_name TEXT, email TEXT NOT NULL, note TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_sent_at TEXT, cancelled_at TEXT, cancelled_by TEXT)''')
+    cur.execute('''CREATE TABLE IF NOT EXISTS account_admin_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT NOT NULL, action TEXT NOT NULL, username TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL)''')
     cur.execute('''CREATE TABLE IF NOT EXISTS file_bans (username TEXT, file_type TEXT, until_date TEXT, reason TEXT, PRIMARY KEY(username, file_type))''')
     # Add file_type column if table was created with an older schema
     fb_cols = [row[1] for row in cur.execute("PRAGMA table_info(file_bans)")]
@@ -2199,6 +2202,7 @@ def init_db():
     if 'reason' not in fb_cols: cur.execute("ALTER TABLE file_bans ADD COLUMN reason TEXT")
     conn.commit()
     cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('max_accounts_per_email', '0')")
+    cur.execute("INSERT OR IGNORE INTO server_settings(key, value) VALUES('pending_account_expiry_days', '7')")
     conn.commit()
     _seed_feature_defaults()
     conn.close()
@@ -2585,6 +2589,7 @@ def handle_client(cs, addr):
                         con.execute("INSERT OR IGNORE INTO contacts(owner,contact) VALUES(?,?)", (new_user, bot))
             if invite_token:
                 con.execute("UPDATE invite_tokens SET used=1 WHERE token=?", (invite_token,))
+                con.execute("DELETE FROM pending_accounts WHERE username=?", (new_user,))
             con.commit()
             con.close()
 
@@ -2979,6 +2984,57 @@ def handle_client(cs, addr):
                 groups = [r[0] for r in con.execute("SELECT group_name FROM user_access_groups WHERE username=? ORDER BY group_name", (target_user,)).fetchall()]
                 con.close()
                 sock.sendall((json.dumps({"action": "feature_group_list", "ok": True, "username": target_user, "groups": groups}) + "\n").encode())
+
+            elif action in ("admin_create_account", "admin_pending_accounts", "admin_resend_account", "admin_cancel_account"):
+                if not _is_admin(user) or not _can_user_use_feature(user, "admin_create_account"):
+                    _deny_feature("admin_create_account", "admin_account_result")
+                    continue
+                now = datetime.datetime.utcnow()
+                con = sqlite3.connect(DB)
+                con.execute("DELETE FROM pending_accounts WHERE expires_at<?", (now.isoformat(),))
+                if action == "admin_pending_accounts":
+                    rows = con.execute("SELECT username, display_name, email, note, created_by, created_at, expires_at, last_sent_at FROM pending_accounts ORDER BY created_at DESC").fetchall()
+                    con.commit(); con.close()
+                    _send_json_line(sock, {"action": "admin_pending_accounts", "ok": True, "accounts": [dict(zip(("username", "display_name", "email", "note", "created_by", "created_at", "expires_at", "last_sent_at"), row)) for row in rows]})
+                    continue
+                target = str(msg.get("username", "") or "").strip()
+                if not target:
+                    con.close(); _send_json_line(sock, {"action": "admin_account_result", "ok": False, "reason": "A username is required."}); continue
+                if action == "admin_create_account":
+                    email = str(msg.get("email", "") or "").strip()
+                    display_name = str(msg.get("display_name", "") or "").strip()
+                    note = str(msg.get("note", "") or "").strip()[:1000]
+                    if not email or "@" not in email or not target.replace("_", "").replace("-", "").isalnum():
+                        con.close(); _send_json_line(sock, {"action": "admin_account_result", "ok": False, "reason": "Enter a valid username and email address."}); continue
+                    recent = con.execute("SELECT COUNT(*) FROM account_admin_audit WHERE actor=? AND action='create' AND created_at>?", (user, (now - datetime.timedelta(hours=1)).isoformat())).fetchone()[0]
+                    taken = con.execute("SELECT 1 FROM users WHERE username=?", (target,)).fetchone() or con.execute("SELECT 1 FROM pending_accounts WHERE username=?", (target,)).fetchone()
+                    if recent >= 20 or taken:
+                        con.close(); _send_json_line(sock, {"action": "admin_account_result", "ok": False, "reason": "That username is unavailable, or the hourly account-creation limit was reached."}); continue
+                    days = max(1, min(30, int((con.execute("SELECT value FROM server_settings WHERE key='pending_account_expiry_days'").fetchone() or [7])[0] or 7)))
+                    expires = now + datetime.timedelta(days=days)
+                    con.commit(); con.close()
+                    token = _create_invite_token(target, email, user, expires_hours=days * 24)
+                    con = sqlite3.connect(DB)
+                    con.execute("INSERT INTO pending_accounts(username, display_name, email, note, created_by, created_at, expires_at, last_sent_at) VALUES(?,?,?,?,?,?,?,?)", (target, display_name, email, note, user, now.isoformat(), expires.isoformat(), now.isoformat()))
+                    con.execute("INSERT INTO account_admin_audit(actor, action, username, detail, created_at) VALUES(?,?,?,?,?)", (user, "create", target, note, now.isoformat()))
+                    con.commit(); con.close()
+                    link = f"https://im.tappedin.fm/?invite={urllib.parse.quote(token)}&user={urllib.parse.quote(target)}&email={urllib.parse.quote(email)}"
+                    sent = EmailManager.send_email(email, "You're invited to Thrive Messenger", f"{user} created a pending Thrive account for you on {server_identity}. Set your own password and verify your email here: {link}\n\nThis invitation expires {expires.isoformat()}.")
+                    _send_json_line(sock, {"action": "admin_account_result", "ok": bool(sent), "username": target, "reason": "Invitation email sent." if sent else "The account is pending, but the email could not be sent."})
+                    continue
+                row = con.execute("SELECT email, expires_at FROM pending_accounts WHERE username=?", (target,)).fetchone()
+                if not row:
+                    con.close(); _send_json_line(sock, {"action": "admin_account_result", "ok": False, "reason": "Pending account not found."}); continue
+                if action == "admin_cancel_account":
+                    con.execute("DELETE FROM pending_accounts WHERE username=?", (target,)); con.execute("DELETE FROM invite_tokens WHERE invited_user=? AND used=0", (target,)); detail = "cancelled"
+                    sent = True
+                else:
+                    con.commit(); con.close()
+                    token = _create_invite_token(target, row[0], user, expires_hours=max(1, int((datetime.datetime.fromisoformat(row[1]) - now).total_seconds() / 3600)))
+                    con = sqlite3.connect(DB)
+                    con.execute("UPDATE pending_accounts SET last_sent_at=? WHERE username=?", (now.isoformat(), target)); detail = "resent"; sent = EmailManager.send_email(row[0], "Your Thrive Messenger invitation", f"Complete your account setup: https://im.tappedin.fm/?invite={urllib.parse.quote(token)}&user={urllib.parse.quote(target)}&email={urllib.parse.quote(row[0])}")
+                con.execute("INSERT INTO account_admin_audit(actor, action, username, detail, created_at) VALUES(?,?,?,?,?)", (user, detail, target, "", now.isoformat()))
+                con.commit(); con.close(); _send_json_line(sock, {"action": "admin_account_result", "ok": bool(sent), "username": target, "reason": "Account cancelled; the username is available again." if action == "admin_cancel_account" else "Invitation email resent."})
 
             elif action == "add_contact":
                 contact_to_add = msg["to"]
